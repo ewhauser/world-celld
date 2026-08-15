@@ -104,7 +104,7 @@ jobs:
       RELEASE_VERSION: ${{ needs.build.outputs.version }}
       RELEASE_TARBALL: ${{ needs.build.outputs.tarball }}
     outputs:
-      integrity: ${{ steps.package.outputs.integrity }}
+      integrity: ${{ steps.publish.outputs.integrity }}
     steps:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -134,22 +134,78 @@ jobs:
           if (pack.name !== '@ewhauser/world-celld' || pack.version !== process.env.RELEASE_VERSION) {
             throw new Error(`unexpected package: ${pack.name}@${pack.version}`);
           }
-          appendFileSync(process.env.GITHUB_OUTPUT, `integrity=${pack.integrity}\n`);
+          appendFileSync(process.env.GITHUB_OUTPUT, `built_integrity=${pack.integrity}\n`);
           EOF
       - name: Publish package with trusted publishing
+        id: publish
         env:
-          EXPECTED_INTEGRITY: ${{ steps.package.outputs.integrity }}
+          BUILT_INTEGRITY: ${{ steps.package.outputs.built_integrity }}
         run: |
           if REGISTRY_INTEGRITY=$(npm view "@ewhauser/world-celld@$RELEASE_VERSION" dist.integrity 2>/dev/null); then
-            test "$REGISTRY_INTEGRITY" = "$EXPECTED_INTEGRITY"
-            echo "Registry already contains the identical package."
+            if test "$REGISTRY_INTEGRITY" != "$BUILT_INTEGRITY"; then
+              # npm and zlib versions can encode identical tar streams into
+              # different gzip bytes. Compare the complete package tar stream
+              # before accepting an existing bootstrap version.
+              READBACK_DIRECTORY=$(mktemp -d)
+              npm pack "@ewhauser/world-celld@$RELEASE_VERSION" \
+                --json \
+                --ignore-scripts \
+                --pack-destination "$READBACK_DIRECTORY" >/dev/null
+              cmp \
+                <(gzip -dc "./release-artifacts/$RELEASE_TARBALL") \
+                <(gzip -dc "$READBACK_DIRECTORY/$RELEASE_TARBALL")
+            fi
+            RELEASE_INTEGRITY=$REGISTRY_INTEGRITY
+            echo "Registry already contains the identical package contents."
           else
             npm publish "./release-artifacts/$RELEASE_TARBALL" --access public --ignore-scripts
+            RELEASE_INTEGRITY=$BUILT_INTEGRITY
           fi
+          echo "integrity=$RELEASE_INTEGRITY" >> "$GITHUB_OUTPUT"
       - name: Verify registry integrity
         env:
-          EXPECTED_INTEGRITY: ${{ steps.package.outputs.integrity }}
-        run: test "$(npm view "@ewhauser/world-celld@$RELEASE_VERSION" dist.integrity)" = "$EXPECTED_INTEGRITY"
+          EXPECTED_INTEGRITY: ${{ steps.publish.outputs.integrity }}
+        run: |
+          for _ in {1..24}; do
+            if REGISTRY_INTEGRITY=$(npm view "@ewhauser/world-celld@$RELEASE_VERSION" dist.integrity 2>/dev/null) && \
+              test "$REGISTRY_INTEGRITY" = "$EXPECTED_INTEGRITY"; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "npm registry did not expose the expected integrity within two minutes" >&2
+          exit 1
+      - name: Read back canonical registry package
+        env:
+          EXPECTED_INTEGRITY: ${{ steps.publish.outputs.integrity }}
+        run: |
+          mkdir registry-artifacts
+          npm pack "@ewhauser/world-celld@$RELEASE_VERSION" \
+            --json \
+            --ignore-scripts \
+            --pack-destination registry-artifacts > registry-pack.json
+          node --input-type=module <<'EOF'
+          import { readFileSync } from 'node:fs';
+          const [pack] = JSON.parse(readFileSync('registry-pack.json', 'utf8'));
+          if (pack.filename !== process.env.RELEASE_TARBALL) {
+            throw new Error(`unexpected registry tarball: ${pack.filename}`);
+          }
+          if (pack.integrity !== process.env.EXPECTED_INTEGRITY) {
+            throw new Error(`unexpected registry integrity: ${pack.integrity}`);
+          }
+          EOF
+          cmp \
+            <(gzip -dc "./release-artifacts/$RELEASE_TARBALL") \
+            <(gzip -dc "./registry-artifacts/$RELEASE_TARBALL")
+          (cd registry-artifacts && sha256sum "$RELEASE_TARBALL" > "$RELEASE_TARBALL.sha256")
+      - name: Upload canonical registry package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-package-verified-${{ needs.build.outputs.version }}
+          path: registry-artifacts/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
 
   finalize:
     name: Publish GitHub release
@@ -169,7 +225,7 @@ jobs:
       - name: Download release artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: npm-package-${{ needs.build.outputs.version }}
+          name: npm-package-verified-${{ needs.build.outputs.version }}
           path: release-artifacts
       - name: Verify artifact and registry
         run: |
