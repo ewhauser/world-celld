@@ -152,8 +152,8 @@ describe('Cloudflare Durable Objects Features', () => {
       });
 
       // Verify KV index
-      const indexKey = `run:indexed-workflow:${run.runId}`;
-      const indexValue = await mockEnv.WORKFLOW_INDEX.get(indexKey);
+      const listed = await mockEnv.WORKFLOW_INDEX.list({ prefix: 'run:indexed-workflow:' });
+      const indexValue = await mockEnv.WORKFLOW_INDEX.get(listed.keys[0].name);
 
       expect(indexValue).toBeDefined();
       const parsed = JSON.parse(indexValue as string);

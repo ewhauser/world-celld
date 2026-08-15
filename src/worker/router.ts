@@ -56,7 +56,16 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
   },
   index: {
     env: 'WORKFLOW_INDEX',
-    methods: new Set(['get', 'put', 'delete', 'list']),
+    methods: new Set([
+      'get',
+      'put',
+      'delete',
+      'list',
+      'reserveHookToken',
+      'finalizeHookIndexes',
+      'releaseHookToken',
+      'deleteHookIndexes',
+    ]),
   },
   queue: {
     env: 'WORKFLOW_QUEUE',
@@ -76,6 +85,29 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 
 function errorResponse(status: number, name: string, message: string): Response {
   return Response.json({ error: { name, message } }, { status });
+}
+
+async function readBoundedBody(request: Request): Promise<string | null> {
+  if (!request.body) return '';
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let total = 0;
+  let text = '';
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_BODY_BYTES) {
+        await reader.cancel('RPC body exceeds configured limit').catch(() => undefined);
+        return null;
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export function createRouter(env: WorkerEnv) {
@@ -125,7 +157,10 @@ export function createRouter(env: WorkerEnv) {
 
     let args: unknown[];
     try {
-      const text = await request.text();
+      const text = await readBoundedBody(request);
+      if (text === null) {
+        return errorResponse(413, 'PayloadTooLarge', `body exceeds ${MAX_BODY_BYTES} bytes`);
+      }
       const parsed = rpcParse<unknown>(text);
       if (!Array.isArray(parsed)) {
         return errorResponse(400, 'BadRequest', 'body must be an argument array');

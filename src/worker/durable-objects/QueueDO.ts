@@ -100,7 +100,10 @@ export class QueueDO extends DurableObject {
     return typeof impl === 'function' ? impl : fetch;
   }
 
-  #intVar(name: 'QUEUE_MAX_ATTEMPTS' | 'QUEUE_MAX_INFLIGHT' | 'QUEUE_DELIVERY_TIMEOUT_MS', fallback: number): number {
+  #intVar(
+    name: 'QUEUE_MAX_ATTEMPTS' | 'QUEUE_MAX_INFLIGHT' | 'QUEUE_DELIVERY_TIMEOUT_MS',
+    fallback: number,
+  ): number {
     const raw = (this.env as QueueCellEnv)?.[name];
     const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
@@ -109,56 +112,62 @@ export class QueueDO extends DurableObject {
   async enqueue(request: EnqueueRequest): Promise<EnqueueOutcome> {
     const storage = this.ctx.storage;
     const now = this.#now();
+    let dueAt: number | null = null;
 
-    // Pin the shard count from the first enqueue and reject drift loudly:
-    // idempotencyKey -> cell affinity (and therefore dedup correctness)
-    // depends on every producer agreeing on the shard count. The delivery
-    // URL deliberately is NOT pinned — it travels per message.
-    const pinned = await storage.get<{ queueShards: number; pinnedAt: number }>('cfg');
-    if (!pinned) {
-      await storage.put('cfg', { queueShards: request.config.queueShards, pinnedAt: now });
-    } else if (pinned.queueShards !== request.config.queueShards) {
-      return {
-        ok: false,
-        code: 'CONFIG_MISMATCH',
-        message:
-          `queue cell shard-count mismatch: pinned ${pinned.queueShards}, ` +
-          `got ${request.config.queueShards} — changing queueShards requires draining the fleet`,
-      };
-    }
-
-    // Dedup: while a message with this idempotencyKey is active, return the
-    // original messageId (core re-enqueues pending steps on every replay and
-    // relies on this).
-    if (request.idempotencyKey) {
-      const existing = await storage.get<string>(`key:${request.idempotencyKey}`);
-      if (existing) {
-        if (await storage.get(`msg:${existing}`)) {
-          return { ok: true, messageId: existing, deduped: true };
-        }
-        // Stale claim (message gone without release) — steal it.
-        await storage.delete(`key:${request.idempotencyKey}`);
+    const outcome = await storage.transaction<EnqueueOutcome>(async (txn) => {
+      // Pin the shard count from the first enqueue and reject drift loudly:
+      // idempotencyKey -> cell affinity (and therefore dedup correctness)
+      // depends on every producer agreeing on the shard count. The delivery
+      // URL deliberately is NOT pinned — it travels per message.
+      const pinned = await txn.get<{ queueShards: number; pinnedAt: number }>('cfg');
+      if (!pinned) {
+        await txn.put('cfg', { queueShards: request.config.queueShards, pinnedAt: now });
+      } else if (pinned.queueShards !== request.config.queueShards) {
+        return {
+          ok: false,
+          code: 'CONFIG_MISMATCH',
+          message:
+            `queue cell shard-count mismatch: pinned ${pinned.queueShards}, ` +
+            `got ${request.config.queueShards} — changing queueShards requires draining the fleet`,
+        };
       }
-      await storage.put(`key:${request.idempotencyKey}`, request.messageId);
+
+      // Dedup: while a message with this idempotencyKey is active, return the
+      // original messageId (core re-enqueues pending steps on every replay and
+      // relies on this).
+      if (request.idempotencyKey) {
+        const existing = await txn.get<string>(`key:${request.idempotencyKey}`);
+        if (existing) {
+          if (await txn.get(`msg:${existing}`)) {
+            return { ok: true, messageId: existing, deduped: true };
+          }
+          // Stale claim (message gone without release) — steal it.
+          await txn.delete(`key:${request.idempotencyKey}`);
+        }
+        await txn.put(`key:${request.idempotencyKey}`, request.messageId);
+      }
+
+      const row: MessageRow = {
+        messageId: request.messageId,
+        queueName: request.queueName,
+        pathname: request.pathname,
+        body: request.body,
+        targetBaseUrl: request.config.targetBaseUrl,
+        idempotencyKey: request.idempotencyKey,
+        attempt: 0,
+        enqueuedAt: now,
+      };
+      dueAt = now + Math.max(0, request.delaySeconds ?? 0) * 1000;
+      await txn.put(`msg:${row.messageId}`, row);
+      await txn.put(dueKey(dueAt, row.messageId), row.messageId);
+
+      return { ok: true, messageId: row.messageId, deduped: false };
+    });
+
+    if (dueAt !== null) {
+      await this.#armAlarmAtMost(dueAt);
     }
-
-    const row: MessageRow = {
-      messageId: request.messageId,
-      queueName: request.queueName,
-      pathname: request.pathname,
-      body: request.body,
-      targetBaseUrl: request.config.targetBaseUrl,
-      idempotencyKey: request.idempotencyKey,
-      attempt: 0,
-      enqueuedAt: now,
-    };
-    const dueAt = now + Math.max(0, request.delaySeconds ?? 0) * 1000;
-    await storage.put(`msg:${row.messageId}`, row);
-    await storage.put(dueKey(dueAt, row.messageId), row.messageId);
-
-    await this.#armAlarmAtMost(dueAt);
-
-    return { ok: true, messageId: row.messageId, deduped: false };
+    return outcome;
   }
 
   async alarm(): Promise<void> {
@@ -194,40 +203,42 @@ export class QueueDO extends DurableObject {
     const storage = this.ctx.storage;
     const now = this.#now();
     const maxInflight = this.#intVar('QUEUE_MAX_INFLIGHT', DEFAULT_MAX_INFLIGHT);
-
-    // 1. Recover: an inflight entry past its deadline is a lost delivery
-    // (node crash, deploy restart) — back to due for redelivery.
-    const inflight = await storage.list<number>({ prefix: 'inflight:' });
-    let inflightCount = 0;
-    for (const [key, deadline] of inflight) {
-      if (deadline <= now) {
-        const messageId = key.slice('inflight:'.length);
-        await storage.delete(key);
-        if (await storage.get(`msg:${messageId}`)) {
-          await storage.put(dueKey(now, messageId), messageId);
+    const claimed = await storage.transaction<MessageRow[]>(async (txn) => {
+      // 1. Recover: an inflight entry past its deadline is a lost delivery
+      // (node crash, deploy restart) — back to due for redelivery.
+      const inflight = await txn.list<number>({ prefix: 'inflight:' });
+      let inflightCount = 0;
+      for (const [key, deadline] of inflight) {
+        if (deadline <= now) {
+          const messageId = key.slice('inflight:'.length);
+          await txn.delete(key);
+          if (await txn.get(`msg:${messageId}`)) {
+            await txn.put(dueKey(now, messageId), messageId);
+          }
+        } else {
+          inflightCount++;
         }
-      } else {
-        inflightCount++;
       }
-    }
 
-    // 2. Claim due messages up to the cap.
-    const claimed: MessageRow[] = [];
-    if (inflightCount < maxInflight) {
-      const due = await storage.list<string>({
-        prefix: 'due:',
-        end: `due:${pad(now + 1)}`,
-        limit: maxInflight - inflightCount,
-      });
-      const timeoutMs = this.#intVar('QUEUE_DELIVERY_TIMEOUT_MS', DEFAULT_DELIVERY_TIMEOUT_MS);
-      for (const [key, messageId] of due) {
-        await storage.delete(key);
-        const row = await storage.get<MessageRow>(`msg:${messageId}`);
-        if (!row) continue; // orphaned schedule entry
-        await storage.put(`inflight:${messageId}`, now + timeoutMs + INFLIGHT_GRACE_MS);
-        claimed.push(row);
+      // 2. Claim due messages up to the cap.
+      const rows: MessageRow[] = [];
+      if (inflightCount < maxInflight) {
+        const due = await txn.list<string>({
+          prefix: 'due:',
+          end: `due:${pad(now + 1)}`,
+          limit: maxInflight - inflightCount,
+        });
+        const timeoutMs = this.#intVar('QUEUE_DELIVERY_TIMEOUT_MS', DEFAULT_DELIVERY_TIMEOUT_MS);
+        for (const [key, messageId] of due) {
+          await txn.delete(key);
+          const row = await txn.get<MessageRow>(`msg:${messageId}`);
+          if (!row) continue; // orphaned schedule entry
+          await txn.put(`inflight:${messageId}`, now + timeoutMs + INFLIGHT_GRACE_MS);
+          rows.push(row);
+        }
       }
-    }
+      return rows;
+    });
 
     await this.#rearm();
     return claimed;
@@ -274,8 +285,10 @@ export class QueueDO extends DurableObject {
         timeoutSeconds = undefined;
       }
       if (typeof timeoutSeconds === 'number') {
-        await storage.delete(`inflight:${row.messageId}`);
-        await storage.put(dueKey(now + timeoutSeconds * 1000, row.messageId), row.messageId);
+        await storage.transaction(async (txn) => {
+          await txn.delete(`inflight:${row.messageId}`);
+          await txn.put(dueKey(now + timeoutSeconds * 1000, row.messageId), row.messageId);
+        });
       } else {
         await this.#retry(row, 'HTTP 503');
       }
@@ -295,14 +308,16 @@ export class QueueDO extends DurableObject {
 
   async #ack(row: MessageRow): Promise<void> {
     const storage = this.ctx.storage;
-    await storage.delete(`msg:${row.messageId}`);
-    await storage.delete(`inflight:${row.messageId}`);
-    if (row.idempotencyKey) {
-      const holder = await storage.get<string>(`key:${row.idempotencyKey}`);
-      if (holder === row.messageId) {
-        await storage.delete(`key:${row.idempotencyKey}`);
+    await storage.transaction(async (txn) => {
+      await txn.delete(`msg:${row.messageId}`);
+      await txn.delete(`inflight:${row.messageId}`);
+      if (row.idempotencyKey) {
+        const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
+        if (holder === row.messageId) {
+          await txn.delete(`key:${row.idempotencyKey}`);
+        }
       }
-    }
+    });
   }
 
   async #retry(row: MessageRow, reason: string): Promise<void> {
@@ -311,24 +326,26 @@ export class QueueDO extends DurableObject {
     const maxAttempts = this.#intVar('QUEUE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS);
     const attempt = row.attempt + 1;
 
-    await storage.delete(`inflight:${row.messageId}`);
+    await storage.transaction(async (txn) => {
+      await txn.delete(`inflight:${row.messageId}`);
 
-    if (attempt >= maxAttempts) {
-      const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt: now };
-      await storage.put(`dlq:${pad(now)}:${row.messageId}`, dead);
-      await storage.delete(`msg:${row.messageId}`);
-      if (row.idempotencyKey) {
-        const holder = await storage.get<string>(`key:${row.idempotencyKey}`);
-        if (holder === row.messageId) {
-          await storage.delete(`key:${row.idempotencyKey}`);
+      if (attempt >= maxAttempts) {
+        const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt: now };
+        await txn.put(`dlq:${pad(now)}:${row.messageId}`, dead);
+        await txn.delete(`msg:${row.messageId}`);
+        if (row.idempotencyKey) {
+          const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
+          if (holder === row.messageId) {
+            await txn.delete(`key:${row.idempotencyKey}`);
+          }
         }
+        return;
       }
-      return;
-    }
 
-    const updated: MessageRow = { ...row, attempt, lastError: reason };
-    await storage.put(`msg:${row.messageId}`, updated);
-    await storage.put(dueKey(now + backoffSeconds(attempt) * 1000, row.messageId), row.messageId);
+      const updated: MessageRow = { ...row, attempt, lastError: reason };
+      await txn.put(`msg:${row.messageId}`, updated);
+      await txn.put(dueKey(now + backoffSeconds(attempt) * 1000, row.messageId), row.messageId);
+    });
   }
 
   /** Arm the alarm no later than `atMs` (durable backoff never throws). */
@@ -402,31 +419,49 @@ export class QueueDO extends DurableObject {
   /** Move a dead letter back to the live queue (attempt count reset). */
   async redriveDeadLetter(messageId: string): Promise<{ ok: boolean }> {
     const storage = this.ctx.storage;
-    const dlq = await storage.list<DeadLetterRow>({ prefix: 'dlq:' });
-    for (const [key, dead] of dlq) {
-      if (dead.messageId !== messageId) continue;
-      const now = this.#now();
-      const { failedAt: _failedAt, ...rest } = dead;
-      const row: MessageRow = { ...rest, attempt: 0, lastError: undefined };
-      await storage.put(`msg:${row.messageId}`, row);
-      await storage.put(dueKey(now, row.messageId), row.messageId);
-      if (row.idempotencyKey && !(await storage.get(`key:${row.idempotencyKey}`))) {
-        await storage.put(`key:${row.idempotencyKey}`, row.messageId);
+    const now = this.#now();
+    const outcome = await storage.transaction<{ ok: boolean }>(async (txn) => {
+      const dlq = await txn.list<DeadLetterRow>({ prefix: 'dlq:' });
+      for (const [key, dead] of dlq) {
+        if (dead.messageId !== messageId) continue;
+        const { failedAt: _failedAt, ...rest } = dead;
+        const row: MessageRow = { ...rest, attempt: 0, lastError: undefined };
+
+        if (row.idempotencyKey) {
+          const dedupKey = `key:${row.idempotencyKey}`;
+          const holder = await txn.get<string>(dedupKey);
+          if (holder && holder !== row.messageId && (await txn.get(`msg:${holder}`))) {
+            return { ok: false };
+          }
+          if (holder && holder !== row.messageId) {
+            await txn.delete(dedupKey);
+          }
+          await txn.put(dedupKey, row.messageId);
+        }
+
+        await txn.put(`msg:${row.messageId}`, row);
+        await txn.put(dueKey(now, row.messageId), row.messageId);
+        await txn.delete(key);
+        return { ok: true };
       }
-      await storage.delete(key);
+      return { ok: false };
+    });
+
+    if (outcome.ok) {
       await this.#armAlarmAtMost(now);
-      return { ok: true };
     }
-    return { ok: false };
+    return outcome;
   }
 
   async purgeDeadLetters(): Promise<{ purged: number }> {
     const storage = this.ctx.storage;
-    const dlq = await storage.list({ prefix: 'dlq:' });
-    for (const key of dlq.keys()) {
-      await storage.delete(key);
-    }
-    return { purged: dlq.size };
+    return await storage.transaction(async (txn) => {
+      const dlq = await txn.list({ prefix: 'dlq:' });
+      for (const key of dlq.keys()) {
+        await txn.delete(key);
+      }
+      return { purged: dlq.size };
+    });
   }
 
   /**

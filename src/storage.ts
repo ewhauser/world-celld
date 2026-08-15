@@ -40,6 +40,7 @@ import {
 import { parse, stringify } from './vendor/shared/index.js';
 import { monotonicFactory } from 'ulid';
 import type { ApplyEventFailure, ApplyEventOutcome, ApplyEventRequest } from './apply-event.js';
+import type { HookTokenOwner, IndexNamespace } from './config.js';
 import { compact } from './util.js';
 
 /**
@@ -59,10 +60,12 @@ export interface WorkflowRunDOStub {
   listSteps(params?: {
     limit?: number;
     cursor?: string;
+    sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Step[]; cursor: string | null; hasMore: boolean }>;
   listHooks(params?: {
     limit?: number;
     cursor?: string;
+    sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Hook[]; cursor: string | null; hasMore: boolean }>;
 }
 
@@ -78,20 +81,25 @@ export interface DurableObjectIdLike {
 export interface CloudflareStorageConfig {
   env: {
     WORKFLOW_DB: WorkflowRunDONamespace;
-    WORKFLOW_INDEX: KVNamespace;
+    WORKFLOW_INDEX: IndexNamespace;
   };
   deploymentId: string;
 }
 
-interface KVNamespace {
-  get(key: string): Promise<string | null>;
-  put(key: string, value: string): Promise<void>;
-  delete(key: string): Promise<void>;
-  list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{
-    keys: Array<{ name: string }>;
-    list_complete: boolean;
-    cursor?: string;
-  }>;
+function sortableTimestamp(date: Date): string {
+  return date.getTime().toString().padStart(13, '0');
+}
+
+function workflowRunIndexKey(run: WorkflowRun): string {
+  return `run:${run.workflowName}:${sortableTimestamp(run.createdAt)}:${run.runId}`;
+}
+
+function globalRunIndexKey(run: WorkflowRun): string {
+  return `runall:${sortableTimestamp(run.createdAt)}:${run.runId}`;
+}
+
+function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
+  return { runId: hook.runId, hookId: hook.hookId };
 }
 
 /**
@@ -194,46 +202,55 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         params?: ListWorkflowRunsParams,
       ): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>> {
         const limit = params?.pagination?.limit ?? 20;
-        const prefix = params?.workflowName ? `run:${params.workflowName}:` : 'run:';
+        const prefix = params?.workflowName ? `run:${params.workflowName}:` : 'runall:';
+        const reverse = params?.pagination?.sortOrder === 'desc';
+        const matches: Array<{
+          key: string;
+          run: WorkflowRun | WorkflowRunWithoutData;
+        }> = [];
+        let scanCursor = params?.pagination?.cursor;
+        let exhausted = false;
 
-        // Exact limit + list_complete: fetching limit+1 would advance the KV
-        // cursor past the peeked key and silently drop one run per page.
-        const kvList = await env.WORKFLOW_INDEX.list({
-          prefix,
-          limit,
-          cursor: params?.pagination?.cursor,
-        });
+        // Keep scanning index pages until the requested page is full. This
+        // prevents status filters and stale derived entries from producing
+        // short pages or cursors that skip matching runs.
+        while (matches.length <= limit && !exhausted) {
+          const kvList = await env.WORKFLOW_INDEX.list({
+            prefix,
+            limit: Math.min(1000, Math.max(50, limit)),
+            cursor: scanCursor,
+            reverse,
+          });
+          if (kvList.keys.length === 0) {
+            exhausted = true;
+            break;
+          }
 
-        const hasMore = !kvList.list_complete;
-
-        const runs = await Promise.all(
-          kvList.keys.map(async (key) => {
+          for (const key of kvList.keys) {
             const meta = await env.WORKFLOW_INDEX.get(key.name);
-            if (!meta) return null;
+            if (!meta) continue;
             const { runId } = JSON.parse(meta) as { runId: string };
             try {
-              return await runsGet(runId, { resolveData: params?.resolveData });
+              const run = await runsGet(runId, { resolveData: params?.resolveData });
+              if (!params?.status || run.status === params.status) {
+                matches.push({ key: key.name, run });
+                if (matches.length > limit) break;
+              }
             } catch (error) {
-              // An index entry whose run row never landed (partial create) is
-              // skippable; anything else is a real failure.
-              if (WorkflowRunNotFoundError.is(error)) return null;
-              throw error;
+              if (!WorkflowRunNotFoundError.is(error)) throw error;
             }
-          }),
-        );
+          }
 
-        const filtered = runs.filter((r): r is WorkflowRun => r !== null);
+          exhausted = kvList.list_complete;
+          scanCursor = kvList.cursor ?? kvList.keys.at(-1)?.name;
+        }
 
-        // Status filtering is best-effort within a page: it is applied after
-        // KV pagination, so a page may return fewer than `limit` matches
-        // while hasMore is still true.
-        const statusFiltered = params?.status
-          ? filtered.filter((r) => r.status === params.status)
-          : filtered;
+        const hasMore = matches.length > limit;
+        const page = matches.slice(0, limit);
 
         return {
-          data: statusFiltered,
-          cursor: hasMore ? (kvList.cursor ?? null) : null,
+          data: page.map(({ run }) => run),
+          cursor: hasMore ? (page.at(-1)?.key ?? null) : null,
           hasMore,
         };
       },
@@ -259,51 +276,76 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         const stub = getRunDO(effectiveRunId);
 
-        // hook_created needs to know who currently holds the token in the
-        // global index. The check-then-write across KV and the DO is not
-        // atomic (KV has no compare-and-swap); the DO-side hook_created event
-        // marker keeps same-run replays exactly-once, while cross-run token
-        // races remain best-effort — matching KV's consistency model.
         let tokenHolder: ApplyEventRequest['tokenHolder'];
+        let hookReservation: HookTokenOwner | undefined;
         if (data.eventType === 'hook_created') {
-          const raw = await env.WORKFLOW_INDEX.get(`hook:${data.eventData.token}`);
-          if (raw) {
-            const holder = parse<Hook>(raw);
-            tokenHolder = { runId: holder.runId, hookId: holder.hookId };
-          } else {
-            tokenHolder = null;
-          }
+          hookReservation = {
+            runId: effectiveRunId,
+            hookId: data.correlationId,
+          };
+          const reservation = await env.WORKFLOW_INDEX.reserveHookToken(
+            data.eventData.token,
+            hookReservation,
+          );
+          tokenHolder = reservation.claimed ? null : reservation.holder;
         }
 
         // Guards, event append, and entity mutation run in ONE DO storage
         // transaction (see apply-event.ts). The event is schema-validated
         // before anything is persisted.
-        const outcome = await stub.applyEvent({ runId: effectiveRunId, data, tokenHolder });
+        let outcome: ApplyEventOutcome;
+        try {
+          outcome = await stub.applyEvent({ runId: effectiveRunId, data, tokenHolder });
+        } catch (error) {
+          if (hookReservation && data.eventType === 'hook_created') {
+            await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
+          }
+          throw error;
+        }
 
         if (!outcome.ok) {
+          if (hookReservation && data.eventType === 'hook_created') {
+            await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
+          }
           throwOutcomeError(outcome, effectiveRunId, data);
         }
 
-        // KV side effects happen after the DO transaction committed; the DO
-        // event log is the source of truth and can re-derive these.
-        if (outcome.runCreated) {
-          await env.WORKFLOW_INDEX.put(
-            `run:${outcome.runCreated.workflowName}:${effectiveRunId}`,
-            JSON.stringify({
-              runId: effectiveRunId,
-              createdAt: outcome.runCreated.createdAt.toISOString(),
-              status: 'pending',
-            }),
-          );
+        // Derived indexes are deliberately rewritten on idempotent replay so
+        // a committed run or hook can repair an interrupted index update.
+        if (outcome.run) {
+          const meta = JSON.stringify({
+            runId: effectiveRunId,
+            createdAt: outcome.run.createdAt.toISOString(),
+            status: outcome.run.status,
+          });
+          await env.WORKFLOW_INDEX.put(workflowRunIndexKey(outcome.run), meta);
+          await env.WORKFLOW_INDEX.put(globalRunIndexKey(outcome.run), meta);
         }
         if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
-          await env.WORKFLOW_INDEX.put(`hook:${outcome.hookToIndex.token}`, serialized);
-          await env.WORKFLOW_INDEX.put(`hookid:${outcome.hookToIndex.hookId}`, serialized);
+          await env.WORKFLOW_INDEX.finalizeHookIndexes(
+            outcome.hookToIndex.token,
+            outcome.hookToIndex.hookId,
+            serialized,
+            hookOwner(outcome.hookToIndex),
+          );
+        } else if (hookReservation && data.eventType === 'hook_created') {
+          await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
         }
         for (const released of outcome.releasedHooks) {
-          await env.WORKFLOW_INDEX.delete(`hook:${released.token}`);
-          await env.WORKFLOW_INDEX.delete(`hookid:${released.hookId}`);
+          await env.WORKFLOW_INDEX.deleteHookIndexes(released.token, released.hookId, {
+            runId: effectiveRunId,
+            hookId: released.hookId,
+          });
+        }
+        if (outcome.event?.correlationId) {
+          const correlationKey = `correlation:${encodeURIComponent(
+            outcome.event.correlationId,
+          )}:${sortableTimestamp(outcome.event.createdAt)}:${outcome.event.eventId}:${effectiveRunId}`;
+          await env.WORKFLOW_INDEX.put(
+            correlationKey,
+            JSON.stringify({ runId: effectiveRunId, eventId: outcome.event.eventId }),
+          );
         }
 
         return {
@@ -346,13 +388,27 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         };
       },
 
-      async listByCorrelationId(_params) {
-        // For Cloudflare, we'd need a global index in KV or D1
-        // For now, return empty as this requires cross-DO coordination
+      async listByCorrelationId(params) {
+        const limit = params.pagination?.limit ?? 100;
+        const prefix = `correlation:${encodeURIComponent(params.correlationId)}:`;
+        const listed = await env.WORKFLOW_INDEX.list({
+          prefix,
+          limit,
+          cursor: params.pagination?.cursor,
+          reverse: params.pagination?.sortOrder === 'desc',
+        });
+        const events = await Promise.all(
+          listed.keys.map(async ({ name }) => {
+            const raw = await env.WORKFLOW_INDEX.get(name);
+            if (!raw) return null;
+            const { runId, eventId } = JSON.parse(raw) as { runId: string; eventId: string };
+            return getRunDO(runId).getEvent(eventId);
+          }),
+        );
         return {
-          data: [],
-          cursor: null,
-          hasMore: false,
+          data: events.filter((event): event is Event => event !== null).map(parseEvent),
+          cursor: listed.list_complete ? null : (listed.cursor ?? null),
+          hasMore: !listed.list_complete,
         };
       },
     },
@@ -386,6 +442,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const result = await stub.listSteps({
           limit,
           cursor: params?.pagination?.cursor || undefined,
+          sortOrder: params?.pagination?.sortOrder ?? 'asc',
         });
 
         return {
@@ -434,6 +491,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const result = await stub.listHooks({
           limit,
           cursor: params?.pagination?.cursor || undefined,
+          sortOrder: params?.pagination?.sortOrder ?? 'asc',
         });
 
         return {

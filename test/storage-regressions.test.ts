@@ -94,7 +94,7 @@ describe('Storage regressions', () => {
     expect(listed.data.map((run) => run.runId)).toContain(runId);
   });
 
-  it('reconciles both hook indexes after a partial post-commit write', async () => {
+  it('reconciles both hook indexes after a post-commit index failure', async () => {
     const run = await createRun('hook-index-reconciliation');
     const hookEvent = {
       eventType: 'hook_created' as const,
@@ -102,25 +102,25 @@ describe('Storage regressions', () => {
       eventData: { token: 'partial-index-token' },
     };
     const index = mockEnv.WORKFLOW_INDEX;
-    const put = index.put.bind(index);
-    let failHookIdWrite = true;
-    index.put = async (key, value) => {
-      if (failHookIdWrite && key === 'hookid:hook-partial-index') {
-        failHookIdWrite = false;
-        throw new Error('injected hook-id index outage');
+    const finalize = index.finalizeHookIndexes.bind(index);
+    let failFinalize = true;
+    index.finalizeHookIndexes = async (...args) => {
+      if (failFinalize) {
+        failFinalize = false;
+        throw new Error('injected hook index outage');
       }
-      await put(key, value);
+      await finalize(...args);
     };
 
     try {
       await expect(storage.events.create(run.runId, hookEvent)).rejects.toThrow(
-        'injected hook-id index outage',
+        'injected hook index outage',
       );
     } finally {
-      index.put = put;
+      index.finalizeHookIndexes = finalize;
     }
 
-    // The hook and token index committed, so replay is the recovery opportunity.
+    // The hook entity committed, so replay is the index recovery opportunity.
     await expect(storage.events.create(run.runId, hookEvent)).resolves.toMatchObject({
       hook: { hookId: 'hook-partial-index', token: 'partial-index-token' },
     });

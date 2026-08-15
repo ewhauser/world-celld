@@ -4,6 +4,8 @@ import { FleetTransportError, reconstructError, type WireError } from './errors.
 export interface RpcTransport {
   fleetUrl: string;
   secret: string;
+  /** Per-attempt request deadline. Default: 30 seconds. */
+  timeoutMs?: number;
   /** Injectable for tests. Default: globalThis.fetch */
   fetchImpl?: typeof fetch;
 }
@@ -11,6 +13,7 @@ export interface RpcTransport {
 /** Statuses that mean "the fleet couldn't take the request" (safe to retry reads). */
 const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const READ_RETRIES = 2;
+const DEFAULT_TIMEOUT_MS = 30_000;
 
 function delayMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -52,6 +55,7 @@ export async function callDO<T>(
           authorization: `Bearer ${transport.secret}`,
         },
         body: rpcStringify(args),
+        signal: AbortSignal.timeout(Math.max(1, transport.timeoutMs ?? DEFAULT_TIMEOUT_MS)),
       });
     } catch (error) {
       lastError = new FleetTransportError(`world-celld: fleet unreachable at ${url}`, error);
@@ -59,7 +63,16 @@ export async function callDO<T>(
     }
 
     if (response.ok) {
-      return rpcParse<T>(await response.text());
+      try {
+        return rpcParse<T>(await response.text());
+      } catch (error) {
+        lastError = new FleetTransportError(
+          `world-celld: malformed successful response from ${url}`,
+          error,
+        );
+        if (attempt < attempts) continue;
+        throw lastError;
+      }
     }
 
     const text = await response.text();

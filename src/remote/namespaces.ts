@@ -4,7 +4,7 @@
  * whose method calls become `POST /v1/rpc/{binding}/{name}/{method}` against
  * the fleet — the celld stand-in for Cloudflare's `env` bindings.
  */
-import type { CelldWorldEnv, IndexNamespace } from '../config.js';
+import type { CelldWorldEnv, HookTokenOwner, IndexNamespace } from '../config.js';
 import type { QueueCellStub } from '../queue.js';
 import type { WorkflowRunDOStub } from '../storage.js';
 import type { StreamDOStub } from '../streamer.js';
@@ -70,6 +70,13 @@ function makeIndexNamespace(transport: RpcTransport): IndexNamespace {
     put: (key, value) => call<void>('put', [key, value], false),
     delete: (key) => call<void>('delete', [key], false),
     list: (options) => call('list', [options], true),
+    reserveHookToken: (token: string, owner: HookTokenOwner) =>
+      call('reserveHookToken', [token, owner], false),
+    finalizeHookIndexes: (token, hookId, serializedHook, owner) =>
+      call<void>('finalizeHookIndexes', [token, hookId, serializedHook, owner], false),
+    releaseHookToken: (token, owner) => call<void>('releaseHookToken', [token, owner], false),
+    deleteHookIndexes: (token, hookId, owner) =>
+      call<void>('deleteHookIndexes', [token, hookId, owner], false),
   };
 }
 

@@ -1,14 +1,16 @@
 import { DurableObject } from '../do-base.js';
 import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
-import { monotonicFactory } from 'ulid';
 import {
   applyEvent,
   type ApplyEventOutcome,
   type ApplyEventRequest,
   EVENT_KEY_PREFIX,
   type EventStore,
+  HOOK_CREATED_KEY_PREFIX,
   HOOK_KEY_PREFIX,
+  listByCreationTime,
   listByPrefix,
+  STEP_CREATED_KEY_PREFIX,
   STEP_KEY_PREFIX,
 } from '../../apply-event.js';
 
@@ -21,21 +23,56 @@ import {
  * and hook ('hook:<hookId>') instead of single aggregate values. This package
  * is pre-production, so the migration simply drops the legacy aggregates.
  */
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 /**
- * Migration functions keyed by target version.
- * Each migration upgrades storage from (version - 1) to version.
- * The transaction parameter provides get/put/delete within a transactional context.
+ * Idempotent migration functions keyed by target version. The schema version
+ * is written only after the migration completes, so eviction safely retries
+ * an interrupted migration.
  */
-const MIGRATIONS: Record<number, (txn: DurableObjectTransaction) => Promise<void>> = {
-  2: async (txn) => {
-    // Pre-production layout change: drop the v1 aggregate values.
-    await txn.delete('events');
-    await txn.delete('steps');
-    await txn.delete('hooks');
+const MIGRATIONS: Record<number, (storage: DurableObjectStorage) => Promise<void>> = {
+  2: async (storage) => {
+    await storage.transaction(async (txn) => {
+      // Pre-production layout change: drop the v1 aggregate values.
+      await txn.delete('events');
+      await txn.delete('steps');
+      await txn.delete('hooks');
+    });
+  },
+  3: async (storage) => {
+    await backfillCreationIndex<Step>(
+      storage,
+      STEP_KEY_PREFIX,
+      STEP_CREATED_KEY_PREFIX,
+      (step) => step.stepId,
+    );
+    await backfillCreationIndex<Hook>(
+      storage,
+      HOOK_KEY_PREFIX,
+      HOOK_CREATED_KEY_PREFIX,
+      (hook) => hook.hookId,
+    );
   },
 };
+
+async function backfillCreationIndex<T extends { createdAt: Date }>(
+  storage: DurableObjectStorage,
+  entityPrefix: string,
+  indexPrefix: string,
+  getId: (entity: T) => string,
+): Promise<void> {
+  let startAfter: string | undefined;
+  while (true) {
+    const entities = await storage.list<T>({ prefix: entityPrefix, startAfter, limit: 100 });
+    if (entities.size === 0) return;
+    for (const [key, entity] of entities) {
+      const id = getId(entity);
+      await storage.put(`${indexPrefix}${entity.createdAt.toISOString()}:${id}`, id);
+      startAfter = key;
+    }
+    if (entities.size < 100) return;
+  }
+}
 
 /**
  * Ensure the DO storage schema is up to date.
@@ -49,13 +86,9 @@ async function ensureSchemaUpToDate(storage: DurableObjectStorage): Promise<void
   for (let v = stored + 1; v <= CURRENT_SCHEMA_VERSION; v++) {
     const migration = MIGRATIONS[v];
     if (migration) {
-      await storage.transaction(async (txn) => {
-        await migration(txn);
-        await txn.put('schema_version', v);
-      });
-    } else {
-      await storage.put('schema_version', v);
+      await migration(storage);
     }
+    await storage.put('schema_version', v);
   }
 }
 
@@ -90,11 +123,6 @@ interface InflightClaim {
  */
 export class WorkflowRunDO extends DurableObject {
   private schemaReady: Promise<void> | null = null;
-  /**
-   * Per-DO monotonic ULID factory. Event ids are allocated inside the DO so
-   * their order matches transaction commit order for the run.
-   */
-  private nextUlid = monotonicFactory();
 
   /**
    * Lazily ensure schema migrations have run.
@@ -115,13 +143,20 @@ export class WorkflowRunDO extends DurableObject {
    */
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
     await this.ensureSchema();
-    return await this.ctx.storage.transaction(async (txn) =>
-      applyEvent(storeFrom(txn), {
+    return await this.ctx.storage.transaction(async (txn) => {
+      let eventSequence = (await txn.get<number>('event_sequence')) ?? 0;
+      const outcome = await applyEvent(storeFrom(txn), {
         ...request,
-        nextEventId: () => `wevt_${this.nextUlid()}`,
+        // The sequence is durable, so a newly instantiated DO can never
+        // allocate an event id that sorts before an earlier commit.
+        nextEventId: () => `wevt_z${String(++eventSequence).padStart(20, '0')}`,
         now: new Date(),
-      }),
-    );
+      });
+      if (outcome.ok) {
+        await txn.put('event_sequence', eventSequence);
+      }
+      return outcome;
+    });
   }
 
   /**
@@ -148,13 +183,18 @@ export class WorkflowRunDO extends DurableObject {
   async listSteps(params?: {
     limit?: number;
     cursor?: string;
+    sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Step[]; cursor: string | null; hasMore: boolean }> {
     await this.ensureSchema();
-    return listByPrefix<Step>(
+    return listByCreationTime<Step>(
       storeFrom(this.ctx.storage),
+      STEP_CREATED_KEY_PREFIX,
       STEP_KEY_PREFIX,
-      { limit: params?.limit ?? 20, cursor: params?.cursor },
-      (step) => step.stepId,
+      {
+        limit: params?.limit ?? 20,
+        cursor: params?.cursor,
+        sortOrder: params?.sortOrder ?? 'asc',
+      },
     );
   }
 
@@ -195,13 +235,18 @@ export class WorkflowRunDO extends DurableObject {
   async listHooks(params?: {
     limit?: number;
     cursor?: string;
+    sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Hook[]; cursor: string | null; hasMore: boolean }> {
     await this.ensureSchema();
-    return listByPrefix<Hook>(
+    return listByCreationTime<Hook>(
       storeFrom(this.ctx.storage),
+      HOOK_CREATED_KEY_PREFIX,
       HOOK_KEY_PREFIX,
-      { limit: params?.limit ?? 100, cursor: params?.cursor },
-      (hook) => hook.hookId,
+      {
+        limit: params?.limit ?? 100,
+        cursor: params?.cursor,
+        sortOrder: params?.sortOrder ?? 'asc',
+      },
     );
   }
 

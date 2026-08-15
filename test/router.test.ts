@@ -106,6 +106,29 @@ describe('router auth and shape', () => {
 describe('full stack: vendored storage over the wire', () => {
   const transport = () => createRemoteEnv({ fleetUrl: harness.url, secret: SECRET });
 
+  it('atomically publishes hook indexes over the wire', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-test',
+    });
+    const created = await storage.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId: 'wire-test', workflowName: 'wire-hooks', input: [] },
+    });
+
+    await storage.events.create(created.run!.runId, {
+      eventType: 'hook_created',
+      correlationId: 'wire-hook',
+      eventData: { token: 'wire-hook-token' },
+    });
+
+    await expect(storage.hooks.getByToken('wire-hook-token')).resolves.toMatchObject({
+      runId: created.run!.runId,
+      hookId: 'wire-hook',
+    });
+  });
+
   it('creates a run via applyEvent and reads it back with Dates intact', async () => {
     const env = transport();
     const storage = createStorage({

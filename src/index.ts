@@ -40,7 +40,11 @@ export function createCelldWorld(config?: CelldWorldConfig): World {
           'world-celld: config.secret (or CELLD_WORLD_SECRET) is required with fleetUrl',
         );
       }
-      env = createRemoteEnv({ fleetUrl: resolved.fleetUrl, secret: resolved.secret });
+      env = createRemoteEnv({
+        fleetUrl: resolved.fleetUrl,
+        secret: resolved.secret,
+        timeoutMs: resolved.rpcTimeoutMs,
+      });
     }
   }
 

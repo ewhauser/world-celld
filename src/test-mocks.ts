@@ -8,7 +8,7 @@
  */
 
 import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
-import { monotonicFactory } from 'ulid';
+import type { HookTokenOwner } from './config.js';
 import type { EnqueueOutcome, EnqueueRequest, QueueCellStub } from './queue.js';
 import {
   applyEvent,
@@ -17,10 +17,14 @@ import {
   EVENT_KEY_PREFIX,
   type EventStore,
   type EventStoreListOptions,
+  HOOK_CREATED_KEY_PREFIX,
   HOOK_KEY_PREFIX,
+  listByCreationTime,
   listByPrefix,
+  STEP_CREATED_KEY_PREFIX,
   STEP_KEY_PREFIX,
 } from './apply-event.js';
+import { parse } from './vendor/shared/index.js';
 
 // In-memory storage for mock Durable Objects
 const durableObjectData = new Map<string, Map<string, unknown>>();
@@ -86,18 +90,32 @@ interface InflightClaim {
  */
 class MockWorkflowRunDOStub {
   private store: EventStore;
-  private nextUlid = monotonicFactory();
+  private applyChain: Promise<void> = Promise.resolve();
 
   constructor(runId: string) {
     this.store = createMemoryStore(() => getDOStorage(runId));
   }
 
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
-    return applyEvent(this.store, {
+    const result = this.applyChain.then(() => this.applyEventSerial(request));
+    this.applyChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async applyEventSerial(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
+    let eventSequence = (await this.store.get<number>('event_sequence')) ?? 0;
+    const outcome = await applyEvent(this.store, {
       ...request,
-      nextEventId: () => `wevt_${this.nextUlid()}`,
+      nextEventId: () => `wevt_z${String(++eventSequence).padStart(20, '0')}`,
       now: new Date(),
     });
+    if (outcome.ok) {
+      await this.store.put('event_sequence', eventSequence);
+    }
+    return outcome;
   }
 
   async getRun(): Promise<WorkflowRun | null> {
@@ -135,24 +153,34 @@ class MockWorkflowRunDOStub {
   async listSteps(params?: {
     limit?: number;
     cursor?: string;
+    sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Step[]; cursor: string | null; hasMore: boolean }> {
-    return listByPrefix<Step>(
+    return listByCreationTime<Step>(
       this.store,
+      STEP_CREATED_KEY_PREFIX,
       STEP_KEY_PREFIX,
-      { limit: params?.limit ?? 20, cursor: params?.cursor },
-      (step) => step.stepId,
+      {
+        limit: params?.limit ?? 20,
+        cursor: params?.cursor,
+        sortOrder: params?.sortOrder ?? 'asc',
+      },
     );
   }
 
   async listHooks(params?: {
     limit?: number;
     cursor?: string;
+    sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Hook[]; cursor: string | null; hasMore: boolean }> {
-    return listByPrefix<Hook>(
+    return listByCreationTime<Hook>(
       this.store,
+      HOOK_CREATED_KEY_PREFIX,
       HOOK_KEY_PREFIX,
-      { limit: params?.limit ?? 100, cursor: params?.cursor },
-      (hook) => hook.hookId,
+      {
+        limit: params?.limit ?? 100,
+        cursor: params?.cursor,
+        sortOrder: params?.sortOrder ?? 'asc',
+      },
     );
   }
 
@@ -195,7 +223,12 @@ class MockKVNamespace {
     kvData.delete(key);
   }
 
-  async list(options?: { prefix?: string; cursor?: string; limit?: number }): Promise<{
+  async list(options?: {
+    prefix?: string;
+    cursor?: string;
+    limit?: number;
+    reverse?: boolean;
+  }): Promise<{
     keys: Array<{ name: string }>;
     list_complete: boolean;
     cursor?: string;
@@ -209,7 +242,13 @@ class MockKVNamespace {
 
     if (options?.cursor) {
       const cursor = options.cursor;
-      matchingKeys = matchingKeys.filter((key) => key > cursor);
+      matchingKeys = matchingKeys.filter((key) =>
+        options.reverse ? key < cursor : key > cursor,
+      );
+    }
+
+    if (options?.reverse) {
+      matchingKeys.reverse();
     }
 
     const page = matchingKeys.slice(0, limit);
@@ -220,6 +259,83 @@ class MockKVNamespace {
       list_complete: listComplete,
       cursor: listComplete ? undefined : page.at(-1),
     };
+  }
+
+  async reserveHookToken(
+    token: string,
+    owner: HookTokenOwner,
+  ): Promise<{ claimed: boolean; holder?: HookTokenOwner }> {
+    const raw = kvData.get(`hook:${token}`);
+    if (raw !== undefined) {
+      const hook = parse<Hook>(raw);
+      const holder = { runId: hook.runId, hookId: hook.hookId };
+      return { claimed: false, holder };
+    }
+
+    const claimKey = `hookclaim:${token}`;
+    const claim = kvData.get(claimKey);
+    if (claim !== undefined) {
+      const holder = JSON.parse(claim) as HookTokenOwner;
+      return holder.runId === owner.runId && holder.hookId === owner.hookId
+        ? { claimed: true }
+        : { claimed: false, holder };
+    }
+
+    kvData.set(claimKey, JSON.stringify(owner));
+    return { claimed: true };
+  }
+
+  async finalizeHookIndexes(
+    token: string,
+    hookId: string,
+    serializedHook: string,
+    owner: HookTokenOwner,
+  ): Promise<void> {
+    const raw = kvData.get(`hook:${token}`);
+    if (raw !== undefined) {
+      const hook = parse<Hook>(raw);
+      if (hook.runId !== owner.runId || hook.hookId !== owner.hookId) {
+        throw new Error(`Hook token ${token} is owned by another hook`);
+      }
+    }
+    const claim = kvData.get(`hookclaim:${token}`);
+    if (claim !== undefined) {
+      const holder = JSON.parse(claim) as HookTokenOwner;
+      if (holder.runId !== owner.runId || holder.hookId !== owner.hookId) {
+        throw new Error(`Hook token ${token} is reserved by another hook`);
+      }
+    }
+    kvData.set(`hook:${token}`, serializedHook);
+    kvData.set(`hookid:${hookId}`, serializedHook);
+    kvData.delete(`hookclaim:${token}`);
+  }
+
+  async releaseHookToken(token: string, owner: HookTokenOwner): Promise<void> {
+    const key = `hookclaim:${token}`;
+    const claim = kvData.get(key);
+    if (claim !== undefined) {
+      const holder = JSON.parse(claim) as HookTokenOwner;
+      if (holder.runId === owner.runId && holder.hookId === owner.hookId) {
+        kvData.delete(key);
+      }
+    }
+  }
+
+  async deleteHookIndexes(
+    token: string,
+    hookId: string,
+    owner: HookTokenOwner,
+  ): Promise<void> {
+    for (const key of [`hook:${token}`, `hookid:${hookId}`]) {
+      const raw = kvData.get(key);
+      if (raw !== undefined) {
+        const hook = parse<Hook>(raw);
+        if (hook.runId === owner.runId && hook.hookId === owner.hookId) {
+          kvData.delete(key);
+        }
+      }
+    }
+    await this.releaseHookToken(token, owner);
   }
 }
 

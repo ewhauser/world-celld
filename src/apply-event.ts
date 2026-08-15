@@ -47,10 +47,12 @@ import { compact } from './util.js';
 
 /** Storage key for the run entity. */
 const RUN_KEY = 'run';
-/** Key prefixes for per-entity storage. ULID-suffixed keys list in order. */
+/** Key prefixes for per-entity storage. */
 export const EVENT_KEY_PREFIX = 'event:';
 export const STEP_KEY_PREFIX = 'step:';
 export const HOOK_KEY_PREFIX = 'hook:';
+export const STEP_CREATED_KEY_PREFIX = 'stepcreated:';
+export const HOOK_CREATED_KEY_PREFIX = 'hookcreated:';
 /**
  * Marker recording that a hook_created event was committed for a hookId.
  * Mirrors postgres' `workflow_events_entity_creation_unique` partial index:
@@ -199,6 +201,51 @@ export async function listByPrefix<T>(
   };
 }
 
+function creationIndexKey(prefix: string, createdAt: Date, id: string): string {
+  return `${prefix}${createdAt.toISOString()}:${id}`;
+}
+
+/**
+ * Cursor pagination over an explicit creation-time index. Entity ids are
+ * values rather than key suffixes, so caller-supplied ids cannot disturb the
+ * requested ordering.
+ */
+export async function listByCreationTime<T>(
+  store: EventStore,
+  indexPrefix: string,
+  entityPrefix: string,
+  params: { limit: number; cursor?: string; sortOrder?: 'asc' | 'desc' },
+): Promise<{ data: T[]; cursor: string | null; hasMore: boolean }> {
+  const { limit, cursor, sortOrder = 'asc' } = params;
+  const entries = await store.list<string>(
+    sortOrder === 'desc'
+      ? {
+          prefix: indexPrefix,
+          reverse: true,
+          limit: limit + 1,
+          end: cursor ? `${indexPrefix}${cursor}` : undefined,
+        }
+      : {
+          prefix: indexPrefix,
+          limit: limit + 1,
+          startAfter: cursor ? `${indexPrefix}${cursor}` : undefined,
+        },
+  );
+  const page = Array.from(entries.entries()).slice(0, limit);
+  const data: T[] = [];
+  for (const [, id] of page) {
+    const item = await store.get<T>(`${entityPrefix}${id}`);
+    if (item !== undefined) data.push(item);
+  }
+  const hasMore = entries.size > limit;
+  const lastKey = page.at(-1)?.[0];
+  return {
+    data,
+    cursor: hasMore && lastKey ? lastKey.slice(indexPrefix.length) : null,
+    hasMore,
+  };
+}
+
 /** Delete all hook entities for the run, returning the released tokens. */
 async function releaseAllHooks(
   store: EventStore,
@@ -207,6 +254,7 @@ async function releaseAllHooks(
   const released: Array<{ hookId: string; token: string }> = [];
   for (const hook of hooks.values()) {
     await store.delete(`${HOOK_KEY_PREFIX}${hook.hookId}`);
+    await store.delete(creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId));
     released.push({ hookId: hook.hookId, token: hook.token });
   }
   return released;
@@ -573,6 +621,10 @@ export async function applyEvent(
       );
       const event = buildEvent({ ...data });
       await store.put(stepKey, step);
+      await store.put(
+        creationIndexKey(STEP_CREATED_KEY_PREFIX, step.createdAt, step.stepId),
+        step.stepId,
+      );
       await putEvent(event);
       return { ok: true, event, step, releasedHooks: [] };
     }
@@ -718,6 +770,10 @@ export async function applyEvent(
       );
       const event = buildEvent({ ...data });
       await store.put(hookKey, hook);
+      await store.put(
+        creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId),
+        hook.hookId,
+      );
       await store.put(markerKey, event.eventId);
       await putEvent(event);
       return { ok: true, event, hook, hookToIndex: hook, releasedHooks: [] };
@@ -731,6 +787,7 @@ export async function applyEvent(
         return failure('HOOK_NOT_FOUND', `Hook "${data.correlationId}" not found`);
       }
       await store.delete(hookKey);
+      await store.delete(creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId));
       const event = buildEvent({ ...data });
       await putEvent(event);
       return {
