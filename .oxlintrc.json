@@ -1,0 +1,20 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "deny",
+    "perf": "deny",
+    "suspicious": "deny"
+  },
+  "ignorePatterns": ["src/vendor/**"],
+  "plugins": ["import", "node", "oxc", "promise", "typescript", "unicorn", "vitest"],
+  "rules": {
+    // Durable storage mutations, retry loops, and polling must remain sequential.
+    "no-await-in-loop": "off",
+    // These names are part of the tagged-JSON wire protocol.
+    "no-underscore-dangle": ["deny", { "allow": ["__type", "__uint8array"] }],
+    // Generic storage/RPC methods use their type parameter to describe decoded data.
+    "typescript/no-unnecessary-type-parameters": "off",
+    // Runtime boundaries validate data through schemas, tagged codecs, or platform contracts.
+    "typescript/no-unsafe-type-assertion": "off"
+  }
+}

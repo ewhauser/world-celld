@@ -11,6 +11,23 @@ import { createQueue, shardFor } from '../src/queue.js';
 import { parse, stringify } from '../src/vendor/shared/index.js';
 import { clearMockData, createMockEnv, recordedEnqueues } from '../src/test-mocks.js';
 
+function vqsRequest(
+  message: unknown,
+  headers: Record<string, string> = {
+    'x-vqs-queue-name': 'workflow:test-queue',
+    'x-vqs-message-id': 'msg_test',
+    'x-vqs-message-attempt': '1',
+  },
+): Request {
+  return new Request('http://localhost', {
+    method: 'POST',
+    headers,
+    body: stringify(message),
+  });
+}
+
+type QueueMessageHandler = Parameters<ReturnType<typeof createQueue>['createQueueHandler']>[1];
+
 describe('Queue (celld QueueDO integration)', () => {
   let mockEnv: ReturnType<typeof createMockEnv>;
   let queue: ReturnType<typeof createQueue>;
@@ -62,24 +79,24 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should route workflow queues to the flow pathname', async () => {
-      await queue.queue('__wkf_workflow_test' as ValidQueueName, {});
+      await queue.queue('__wkf_workflow_test', {});
       expect(recordedEnqueues[0].pathname).toBe('flow');
     });
 
     it('should include the idempotency key in the enqueue request', async () => {
       const idempotencyKey = 'unique-key-123';
-      await queue.queue('__wkf_step_test' as ValidQueueName, { data: 'test' }, { idempotencyKey });
+      await queue.queue('__wkf_step_test', { data: 'test' }, { idempotencyKey });
       expect(recordedEnqueues[0].idempotencyKey).toBe(idempotencyKey);
     });
 
     it('should pass delaySeconds through to the queue cell', async () => {
-      await queue.queue('__wkf_step_test' as ValidQueueName, {}, { delaySeconds: 42 });
+      await queue.queue('__wkf_step_test', {}, { delaySeconds: 42 });
       expect(recordedEnqueues[0].delaySeconds).toBe(42);
     });
 
     it('should generate unique monotonic message IDs', async () => {
-      const first = await queue.queue('__wkf_step_test' as ValidQueueName, {});
-      const second = await queue.queue('__wkf_step_test' as ValidQueueName, {});
+      const first = await queue.queue('__wkf_step_test', {});
+      const second = await queue.queue('__wkf_step_test', {});
 
       expect(first.messageId).toMatch(/^msg_/);
       expect(second.messageId).toMatch(/^msg_/);
@@ -87,16 +104,8 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should return the original messageId when the cell dedups on idempotencyKey', async () => {
-      const first = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
-        { data: 1 },
-        { idempotencyKey: 'step-abc' },
-      );
-      const second = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
-        { data: 1 },
-        { idempotencyKey: 'step-abc' },
-      );
+      const first = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
+      const second = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
 
       expect(second.messageId).toBe(first.messageId);
       expect(recordedEnqueues).toHaveLength(1);
@@ -104,7 +113,7 @@ describe('Queue (celld QueueDO integration)', () => {
 
     it('should round-trip Uint8Array payloads (binary-safe transport)', async () => {
       const input = new Uint8Array([0, 1, 2, 250, 251, 252]);
-      await queue.queue('__wkf_step_test' as ValidQueueName, {
+      await queue.queue('__wkf_step_test', {
         runId: 'wrun_1',
         runInput: { input, deploymentId: 'd', workflowName: 'w', specVersion: 3 },
       });
@@ -122,8 +131,8 @@ describe('Queue (celld QueueDO integration)', () => {
         queueShards: 4,
       });
 
-      await queue.queue('__wkf_step_a' as ValidQueueName, { n: 1 }, { idempotencyKey: 'k-1' });
-      await queue.queue('__wkf_step_b' as ValidQueueName, { n: 2 }, { idempotencyKey: 'k-1' });
+      await queue.queue('__wkf_step_a', { n: 1 }, { idempotencyKey: 'k-1' });
+      await queue.queue('__wkf_step_b', { n: 2 }, { idempotencyKey: 'k-1' });
 
       // Cell-level dedup on the same key means only the first enqueue lands.
       expect(recordedEnqueues).toHaveLength(1);
@@ -141,7 +150,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should not enqueue into queue cells in test mode', async () => {
-      await queue.queue('__wkf_step_q' as ValidQueueName, { data: 'test' });
+      await queue.queue('__wkf_step_q', { data: 'test' });
       expect(recordedEnqueues).toHaveLength(0);
     });
 
@@ -154,26 +163,18 @@ describe('Queue (celld QueueDO integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      await queue.queue('__wkf_step_q' as ValidQueueName, { data: 'test' });
+      await queue.queue('__wkf_step_q', { data: 'test' });
       expect(recordedEnqueues).toHaveLength(0);
     });
 
     it('should dedup messages on idempotencyKey while inflight', async () => {
-      const first = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
-        { data: 1 },
-        { idempotencyKey: 'step-abc' },
-      );
-      const second = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
-        { data: 1 },
-        { idempotencyKey: 'step-abc' },
-      );
+      const first = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
+      const second = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
 
       expect(second.messageId).toBe(first.messageId);
 
       const third = await queue.queue(
-        '__wkf_step_a' as ValidQueueName,
+        '__wkf_step_a',
         { data: 2 },
         { idempotencyKey: 'step-other' },
       );
@@ -189,23 +190,8 @@ describe('Queue (celld QueueDO integration)', () => {
       });
     });
 
-    function vqsRequest(
-      message: unknown,
-      headers: Record<string, string> = {
-        'x-vqs-queue-name': 'workflow:test-queue',
-        'x-vqs-message-id': 'msg_test',
-        'x-vqs-message-attempt': '1',
-      },
-    ): Request {
-      return new Request('http://localhost', {
-        method: 'POST',
-        headers,
-        body: stringify(message),
-      });
-    }
-
     it('should invoke handler with the parsed message and metadata', async () => {
-      const handler = vi.fn().mockResolvedValue(undefined);
+      const handler = vi.fn<QueueMessageHandler>().mockResolvedValue(undefined);
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const response = await queueHandler(vqsRequest({ data: 'test-data' }));
@@ -223,7 +209,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should revive Uint8Array payloads before invoking the handler', async () => {
-      const handler = vi.fn().mockResolvedValue(undefined);
+      const handler = vi.fn<QueueMessageHandler>().mockResolvedValue(undefined);
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const input = new Uint8Array([9, 8, 7]);
@@ -236,7 +222,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should pass the attempt from the x-vqs-message-attempt header', async () => {
-      const handler = vi.fn().mockResolvedValue(undefined);
+      const handler = vi.fn<QueueMessageHandler>().mockResolvedValue(undefined);
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       await queueHandler(
@@ -257,7 +243,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should signal redelivery when the handler returns timeoutSeconds', async () => {
-      const handler = vi.fn().mockResolvedValue({ timeoutSeconds: 30 });
+      const handler = vi.fn<QueueMessageHandler>().mockResolvedValue({ timeoutSeconds: 30 });
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const response = await queueHandler(vqsRequest({ data: 'test' }));
@@ -270,7 +256,7 @@ describe('Queue (celld QueueDO integration)', () => {
 
     it('should surface permanent errors with their own status', async () => {
       const handler = vi
-        .fn()
+        .fn<QueueMessageHandler>()
         .mockRejectedValue(new WorkflowWorldError('run already terminal', { status: 410 }));
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
@@ -282,7 +268,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should return 500 with Retry-After on transient errors', async () => {
-      const handler = vi.fn().mockRejectedValue(new Error('Handler error'));
+      const handler = vi.fn<QueueMessageHandler>().mockRejectedValue(new Error('Handler error'));
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const response = await queueHandler(vqsRequest({ data: 'test' }));
@@ -294,7 +280,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should reject messages with invalid queue name prefix', async () => {
-      const handler = vi.fn();
+      const handler = vi.fn<QueueMessageHandler>();
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const response = await queueHandler(
@@ -313,7 +299,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should reject requests missing the x-vqs headers', async () => {
-      const handler = vi.fn();
+      const handler = vi.fn<QueueMessageHandler>();
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const response = await queueHandler(

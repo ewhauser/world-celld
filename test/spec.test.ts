@@ -13,7 +13,7 @@
  * suite against live QueueDO cells.
  */
 import { createTestSuite } from '@workflow/world-testing';
-import { afterAll, beforeAll, test } from 'vitest';
+import { afterAll, beforeAll, expect, test } from 'vitest';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 
 const SECRET = 'spec-test-secret';
@@ -29,6 +29,8 @@ afterAll(async () => {
   await harness.close();
 });
 
-test('smoke', () => {});
+test('starts the conformance harness', () => {
+  expect(harness.url).toMatch(/^http:\/\/127\.0\.0\.1:/);
+});
 
 createTestSuite('@ewhauser/world-celld');

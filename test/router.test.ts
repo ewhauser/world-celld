@@ -153,9 +153,9 @@ describe('full stack: vendored storage over the wire', () => {
     expect(run.status).toBe('pending');
     expect(run.createdAt).toBeInstanceOf(Date);
     expect(run.updatedAt).toBeInstanceOf(Date);
-    if ('input' in run) {
-      expect(run.input?.[0]).toBeInstanceOf(Uint8Array);
-    }
+    expect('input' in run).toBe(true);
+    if (!('input' in run)) throw new Error('expected run input');
+    expect(run.input?.[0]).toBeInstanceOf(Uint8Array);
 
     const listed = await storage.runs.list({ workflowName: 'wire-workflow' });
     expect(listed.data.some((r) => r.runId === runId)).toBe(true);

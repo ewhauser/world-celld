@@ -7,12 +7,7 @@ export interface IndexNamespace {
   get(key: string): Promise<string | null>;
   put(key: string, value: string): Promise<void>;
   delete(key: string): Promise<void>;
-  list(options?: {
-    prefix?: string;
-    cursor?: string;
-    limit?: number;
-    reverse?: boolean;
-  }): Promise<{
+  list(options?: { prefix?: string; cursor?: string; limit?: number; reverse?: boolean }): Promise<{
     keys: Array<{ name: string }>;
     list_complete: boolean;
     cursor?: string;
@@ -28,11 +23,7 @@ export interface IndexNamespace {
     owner: HookTokenOwner,
   ): Promise<void>;
   releaseHookToken(token: string, owner: HookTokenOwner): Promise<void>;
-  deleteHookIndexes(
-    token: string,
-    hookId: string,
-    owner: HookTokenOwner,
-  ): Promise<void>;
+  deleteHookIndexes(token: string, hookId: string, owner: HookTokenOwner): Promise<void>;
 }
 
 export interface HookTokenOwner {
@@ -97,8 +88,7 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
     fleetUrl: config?.fleetUrl ?? process.env.CELLD_FLEET_URL,
     secret: config?.secret ?? process.env.CELLD_WORLD_SECRET,
     env: config?.env,
-    deploymentId:
-      config?.deploymentId ?? process.env.CELLD_DEPLOYMENT_ID ?? 'celld-default',
+    deploymentId: config?.deploymentId ?? process.env.CELLD_DEPLOYMENT_ID ?? 'celld-default',
     baseUrl: config?.baseUrl,
     queueShards: config?.queueShards ?? 1,
     readPollMs: config?.readPollMs ?? 250,

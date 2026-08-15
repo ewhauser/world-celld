@@ -141,25 +141,25 @@ cell that owns the data.
 Application options can be passed to `createCelldWorld()` unless an environment
 variable is shown below.
 
-| Option | Environment variable | Default |
-| --- | --- | --- |
-| `fleetUrl` | `CELLD_FLEET_URL` | required |
-| `secret` | `CELLD_WORLD_SECRET` | required with `fleetUrl` |
-| `baseUrl` | `WORKFLOW_BASE_URL` | `http://localhost:$PORT` |
-| `deploymentId` | `CELLD_DEPLOYMENT_ID` | `celld-default` |
-| `queueShards` | — | `1` |
-| `readPollMs` | — | `250` |
-| `rpcTimeoutMs` | — | `30000` |
+| Option         | Environment variable  | Default                  |
+| -------------- | --------------------- | ------------------------ |
+| `fleetUrl`     | `CELLD_FLEET_URL`     | required                 |
+| `secret`       | `CELLD_WORLD_SECRET`  | required with `fleetUrl` |
+| `baseUrl`      | `WORKFLOW_BASE_URL`   | `http://localhost:$PORT` |
+| `deploymentId` | `CELLD_DEPLOYMENT_ID` | `celld-default`          |
+| `queueShards`  | —                     | `1`                      |
+| `readPollMs`   | —                     | `250`                    |
+| `rpcTimeoutMs` | —                     | `30000`                  |
 
 The deployed worker also accepts these celld variables:
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `WORLD_SECRET` | none | Required bearer secret for RPC routes |
-| `WORKFLOW_CALLBACK_SECRET` | none | Sent with deliveries as `x-workflow-callback-secret` |
-| `QUEUE_MAX_ATTEMPTS` | `5` | Attempts before a message is dead-lettered |
-| `QUEUE_MAX_INFLIGHT` | `5` | Concurrent deliveries per queue cell |
-| `QUEUE_DELIVERY_TIMEOUT_MS` | `300000` | Timeout for an application callback |
+| Variable                    | Default  | Purpose                                              |
+| --------------------------- | -------- | ---------------------------------------------------- |
+| `WORLD_SECRET`              | none     | Required bearer secret for RPC routes                |
+| `WORKFLOW_CALLBACK_SECRET`  | none     | Sent with deliveries as `x-workflow-callback-secret` |
+| `QUEUE_MAX_ATTEMPTS`        | `5`      | Attempts before a message is dead-lettered           |
+| `QUEUE_MAX_INFLIGHT`        | `5`      | Concurrent deliveries per queue cell                 |
+| `QUEUE_DELIVERY_TIMEOUT_MS` | `300000` | Timeout for an application callback                  |
 
 `queueShards` is part of queue placement and is pinned when a queue cell is
 first used. Drain pending work before changing it.
@@ -178,14 +178,15 @@ first used. Drain pending work before changing it.
 ## Development
 
 ```sh
-pnpm build
-pnpm typecheck
-pnpm test
-pnpm check:worker-bundle
+pnpm format
+pnpm check
 ```
 
-The default test suite includes the upstream `@workflow/world-testing`
-conformance suite and does not require celld. To run the live fleet tests:
+`pnpm check` runs formatting, linting, type checking, tests, the build, and the
+worker bundle check. Oxlint runs its correctness, suspicious, and performance
+categories with type-aware checks and warnings denied. The default test suite includes the upstream
+`@workflow/world-testing` conformance suite and does not require celld. To run
+the live fleet tests:
 
 ```sh
 CELLD_FLEET_URL=http://fleet.internal:8080 \

@@ -173,7 +173,7 @@ export function createRouter(env: WorkerEnv) {
     const name = decodeURIComponent(encodedName);
     const namespace = env[binding.env] as DONamespaceLike | undefined;
     if (!namespace) {
-      return errorResponse(500, 'WorldMisconfigured', `missing binding: ${String(binding.env)}`);
+      return errorResponse(500, 'WorldMisconfigured', `missing binding: ${binding.env}`);
     }
 
     try {

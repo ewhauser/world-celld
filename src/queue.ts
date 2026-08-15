@@ -60,6 +60,14 @@ const QUEUE_PATHNAMES = {
   step: 'step',
 } as const satisfies Record<QueueKind, Pathname>;
 
+function isTestMode(): boolean {
+  // Explicit override: force the production QueueDO path even under a test
+  // runner (used by the conformance suite to exercise live queue cells —
+  // the world-testing server inherits VITEST from the vitest parent).
+  if (process.env.CELLD_QUEUE_MODE === 'cells') return false;
+  return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
+}
+
 /**
  * Enqueue request accepted by a QueueDO cell. The message payload travels
  * pre-encoded with the shared tagged-JSON codec (`body`), so the cell can
@@ -251,7 +259,8 @@ function createTestPump(config: CelldQueueConfig) {
   }
 
   async function loop(pathname: Pathname) {
-    while (running) {
+    while (true) {
+      if (!running) return;
       const envelope = await take(pathname);
       if (!envelope) continue;
       try {
@@ -297,14 +306,6 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
 
   const generateMessageId = monotonicFactory();
   const testPump = createTestPump(config);
-
-  function isTestMode(): boolean {
-    // Explicit override: force the production QueueDO path even under a test
-    // runner (used by the conformance suite to exercise live queue cells —
-    // the world-testing server inherits VITEST from the vitest parent).
-    if (process.env.CELLD_QUEUE_MODE === 'cells') return false;
-    return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
-  }
 
   const getQueueStub = (shard: number): QueueCellStub => {
     const id = env.WORKFLOW_QUEUE.idFromName(`q:${shard}`);
@@ -372,7 +373,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
       // - 404/409/410/422         -> permanent, drop without retrying
       // - other non-2xx           -> retry with capped backoff
       return async (req: Request) => {
-        const reqQueueName = req.headers.get('x-vqs-queue-name') as ValidQueueName | null;
+        const reqQueueName = req.headers.get('x-vqs-queue-name');
         const reqMessageId = req.headers.get('x-vqs-message-id') as MessageId | null;
         const attemptStr = req.headers.get('x-vqs-message-attempt');
 

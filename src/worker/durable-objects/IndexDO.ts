@@ -60,7 +60,7 @@ export class IndexDO extends DurableObject {
     // Fetch one extra key to learn whether the listing is complete without
     // advancing past the page (the "exact limit + list_complete" contract
     // storage.ts relies on).
-    const entries = await this.ctx.storage.list<unknown>({
+    const entries = await this.ctx.storage.list({
       prefix,
       ...(options?.reverse
         ? { reverse: true, end: options.cursor }
@@ -109,10 +109,7 @@ export class IndexDO extends DurableObject {
   ): Promise<void> {
     await this.ctx.storage.transaction(async (txn) => {
       const indexedHook = await txn.get<string>(`hook:${token}`);
-      if (
-        indexedHook !== undefined &&
-        !sameOwner(ownerFromHook(indexedHook), owner)
-      ) {
+      if (indexedHook !== undefined && !sameOwner(ownerFromHook(indexedHook), owner)) {
         throw new Error(`Hook token ${token} is owned by another hook`);
       }
       const claim = await txn.get<HookClaim>(`hookclaim:${token}`);
@@ -138,11 +135,7 @@ export class IndexDO extends DurableObject {
     });
   }
 
-  async deleteHookIndexes(
-    token: string,
-    hookId: string,
-    owner: HookTokenOwner,
-  ): Promise<void> {
+  async deleteHookIndexes(token: string, hookId: string, owner: HookTokenOwner): Promise<void> {
     await this.ctx.storage.transaction(async (txn) => {
       const tokenKey = `hook:${token}`;
       const idKey = `hookid:${hookId}`;

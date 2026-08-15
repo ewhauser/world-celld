@@ -2,16 +2,25 @@
  * QueueDO state-machine tests on the fake-cell harness: real class, Map
  * storage, virtual clock, manual alarm dispatch.
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { EnqueueRequest } from '../src/queue.js';
 import { QueueDO, type MessageRow } from '../src/worker/durable-objects/QueueDO.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 
-type FetchStub = ReturnType<typeof vi.fn>;
+type FetchStub = Mock<typeof fetch>;
 
 function jsonResponse(status: number, body?: unknown, headers?: Record<string, string>) {
   return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
 }
+
+const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
+  messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
+  queueName: '__wkf_step_test',
+  pathname: 'step',
+  body: '{"data":"payload"}',
+  config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
+  ...over,
+});
 
 describe('QueueDO', () => {
   let fleet: FakeFleet;
@@ -19,21 +28,15 @@ describe('QueueDO', () => {
   let fetchStub: FetchStub;
   let storage: () => Map<string, unknown>;
 
-  const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
-    messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
-    queueName: '__wkf_step_test' as EnqueueRequest['queueName'],
-    pathname: 'step',
-    body: '{"data":"payload"}',
-    config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
-    ...over,
-  });
-
   beforeEach(() => {
-    fetchStub = vi.fn(async () => jsonResponse(200, { ok: true }));
-    fleet = new FakeFleet({ queue: QueueDO as never }, {
-      clock: () => fleet.now,
-      fetch: fetchStub,
-    });
+    fetchStub = vi.fn<typeof fetch>(async () => jsonResponse(200, { ok: true }));
+    fleet = new FakeFleet(
+      { queue: QueueDO },
+      {
+        clock: () => fleet.now,
+        fetch: fetchStub,
+      },
+    );
     queue = fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
     storage = () => fleet.cell('queue', 'q:0').storage.data;
   });
@@ -101,13 +104,10 @@ describe('QueueDO', () => {
   });
 
   it('does not leave stale lifecycle state when acknowledgement is interrupted', async () => {
-    await queue.enqueue(
-      enqueueReq({ messageId: 'msg_atomic_ack', idempotencyKey: 'atomic-ack' }),
-    );
+    await queue.enqueue(enqueueReq({ messageId: 'msg_atomic_ack', idempotencyKey: 'atomic-ack' }));
     const cellStorage = fleet.cell('queue', 'q:0').storage;
     cellStorage.failNextMutation(
-      (mutation) =>
-        mutation.operation === 'delete' && mutation.key === 'inflight:msg_atomic_ack',
+      (mutation) => mutation.operation === 'delete' && mutation.key === 'inflight:msg_atomic_ack',
       new Error('injected crash during ack'),
     );
 
@@ -223,18 +223,15 @@ describe('QueueDO', () => {
     );
 
     const cellStorage = fleet.cell('queue', 'q:0').storage;
-    cellStorage.failNextMutation(
-      (mutation) => {
-        const attempt =
-          mutation.value !== null &&
-          typeof mutation.value === 'object' &&
-          'attempt' in mutation.value
-            ? (mutation.value as { attempt?: unknown }).attempt
-            : undefined;
-        return mutation.operation === 'put' && mutation.key === 'msg:msg_atomic_retry' && attempt === 1;
-      },
-      new Error('injected crash between retry writes'),
-    );
+    cellStorage.failNextMutation((mutation) => {
+      const attempt =
+        mutation.value !== null && typeof mutation.value === 'object' && 'attempt' in mutation.value
+          ? (mutation.value as { attempt?: unknown }).attempt
+          : undefined;
+      return (
+        mutation.operation === 'put' && mutation.key === 'msg:msg_atomic_retry' && attempt === 1
+      );
+    }, new Error('injected crash between retry writes'));
 
     await tick();
 
@@ -248,9 +245,7 @@ describe('QueueDO', () => {
 
   it('keeps a message recoverable if the dead-letter transition is interrupted', async () => {
     fetchStub.mockResolvedValue(jsonResponse(500, { error: 'dead letter me' }));
-    await queue.enqueue(
-      enqueueReq({ messageId: 'msg_atomic_dlq', idempotencyKey: 'atomic-dlq' }),
-    );
+    await queue.enqueue(enqueueReq({ messageId: 'msg_atomic_dlq', idempotencyKey: 'atomic-dlq' }));
     const data = storage();
     const row = data.get('msg:msg_atomic_dlq') as MessageRow;
     data.set('msg:msg_atomic_dlq', { ...row, attempt: 4 });
@@ -294,10 +289,7 @@ describe('QueueDO', () => {
         config: { targetBaseUrl: 'http://app.test:3000', queueShards: 4 },
       }),
     );
-    expect(drift.ok).toBe(false);
-    if (!drift.ok) {
-      expect(drift.code).toBe('CONFIG_MISMATCH');
-    }
+    expect(drift).toMatchObject({ ok: false, code: 'CONFIG_MISMATCH' });
   });
 
   it('allows the delivery URL to change between enqueues (per-message target)', async () => {
@@ -329,7 +321,7 @@ describe('QueueDO', () => {
     expect(redriven.ok).toBe(true);
 
     await tick();
-    expect((await queue.stats())).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
     const lastCall = fetchStub.mock.calls.at(-1)!;
     expect(lastCall[1].headers['x-vqs-message-attempt']).toBe('1');
   });

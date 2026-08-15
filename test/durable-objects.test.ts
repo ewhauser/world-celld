@@ -427,7 +427,7 @@ describe('Cloudflare Durable Objects Features', () => {
         storage.events.create('wrun_nonexistent', {
           eventType: 'run_started',
         }),
-      ).rejects.toThrow();
+      ).rejects.toThrow(/run/i);
     });
   });
 });

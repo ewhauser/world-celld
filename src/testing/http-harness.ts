@@ -32,7 +32,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       streams: StreamDO as never,
       index: IndexDO as never,
       queue: QueueDO as never,
-      ...(options.extraClasses ?? {}),
+      ...options.extraClasses,
     },
     options.cellEnv ?? {},
   );

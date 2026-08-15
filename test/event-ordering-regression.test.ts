@@ -6,8 +6,7 @@ const ulidState = vi.hoisted(() => ({ factoryCount: 0 }));
 vi.mock('ulid', () => ({
   monotonicFactory: () => {
     const factoryIndex = ulidState.factoryCount++;
-    const id =
-      factoryIndex === 0 ? '0000000000ZZZZZZZZZZZZZZZZ' : '00000000000000000000000000';
+    const id = factoryIndex === 0 ? '0000000000ZZZZZZZZZZZZZZZZ' : '00000000000000000000000000';
     return () => id;
   },
 }));

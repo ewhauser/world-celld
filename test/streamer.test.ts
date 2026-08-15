@@ -17,6 +17,10 @@ function text(chunks: Uint8Array[]): string {
   return chunks.map((c) => new TextDecoder().decode(c)).join('');
 }
 
+async function fail(): Promise<never> {
+  throw new Error('DO unavailable');
+}
+
 describe('Streamer (StreamDO RPC integration)', () => {
   let mockEnv: ReturnType<typeof createMockEnv>;
   let streamer: ReturnType<typeof createStreamer>;
@@ -197,16 +201,13 @@ describe('Streamer (StreamDO RPC integration)', () => {
     });
 
     it('should propagate DO errors instead of silently closing', async () => {
-      const fail = async (): Promise<never> => {
-        throw new Error('DO unavailable');
-      };
       const failingStub: StreamDOStub = {
-        writeChunk: vi.fn(fail),
-        closeStream: vi.fn(fail),
-        getChunks: vi.fn(fail),
-        getInfo: vi.fn(fail),
-        registerStream: vi.fn(fail),
-        listStreams: vi.fn(fail),
+        writeChunk: vi.fn<StreamDOStub['writeChunk']>(fail),
+        closeStream: vi.fn<StreamDOStub['closeStream']>(fail),
+        getChunks: vi.fn<StreamDOStub['getChunks']>(fail),
+        getInfo: vi.fn<StreamDOStub['getInfo']>(fail),
+        registerStream: vi.fn<StreamDOStub['registerStream']>(fail),
+        listStreams: vi.fn<StreamDOStub['listStreams']>(fail),
       };
       const failingEnv = {
         WORKFLOW_STREAMS: {
@@ -273,18 +274,18 @@ describe('Streamer (StreamDO RPC integration)', () => {
     it('keeps a default page below the Worker memory limit after base64 encoding', async () => {
       const oneMiB = new Uint8Array(1024 * 1024);
       const largeChunkStub: StreamDOStub = {
-        writeChunk: vi.fn(),
-        closeStream: vi.fn(),
-        getChunks: vi.fn(async ({ limit }) => ({
+        writeChunk: vi.fn<StreamDOStub['writeChunk']>(),
+        closeStream: vi.fn<StreamDOStub['closeStream']>(),
+        getChunks: vi.fn<StreamDOStub['getChunks']>(async ({ limit }) => ({
           // Reuse one allocation: the regression is the logical response size,
           // not Node heap pressure inside the test process.
           chunks: Array.from({ length: limit }, () => oneMiB),
           done: false,
           tailIndex: limit - 1,
         })),
-        getInfo: vi.fn(async () => ({ tailIndex: -1, done: false })),
-        registerStream: vi.fn(),
-        listStreams: vi.fn(async () => []),
+        getInfo: vi.fn<StreamDOStub['getInfo']>(async () => ({ tailIndex: -1, done: false })),
+        registerStream: vi.fn<StreamDOStub['registerStream']>(),
+        listStreams: vi.fn<StreamDOStub['listStreams']>(async () => []),
       };
       const boundedStreamer = createStreamer({
         env: {
@@ -320,7 +321,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
       await streamer.writeToStream('stream-c', 'wrun_other', 'c');
 
       const streams = await streamer.listStreamsByRunId('wrun_list');
-      expect(streams.sort()).toEqual(['stream-a', 'stream-b']);
+      expect(streams.toSorted()).toEqual(['stream-a', 'stream-b']);
 
       const other = await streamer.listStreamsByRunId('wrun_other');
       expect(other).toEqual(['stream-c']);

@@ -165,6 +165,11 @@ function throwOutcomeError(
   }
 }
 
+const parseRun = (run: WorkflowRun): WorkflowRun => WorkflowRunSchema.parse(compact(run));
+const parseStep = (step: Step): Step => StepSchema.parse(compact(step));
+const parseHook = (hook: Hook): Hook => HookSchema.parse(compact(hook));
+const parseEvent = (event: Event): Event => EventSchema.parse(compact(event));
+
 export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
   const ulid = monotonicFactory();
@@ -174,11 +179,6 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
     const id = env.WORKFLOW_DB.idFromName(runId);
     return env.WORKFLOW_DB.get(id);
   };
-
-  const parseRun = (run: WorkflowRun): WorkflowRun => WorkflowRunSchema.parse(compact(run));
-  const parseStep = (step: Step): Step => StepSchema.parse(compact(step));
-  const parseHook = (hook: Hook): Hook => HookSchema.parse(compact(hook));
-  const parseEvent = (event: Event): Event => EventSchema.parse(compact(event));
 
   const runsGet = async (
     runId: string,

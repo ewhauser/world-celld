@@ -6,8 +6,8 @@
     "celld",
     "durable-objects",
     "self-hosted",
-    "workflow",
-    "vercel-workflow"
+    "vercel-workflow",
+    "workflow"
   ],
   "license": "Apache-2.0",
   "author": "ewhauser",
@@ -15,12 +15,12 @@
     "type": "git",
     "url": "https://github.com/ewhauser/world-celld.git"
   },
-  "type": "module",
   "files": [
     "dist",
     "celld-worker",
     "NOTICE"
   ],
+  "type": "module",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -39,16 +39,16 @@
   },
   "scripts": {
     "build": "tsdown",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm check:worker-bundle",
     "clean": "rm -rf dist",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives .",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "typecheck": "tsc --noEmit",
     "check:worker-bundle": "node scripts/check-worker-bundle.mjs"
   },
-  "engines": {
-    "node": ">=22"
-  },
-  "packageManager": "pnpm@11.15.0",
   "dependencies": {
     "@workflow/errors": "4.1.4",
     "@workflow/world": "4.2.1",
@@ -60,8 +60,15 @@
     "@types/node": "^22.19.0",
     "@workflow/world-testing": "4.1.11",
     "esbuild": "^0.25.0",
+    "oxfmt": "^0.63.0",
+    "oxlint": "^1.78.0",
+    "oxlint-tsgolint": "^7.0.2001",
     "tsdown": "^0.22.0",
     "typescript": "^5.9.3",
     "vitest": "^4.1.10"
-  }
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.15.0"
 }

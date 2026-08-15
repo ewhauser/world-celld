@@ -165,11 +165,7 @@ describe('Storage regressions', () => {
       pagination: { sortOrder: 'desc' },
     });
 
-    expect(result.data.map((run) => run.runId)).toEqual([
-      third.runId,
-      second.runId,
-      first.runId,
-    ]);
+    expect(result.data.map((run) => run.runId)).toEqual([third.runId, second.runId, first.runId]);
   });
 
   it('fills a status-filtered run page before advancing its cursor', async () => {

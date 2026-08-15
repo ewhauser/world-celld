@@ -1093,7 +1093,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       expect(pages).toBe(3);
       expect(seen).toHaveLength(8);
       expect(new Set(seen).size).toBe(8);
-      expect([...seen].sort()).toEqual(seen);
+      expect(seen.toSorted()).toEqual(seen);
     });
 
     it('should paginate events in descending order', async () => {
@@ -1126,7 +1126,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
       const all = [...page1.data, ...page2.data].map((e) => e.eventId);
       expect(new Set(all).size).toBe(5);
-      expect([...all].sort().reverse()).toEqual(all);
+      expect(all.toSorted().toReversed()).toEqual(all);
     });
 
     it('should paginate steps with limit and cursor', async () => {

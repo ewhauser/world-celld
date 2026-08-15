@@ -9,7 +9,7 @@
  * real-time pump driving the fake fleet's alarms.
  */
 import { createTestSuite } from '@workflow/world-testing';
-import { afterEach, beforeEach, test } from 'vitest';
+import { afterEach, beforeEach, expect, test } from 'vitest';
 import { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 
@@ -22,7 +22,7 @@ let pumping = false;
 beforeEach(async () => {
   harness = await startHarness({
     secret: SECRET,
-    extraClasses: { queue: QueueDO as never },
+    extraClasses: { queue: QueueDO },
   });
   process.env.CELLD_FLEET_URL = harness.url;
   process.env.CELLD_WORLD_SECRET = SECRET;
@@ -49,6 +49,8 @@ afterEach(async () => {
   harness = null;
 });
 
-test('smoke', () => {});
+test('starts the queue conformance harness', () => {
+  expect(harness?.url).toMatch(/^http:\/\/127\.0\.0\.1:/);
+});
 
 createTestSuite('@ewhauser/world-celld');

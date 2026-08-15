@@ -60,7 +60,7 @@ function createMemoryStore(getData: () => Map<string, unknown>): EventStore {
       const data = getData();
       let keys = Array.from(data.keys())
         .filter((key) => key.startsWith(options.prefix))
-        .sort();
+        .toSorted();
       if (options.startAfter !== undefined) {
         const bound = options.startAfter;
         keys = keys.filter((key) => key > bound);
@@ -70,7 +70,7 @@ function createMemoryStore(getData: () => Map<string, unknown>): EventStore {
         keys = keys.filter((key) => key < bound);
       }
       if (options.reverse) {
-        keys = keys.reverse();
+        keys = keys.toReversed();
       }
       if (options.limit !== undefined) {
         keys = keys.slice(0, options.limit);
@@ -155,16 +155,11 @@ class MockWorkflowRunDOStub {
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Step[]; cursor: string | null; hasMore: boolean }> {
-    return listByCreationTime<Step>(
-      this.store,
-      STEP_CREATED_KEY_PREFIX,
-      STEP_KEY_PREFIX,
-      {
-        limit: params?.limit ?? 20,
-        cursor: params?.cursor,
-        sortOrder: params?.sortOrder ?? 'asc',
-      },
-    );
+    return listByCreationTime<Step>(this.store, STEP_CREATED_KEY_PREFIX, STEP_KEY_PREFIX, {
+      limit: params?.limit ?? 20,
+      cursor: params?.cursor,
+      sortOrder: params?.sortOrder ?? 'asc',
+    });
   }
 
   async listHooks(params?: {
@@ -172,16 +167,11 @@ class MockWorkflowRunDOStub {
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
   }): Promise<{ data: Hook[]; cursor: string | null; hasMore: boolean }> {
-    return listByCreationTime<Hook>(
-      this.store,
-      HOOK_CREATED_KEY_PREFIX,
-      HOOK_KEY_PREFIX,
-      {
-        limit: params?.limit ?? 100,
-        cursor: params?.cursor,
-        sortOrder: params?.sortOrder ?? 'asc',
-      },
-    );
+    return listByCreationTime<Hook>(this.store, HOOK_CREATED_KEY_PREFIX, HOOK_KEY_PREFIX, {
+      limit: params?.limit ?? 100,
+      cursor: params?.cursor,
+      sortOrder: params?.sortOrder ?? 'asc',
+    });
   }
 
   async claimInflight(params: { messageId: string; staleMs: number }): Promise<{
@@ -238,17 +228,15 @@ class MockKVNamespace {
 
     let matchingKeys = Array.from(kvData.keys())
       .filter((key) => key.startsWith(prefix))
-      .sort();
+      .toSorted();
 
     if (options?.cursor) {
       const cursor = options.cursor;
-      matchingKeys = matchingKeys.filter((key) =>
-        options.reverse ? key < cursor : key > cursor,
-      );
+      matchingKeys = matchingKeys.filter((key) => (options.reverse ? key < cursor : key > cursor));
     }
 
     if (options?.reverse) {
-      matchingKeys.reverse();
+      matchingKeys = matchingKeys.toReversed();
     }
 
     const page = matchingKeys.slice(0, limit);
@@ -321,11 +309,7 @@ class MockKVNamespace {
     }
   }
 
-  async deleteHookIndexes(
-    token: string,
-    hookId: string,
-    owner: HookTokenOwner,
-  ): Promise<void> {
+  async deleteHookIndexes(token: string, hookId: string, owner: HookTokenOwner): Promise<void> {
     for (const key of [`hook:${token}`, `hookid:${hookId}`]) {
       const raw = kvData.get(key);
       if (raw !== undefined) {
@@ -382,7 +366,7 @@ class MockStreamDOStub {
   }
 
   async listStreams(): Promise<string[]> {
-    return Array.from(this.registry).sort();
+    return Array.from(this.registry).toSorted();
   }
 }
 
