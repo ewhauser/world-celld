@@ -130,6 +130,7 @@ export class FakeStorage {
 class FakeTransaction {
   private staged = new Map<string, unknown>();
   private deleted = new Set<string>();
+  private stagedAlarm: number | null | undefined;
 
   constructor(private storage: FakeStorage) {}
 
@@ -161,9 +162,22 @@ class FakeTransaction {
     return new Map(keys.map((k) => [k, merged.get(k) as T]));
   }
 
+  async getAlarm(): Promise<number | null> {
+    return this.stagedAlarm === undefined ? this.storage.alarmAt : this.stagedAlarm;
+  }
+
+  async setAlarm(at: number | Date): Promise<void> {
+    this.stagedAlarm = typeof at === 'number' ? at : at.getTime();
+  }
+
+  async deleteAlarm(): Promise<void> {
+    this.stagedAlarm = null;
+  }
+
   commit(): void {
     for (const key of this.deleted) this.storage.data.delete(key);
     for (const [key, value] of this.staged) this.storage.data.set(key, value);
+    if (this.stagedAlarm !== undefined) this.storage.alarmAt = this.stagedAlarm;
   }
 }
 

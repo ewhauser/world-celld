@@ -46,6 +46,24 @@ function rate(count: number, durationMs: number): number {
   return Number((count / Math.max(durationMs / 1000, 0.001)).toFixed(2));
 }
 
+interface LatencySummary {
+  count: number;
+  p50: number;
+  p95: number;
+  p99: number;
+  max: number;
+}
+
+function summarizeLatency(values: number[]): LatencySummary {
+  return {
+    count: values.length,
+    p50: percentile(values, 0.5),
+    p95: percentile(values, 0.95),
+    p99: percentile(values, 0.99),
+    max: percentile(values, 1),
+  };
+}
+
 async function runPool(
   count: number,
   concurrency: number,
@@ -80,10 +98,11 @@ interface PerfPayload {
 interface Delivery {
   messageId: string;
   latencyMs: number;
+  callbackAttempts: number;
 }
 
 interface PerfResult {
-  schemaVersion: 1;
+  schemaVersion: 2;
   recordedAt: string;
   backend: { name: 'minio'; version: string; celldVersion: string };
   workload: Record<string, number>;
@@ -93,8 +112,10 @@ interface PerfResult {
     totalDurationMs: number;
     enqueuePerSecond: number;
     deliveryPerSecond: number;
-    enqueueLatencyMs: Record<string, number>;
-    deliveryLatencyMs: Record<string, number>;
+    enqueueLatencyMs: LatencySummary;
+    deliveryLatencyMs: LatencySummary;
+    firstAttemptDeliveryLatencyMs: LatencySummary;
+    retriedDeliveryLatencyMs: LatencySummary;
   };
   queueStats: QueueStats[];
   budgets: Record<string, number>;
@@ -106,7 +127,7 @@ describe('MinIO single-node queue performance and loss', () => {
   const callbackPort = positiveInteger('PERF_CALLBACK_PORT', 3000);
   const messageCount = positiveInteger('PERF_MESSAGES', 1000);
   const concurrency = positiveInteger('PERF_CONCURRENCY', 32);
-  const queueShards = positiveInteger('PERF_QUEUE_SHARDS', 8);
+  const queueShards = positiveInteger('PERF_QUEUE_SHARDS', 2);
   const payloadBytes = positiveInteger('PERF_PAYLOAD_BYTES', 256);
   const retryEvery = nonNegativeInteger('PERF_RETRY_EVERY', 20);
   const timeoutMs = positiveInteger('PERF_TIMEOUT_MS', 180_000);
@@ -178,7 +199,7 @@ describe('MinIO single-node queue performance and loss', () => {
         successfulDuplicates++;
       } else {
         const latencyMs = performance.now() - start;
-        successful.set(sequence, { messageId, latencyMs });
+        successful.set(sequence, { messageId, latencyMs, callbackAttempts: attemptCount });
         deliveryLatencies.push(latencyMs);
       }
 
@@ -259,9 +280,15 @@ describe('MinIO single-node queue performance and loss', () => {
     const enqueuePerSecond = rate(accepted.size, enqueueDurationMs);
     const deliveryPerSecond = rate(successful.size, totalDurationMs);
     const deliveryP99Ms = percentile(deliveryLatencies, 0.99);
+    const firstAttemptDeliveryLatencies = Array.from(successful.values())
+      .filter((delivery) => delivery.callbackAttempts === 1)
+      .map((delivery) => delivery.latencyMs);
+    const retriedDeliveryLatencies = Array.from(successful.values())
+      .filter((delivery) => delivery.callbackAttempts > 1)
+      .map((delivery) => delivery.latencyMs);
 
     const result: PerfResult = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       recordedAt: new Date().toISOString(),
       backend: {
         name: 'minio',
@@ -298,18 +325,10 @@ describe('MinIO single-node queue performance and loss', () => {
         totalDurationMs: Number(totalDurationMs.toFixed(2)),
         enqueuePerSecond,
         deliveryPerSecond,
-        enqueueLatencyMs: {
-          p50: percentile(enqueueLatencies, 0.5),
-          p95: percentile(enqueueLatencies, 0.95),
-          p99: percentile(enqueueLatencies, 0.99),
-          max: percentile(enqueueLatencies, 1),
-        },
-        deliveryLatencyMs: {
-          p50: percentile(deliveryLatencies, 0.5),
-          p95: percentile(deliveryLatencies, 0.95),
-          p99: deliveryP99Ms,
-          max: percentile(deliveryLatencies, 1),
-        },
+        enqueueLatencyMs: summarizeLatency(enqueueLatencies),
+        deliveryLatencyMs: summarizeLatency(deliveryLatencies),
+        firstAttemptDeliveryLatencyMs: summarizeLatency(firstAttemptDeliveryLatencies),
+        retriedDeliveryLatencyMs: summarizeLatency(retriedDeliveryLatencies),
       },
       queueStats,
       budgets: {

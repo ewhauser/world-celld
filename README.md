@@ -201,7 +201,8 @@ node with Docker Compose, sends concurrent queue traffic, and verifies that
 every accepted message reaches a successful callback. A configurable portion
 of callbacks returns one `503` first, so the same run also exercises durable
 redelivery. The result includes enqueue and delivery throughput plus p50, p95,
-p99, and maximum latency, and is saved to `.perf-results/minio-latest.json`.
+p99, and maximum latency for all deliveries, first-attempt successes, and
+retried messages. It is saved to `.perf-results/minio-latest.json`.
 
 > MinIO Community is **not a supported celld production store**. It does not
 > implement the conditional writes celld needs for ownership fencing. This
@@ -215,7 +216,7 @@ With Docker and the Compose plugin installed, run:
 pnpm test:perf:minio
 ```
 
-The defaults send 1,000 messages with concurrency 32 across eight queue cells,
+The defaults send 1,000 messages with concurrency 32 across two queue cells,
 and force every twentieth message through one `503` redelivery.
 
 #### Reference result
@@ -229,21 +230,25 @@ machine; container results will differ.
 | Machine     | MacBook Pro (Mac15,8), Apple M3 Max, 16 cores (12 performance, 4 efficiency), 64 GB RAM                  |
 | OS          | macOS 26.5.2 (25F84), arm64                                                                              |
 | Services    | celld v0.2.1; MinIO RELEASE.2025-09-07T16-13-09Z                                                         |
-| Workload    | 1,000 messages; concurrency 32; 8 queue shards; 256-byte target payload; every 20th message retried once |
+| Workload    | 1,000 messages; concurrency 32; 2 queue shards; 256-byte target payload; every 20th message retried once |
 
-| Metric                      |                                                                            Result |
-| --------------------------- | --------------------------------------------------------------------------------: |
-| Delivery integrity          | 1,000 accepted, 1,000 delivered, 0 missing, 0 duplicate successes, 0 dead letters |
-| Callback attempts           |                                           1,050, including 50 forced redeliveries |
-| Enqueue throughput          |                                                                 248.18 messages/s |
-| Delivery throughput         |                                                                 235.93 messages/s |
-| Enqueue latency             |                        p50 118.70 ms; p95 201.90 ms; p99 250.69 ms; max 345.86 ms |
-| End-to-end delivery latency |                      p50 236.63 ms; p95 442.58 ms; p99 714.80 ms; max 1,049.85 ms |
-| Final queue state           |                        0 pending, 0 in flight, 0 dead letters across all 8 shards |
+| Metric                  |                                                                            Result |
+| ----------------------- | --------------------------------------------------------------------------------: |
+| Delivery integrity      | 1,000 accepted, 1,000 delivered, 0 missing, 0 duplicate successes, 0 dead letters |
+| Callback attempts       |                                           1,050, including 50 forced redeliveries |
+| Enqueue throughput      |                                                                 882.55 messages/s |
+| Delivery throughput     |                                                                 808.81 messages/s |
+| Enqueue latency         |                          p50 24.37 ms; p95 75.60 ms; p99 176.67 ms; max 200.36 ms |
+| All delivery latency    |                         p50 53.95 ms; p95 167.86 ms; p99 210.84 ms; max 312.03 ms |
+| First-attempt latency   |                         p50 52.55 ms; p95 166.35 ms; p99 209.80 ms; max 212.01 ms |
+| Retried-message latency |                         p50 82.52 ms; p95 262.63 ms; p99 312.03 ms; max 312.03 ms |
+| Final queue state       |                         0 pending, 0 in flight, 0 dead letters across both shards |
 
 Use these numbers as a smoke-test reference, not a portable performance
 guarantee. For regression tracking, compare repeated runs on the same machine
-and runtime configuration.
+and runtime configuration. Two shards gave the best latency balance for this
+workload; benchmark your own traffic before changing the shard count. A fleet
+pins its shard count on first use, so changing it requires draining the queues.
 
 Override the workload or set machine-specific regression budgets with
 environment variables:

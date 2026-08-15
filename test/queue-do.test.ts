@@ -22,6 +22,8 @@ const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
   ...over,
 });
 
+const MIN_TEST_ALARM_DELAY_MS = 1;
+
 describe('QueueDO', () => {
   let fleet: FakeFleet;
   let queue: QueueDO;
@@ -42,7 +44,7 @@ describe('QueueDO', () => {
   });
 
   async function tick(advanceMs = 0) {
-    fleet.advance(advanceMs);
+    fleet.advance(Math.max(MIN_TEST_ALARM_DELAY_MS, advanceMs));
     await fleet.fireDueAlarms();
     await fleet.settle();
   }
@@ -397,6 +399,18 @@ describe('QueueDO', () => {
 
     const { alarmAt } = await queue.rearmAlarm();
     expect(alarmAt).toBe(fleet.now + 60_000);
+  });
+
+  it('moves an overdue alarm to a fresh timestamp so celld observes a new edge', async () => {
+    await queue.enqueue(enqueueReq({ messageId: 'msg_stale_alarm' }));
+    fleet.cell('queue', 'q:0').storage.alarmAt = fleet.now - 1_000;
+
+    const { alarmAt } = await queue.rearmAlarm();
+    expect(alarmAt).toBe(fleet.now + MIN_TEST_ALARM_DELAY_MS);
+
+    await tick();
+    expect(fetchStub).toHaveBeenCalledOnce();
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, alarmAt: null });
   });
 
   it('caps concurrent deliveries at the inflight limit', async () => {

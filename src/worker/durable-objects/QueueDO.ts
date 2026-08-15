@@ -66,6 +66,10 @@ const DEFAULT_MAX_INFLIGHT = 5;
 const DEFAULT_DELIVERY_TIMEOUT_MS = 300_000;
 /** Grace period past the delivery timeout before a claim counts as lost. */
 const INFLIGHT_GRACE_MS = 30_000;
+/** Move overdue alarms to a new timestamp so celld observes a fresh edge. */
+const MIN_ALARM_DELAY_MS = 1;
+
+type AlarmStorage = Pick<DurableObjectStorage, 'list' | 'getAlarm' | 'setAlarm' | 'deleteAlarm'>;
 
 function pad(ms: number): string {
   return String(Math.max(0, Math.floor(ms))).padStart(13, '0');
@@ -112,7 +116,6 @@ export class QueueDO extends DurableObject {
   async enqueue(request: EnqueueRequest): Promise<EnqueueOutcome> {
     const storage = this.ctx.storage;
     const now = this.#now();
-    let dueAt: number | null = null;
 
     const outcome = await storage.transaction<EnqueueOutcome>(async (txn) => {
       // Pin the shard count from the first enqueue and reject drift loudly:
@@ -139,6 +142,7 @@ export class QueueDO extends DurableObject {
         const existing = await txn.get<string>(`key:${request.idempotencyKey}`);
         if (existing) {
           if (await txn.get(`msg:${existing}`)) {
+            await this.#scheduleNextAlarm(txn, now);
             return { ok: true, messageId: existing, deduped: true };
           }
           // Stale claim (message gone without release) — steal it.
@@ -157,16 +161,14 @@ export class QueueDO extends DurableObject {
         attempt: 0,
         enqueuedAt: now,
       };
-      dueAt = now + Math.max(0, request.delaySeconds ?? 0) * 1000;
+      const dueAt = now + Math.max(0, request.delaySeconds ?? 0) * 1000;
       await txn.put(`msg:${row.messageId}`, row);
       await txn.put(dueKey(dueAt, row.messageId), row.messageId);
+      await this.#armAlarmAtMost(txn, dueAt, now);
 
       return { ok: true, messageId: row.messageId, deduped: false };
     });
 
-    if (dueAt !== null) {
-      await this.#armAlarmAtMost(dueAt);
-    }
     return outcome;
   }
 
@@ -237,10 +239,10 @@ export class QueueDO extends DurableObject {
           rows.push(row);
         }
       }
+      await this.#scheduleNextAlarm(txn, now);
       return rows;
     });
 
-    await this.#rearm();
     return claimed;
   }
 
@@ -288,6 +290,7 @@ export class QueueDO extends DurableObject {
         await storage.transaction(async (txn) => {
           await txn.delete(`inflight:${row.messageId}`);
           await txn.put(dueKey(now + timeoutSeconds * 1000, row.messageId), row.messageId);
+          await this.#scheduleNextAlarm(txn, now);
         });
       } else {
         await this.#retry(row, 'HTTP 503');
@@ -302,8 +305,6 @@ export class QueueDO extends DurableObject {
         : `transport error: ${String(transportError)}`;
       await this.#retry(row, reason);
     }
-
-    await this.#rearm();
   }
 
   async #ack(row: MessageRow): Promise<void> {
@@ -317,6 +318,7 @@ export class QueueDO extends DurableObject {
           await txn.delete(`key:${row.idempotencyKey}`);
         }
       }
+      await this.#scheduleNextAlarm(txn, this.#now());
     });
   }
 
@@ -339,26 +341,38 @@ export class QueueDO extends DurableObject {
             await txn.delete(`key:${row.idempotencyKey}`);
           }
         }
+        await this.#scheduleNextAlarm(txn, now);
         return;
       }
 
       const updated: MessageRow = { ...row, attempt, lastError: reason };
       await txn.put(`msg:${row.messageId}`, updated);
       await txn.put(dueKey(now + backoffSeconds(attempt) * 1000, row.messageId), row.messageId);
+      await this.#scheduleNextAlarm(txn, now);
     });
   }
 
   /** Arm the alarm no later than `atMs` (durable backoff never throws). */
-  async #armAlarmAtMost(atMs: number): Promise<void> {
-    const current = await this.ctx.storage.getAlarm();
-    if (current === null || atMs < current) {
-      await this.ctx.storage.setAlarm(atMs);
+  async #armAlarmAtMost(storage: AlarmStorage, atMs: number, now: number): Promise<void> {
+    const current = await storage.getAlarm();
+    if (current !== null && current <= now) {
+      await storage.setAlarm(now + MIN_ALARM_DELAY_MS);
+      return;
+    }
+
+    const target = atMs <= now ? now + MIN_ALARM_DELAY_MS : atMs;
+    if (current === null || target < current) {
+      await storage.setAlarm(target);
     }
   }
 
   /** Recompute the alarm from the earliest due entry / inflight deadline. */
   async #rearm(): Promise<void> {
-    const storage = this.ctx.storage;
+    await this.#scheduleNextAlarm(this.ctx.storage, this.#now());
+  }
+
+  /** Keep the alarm index consistent with message state in the same transaction. */
+  async #scheduleNextAlarm(storage: AlarmStorage, now: number): Promise<void> {
     let next: number | null = null;
 
     const due = await storage.list<string>({ prefix: 'due:', limit: 1 });
@@ -372,7 +386,7 @@ export class QueueDO extends DurableObject {
     }
 
     if (next !== null) {
-      await storage.setAlarm(next);
+      await storage.setAlarm(next <= now ? now + MIN_ALARM_DELAY_MS : next);
     } else {
       await storage.deleteAlarm();
     }
@@ -442,14 +456,12 @@ export class QueueDO extends DurableObject {
         await txn.put(`msg:${row.messageId}`, row);
         await txn.put(dueKey(now, row.messageId), row.messageId);
         await txn.delete(key);
+        await this.#armAlarmAtMost(txn, now, now);
         return { ok: true };
       }
       return { ok: false };
     });
 
-    if (outcome.ok) {
-      await this.#armAlarmAtMost(now);
-    }
     return outcome;
   }
 
