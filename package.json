@@ -1,6 +1,6 @@
 {
   "name": "@ewhauser/world-celld",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "celld (self-hosted Durable Objects) World implementation for the Vercel Workflow DevKit",
   "keywords": [
     "celld",
