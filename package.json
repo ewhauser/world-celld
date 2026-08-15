@@ -1,0 +1,67 @@
+{
+  "name": "@ewhauser/world-celld",
+  "version": "0.1.0",
+  "description": "celld (self-hosted Durable Objects) World implementation for the Vercel Workflow DevKit",
+  "keywords": [
+    "celld",
+    "durable-objects",
+    "self-hosted",
+    "workflow",
+    "vercel-workflow"
+  ],
+  "license": "Apache-2.0",
+  "author": "ewhauser",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ewhauser/world-celld.git"
+  },
+  "type": "module",
+  "files": [
+    "dist",
+    "celld-worker",
+    "NOTICE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/worker.d.ts",
+      "workerd": "./dist/worker.js",
+      "worker": "./dist/worker.js",
+      "default": "./dist/worker.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "default": "./dist/testing.js"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "typecheck": "tsc --noEmit",
+    "check:worker-bundle": "node scripts/check-worker-bundle.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@11.15.0",
+  "dependencies": {
+    "@workflow/errors": "4.1.4",
+    "@workflow/world": "4.2.1",
+    "ulid": "^3.0.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260708.1",
+    "@ewhauser/world-celld": "link:.",
+    "@types/node": "^22.19.0",
+    "@workflow/world-testing": "4.1.11",
+    "esbuild": "^0.25.0",
+    "tsdown": "^0.22.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.10"
+  }
+}

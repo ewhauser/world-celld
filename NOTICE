@@ -1,0 +1,24 @@
+@ewhauser/world-celld
+Copyright 2026 ewhauser
+
+This product includes software developed as part of the "worlds" project
+(https://github.com/vinnymac/worlds), Copyright vinnymac and contributors,
+licensed under the Apache License, Version 2.0.
+
+The following files are vendored (verbatim or with modifications) from
+vinnymac/worlds:
+
+  From packages/world-cloudflare/src:
+    src/apply-event.ts
+    src/storage.ts
+    src/streamer.ts
+    src/queue.ts               (modified: Cloudflare Queues replaced by QueueDO)
+    src/test-mocks.ts          (modified)
+    src/util.ts
+    src/worker/durable-objects/WorkflowRunDO.ts
+    src/worker/durable-objects/StreamDO.ts
+
+  From packages/shared/src:
+    src/vendor/shared/*
+
+  Portions of test/ are derived from packages/world-cloudflare/test.

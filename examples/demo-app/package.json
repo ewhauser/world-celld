@@ -1,0 +1,23 @@
+{
+  "name": "world-celld-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "nitro dev",
+    "build": "nitro build",
+    "start": "node .output/server/index.mjs",
+    "fleet:local": "node scripts/local-fleet.mjs",
+    "demo": "node scripts/run-demo.mjs"
+  },
+  "dependencies": {
+    "@ewhauser/world-celld": "workspace:*",
+    "hono": "^4.13.2",
+    "workflow": "4.6.0"
+  },
+  "devDependencies": {
+    "nitro": "3.0.260610-beta",
+    "rollup": "^4.30.0",
+    "typescript": "^5.9.3"
+  }
+}

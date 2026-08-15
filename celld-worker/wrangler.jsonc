@@ -1,0 +1,32 @@
+{
+  // world-celld worker: deployed to a celld fleet with `celld deploy`.
+  // celld accepts wrangler.jsonc (not .toml) and only these keys — anything
+  // else fails the deploy loudly.
+  "name": "workflow-world",
+  "main": "worker.ts",
+  "compatibility_date": "2026-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "WORKFLOW_DB", "class_name": "WorkflowRunDO" },
+      { "name": "WORKFLOW_STREAMS", "class_name": "StreamDO" },
+      { "name": "WORKFLOW_INDEX", "class_name": "IndexDO" },
+      { "name": "WORKFLOW_QUEUE", "class_name": "QueueDO" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["WorkflowRunDO", "StreamDO", "IndexDO", "QueueDO"]
+    }
+  ],
+  "vars": {
+    // REQUIRED: bearer secret for the world's RPC surface. All /v1/rpc
+    // routes fail closed with 503 while this is empty. Inject the real value
+    // at the node level with CELLD_VAR_WORLD_SECRET instead of committing it.
+    "WORLD_SECRET": "",
+    // Optional: forwarded as x-workflow-callback-secret on queue deliveries.
+    "WORKFLOW_CALLBACK_SECRET": ""
+    // Optional queue tuning (strings): QUEUE_MAX_ATTEMPTS, QUEUE_MAX_INFLIGHT,
+    // QUEUE_DELIVERY_TIMEOUT_MS.
+  }
+}

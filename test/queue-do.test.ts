@@ -1,0 +1,299 @@
+/**
+ * QueueDO state-machine tests on the fake-cell harness: real class, Map
+ * storage, virtual clock, manual alarm dispatch.
+ */
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import type { EnqueueRequest } from '../src/queue.js';
+import { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
+import { FakeFleet } from '../src/testing/fake-cell.js';
+
+type FetchStub = ReturnType<typeof vi.fn>;
+
+function jsonResponse(status: number, body?: unknown, headers?: Record<string, string>) {
+  return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
+}
+
+describe('QueueDO', () => {
+  let fleet: FakeFleet;
+  let queue: QueueDO;
+  let fetchStub: FetchStub;
+  let storage: () => Map<string, unknown>;
+
+  const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
+    messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
+    queueName: '__wkf_step_test' as EnqueueRequest['queueName'],
+    pathname: 'step',
+    body: '{"data":"payload"}',
+    config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
+    ...over,
+  });
+
+  beforeEach(() => {
+    fetchStub = vi.fn(async () => jsonResponse(200, { ok: true }));
+    fleet = new FakeFleet({ queue: QueueDO as never }, {
+      clock: () => fleet.now,
+      fetch: fetchStub,
+    });
+    queue = fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
+    storage = () => fleet.cell('queue', 'q:0').storage.data;
+  });
+
+  async function tick(advanceMs = 0) {
+    fleet.advance(advanceMs);
+    await fleet.fireDueAlarms();
+    await fleet.settle();
+  }
+
+  it('delivers an enqueued message with x-vqs headers and acks on 2xx', async () => {
+    const req = enqueueReq({ messageId: 'msg_1', idempotencyKey: 'step-1' });
+    const outcome = await queue.enqueue(req);
+    expect(outcome).toEqual({ ok: true, messageId: 'msg_1', deduped: false });
+
+    await tick();
+
+    expect(fetchStub).toHaveBeenCalledOnce();
+    const [url, init] = fetchStub.mock.calls[0];
+    expect(url).toBe('http://app.test:3000/.well-known/workflow/v1/step');
+    expect(init.headers['x-vqs-queue-name']).toBe('__wkf_step_test');
+    expect(init.headers['x-vqs-message-id']).toBe('msg_1');
+    expect(init.headers['x-vqs-message-attempt']).toBe('1');
+    expect(init.body).toBe('{"data":"payload"}');
+
+    // Fully settled: no message, schedule, claim, or alarm left behind.
+    const keys = Array.from(storage().keys());
+    expect(keys.filter((k) => !k.startsWith('cfg'))).toEqual([]);
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+  });
+
+  it('dedups on idempotencyKey while active and releases after ack', async () => {
+    await queue.enqueue(enqueueReq({ messageId: 'msg_a', idempotencyKey: 'k1' }));
+    const dup = await queue.enqueue(enqueueReq({ messageId: 'msg_b', idempotencyKey: 'k1' }));
+    expect(dup).toEqual({ ok: true, messageId: 'msg_a', deduped: true });
+
+    await tick();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+
+    // Key released after ack: a new message with the same key delivers.
+    const fresh = await queue.enqueue(enqueueReq({ messageId: 'msg_c', idempotencyKey: 'k1' }));
+    expect(fresh.deduped).toBe(false);
+    await tick();
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+  });
+
+  it('honors delaySeconds via the alarm', async () => {
+    await queue.enqueue(enqueueReq({ messageId: 'msg_d', delaySeconds: 42 }));
+
+    await tick();
+    expect(fetchStub).not.toHaveBeenCalled();
+
+    await tick(41_000);
+    expect(fetchStub).not.toHaveBeenCalled();
+
+    await tick(1_500);
+    expect(fetchStub).toHaveBeenCalledOnce();
+  });
+
+  it('redelivers after 503 {timeoutSeconds} without advancing the attempt', async () => {
+    fetchStub
+      .mockResolvedValueOnce(jsonResponse(503, { timeoutSeconds: 30 }))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+
+    await queue.enqueue(enqueueReq({ messageId: 'msg_e', idempotencyKey: 'k-e' }));
+    await tick();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    // Key stays claimed during the wait.
+    const dup = await queue.enqueue(enqueueReq({ messageId: 'msg_f', idempotencyKey: 'k-e' }));
+    expect(dup.deduped).toBe(true);
+
+    await tick(31_000);
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    // Same message, attempt header unchanged (503-redeliver is not a retry).
+    expect(fetchStub.mock.calls[1][1].headers['x-vqs-message-attempt']).toBe('1');
+  });
+
+  it('drops permanently on 404/409/410/422 without retrying', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(410, { error: 'gone', permanent: true }));
+
+    await queue.enqueue(enqueueReq({ messageId: 'msg_g', idempotencyKey: 'k-g' }));
+    await tick();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+
+    await tick(120_000);
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+  });
+
+  it('retries transient failures with capped backoff, then dead-letters', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(500, { error: 'boom' }));
+
+    await queue.enqueue(enqueueReq({ messageId: 'msg_h', idempotencyKey: 'k-h' }));
+
+    // Attempt 1 immediately; retries at +2s, +4s, +8s, +16s (cap 60) → 5 total.
+    await tick();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    await tick(2_100);
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    await tick(4_100);
+    expect(fetchStub).toHaveBeenCalledTimes(3);
+    await tick(8_100);
+    expect(fetchStub).toHaveBeenCalledTimes(4);
+    await tick(16_100);
+    expect(fetchStub).toHaveBeenCalledTimes(5);
+
+    // Fifth failure hits maxAttempts → dead letter, key released, no alarm.
+    const stats = await queue.stats();
+    expect(stats).toMatchObject({ pending: 0, inflight: 0, deadLetters: 1 });
+
+    const dlq = await queue.listDeadLetters();
+    expect(dlq.data).toHaveLength(1);
+    expect(dlq.data[0]).toMatchObject({ messageId: 'msg_h', attempt: 5 });
+    expect(dlq.data[0].lastError).toContain('500');
+
+    // Attempt numbers advanced on the wire.
+    expect(fetchStub.mock.calls.map((c) => c[1].headers['x-vqs-message-attempt'])).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+    ]);
+
+    // Key released → new enqueue with the same key is fresh.
+    const fresh = await queue.enqueue(enqueueReq({ messageId: 'msg_i', idempotencyKey: 'k-h' }));
+    expect(fresh.deduped).toBe(false);
+  });
+
+  it('treats network errors as transient', async () => {
+    fetchStub
+      .mockRejectedValueOnce(new Error('ECONNREFUSED'))
+      .mockResolvedValueOnce(jsonResponse(200, { ok: true }));
+
+    await queue.enqueue(enqueueReq({ messageId: 'msg_j' }));
+    await tick();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    await tick(2_100);
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+  });
+
+  it('recovers a lost inflight claim after its deadline (crash simulation)', async () => {
+    // Simulate a claim whose delivery died with the node: message row +
+    // expired inflight marker, no due entry.
+    await queue.enqueue(enqueueReq({ messageId: 'msg_k' }));
+    const data = storage();
+    // Remove the due entry and plant an expired inflight claim.
+    for (const key of Array.from(data.keys())) {
+      if (key.startsWith('due:')) data.delete(key);
+    }
+    data.set('inflight:msg_k', fleet.now - 1);
+    fleet.cell('queue', 'q:0').storage.alarmAt = fleet.now;
+
+    await tick(); // sweep moves it back to due
+    await tick(); // next alarm delivers it
+    expect(fetchStub).toHaveBeenCalledOnce();
+  });
+
+  it('rejects shard-count drift with CONFIG_MISMATCH', async () => {
+    await queue.enqueue(enqueueReq({ messageId: 'msg_l' }));
+    const drift = await queue.enqueue(
+      enqueueReq({
+        messageId: 'msg_m',
+        config: { targetBaseUrl: 'http://app.test:3000', queueShards: 4 },
+      }),
+    );
+    expect(drift.ok).toBe(false);
+    if (!drift.ok) {
+      expect(drift.code).toBe('CONFIG_MISMATCH');
+    }
+  });
+
+  it('allows the delivery URL to change between enqueues (per-message target)', async () => {
+    await queue.enqueue(enqueueReq({ messageId: 'msg_url_1' }));
+    const moved = await queue.enqueue(
+      enqueueReq({
+        messageId: 'msg_url_2',
+        config: { targetBaseUrl: 'http://moved.test:4000', queueShards: 1 },
+      }),
+    );
+    expect(moved.ok).toBe(true);
+
+    await tick();
+    const urls = fetchStub.mock.calls.map((c) => c[0]);
+    expect(urls).toContain('http://app.test:3000/.well-known/workflow/v1/step');
+    expect(urls).toContain('http://moved.test:4000/.well-known/workflow/v1/step');
+  });
+
+  it('redrives a dead letter with attempts reset', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(500, { error: 'down' }));
+    await queue.enqueue(enqueueReq({ messageId: 'msg_n', idempotencyKey: 'k-n' }));
+    for (const ms of [0, 2_100, 4_100, 8_100, 16_100]) {
+      await tick(ms);
+    }
+    expect((await queue.stats()).deadLetters).toBe(1);
+
+    fetchStub.mockResolvedValue(jsonResponse(200, { ok: true }));
+    const redriven = await queue.redriveDeadLetter('msg_n');
+    expect(redriven.ok).toBe(true);
+
+    await tick();
+    expect((await queue.stats())).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+    const lastCall = fetchStub.mock.calls.at(-1)!;
+    expect(lastCall[1].headers['x-vqs-message-attempt']).toBe('1');
+  });
+
+  it('purges dead letters', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(500, { error: 'down' }));
+    await queue.enqueue(enqueueReq({ messageId: 'msg_o' }));
+    for (const ms of [0, 2_100, 4_100, 8_100, 16_100]) {
+      await tick(ms);
+    }
+    expect((await queue.purgeDeadLetters()).purged).toBe(1);
+    expect((await queue.stats()).deadLetters).toBe(0);
+  });
+
+  it('rearmAlarm derives the alarm from pending work (abandonment recovery)', async () => {
+    await queue.enqueue(enqueueReq({ messageId: 'msg_p', delaySeconds: 60 }));
+    // Simulate celld abandoning the alarm.
+    fleet.cell('queue', 'q:0').storage.alarmAt = null;
+
+    const { alarmAt } = await queue.rearmAlarm();
+    expect(alarmAt).toBe(fleet.now + 60_000);
+  });
+
+  it('caps concurrent deliveries at the inflight limit', async () => {
+    const pending: Array<() => void> = [];
+    let peakConcurrency = 0;
+    let active = 0;
+    fetchStub.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          active++;
+          peakConcurrency = Math.max(peakConcurrency, active);
+          pending.push(() => {
+            active--;
+            resolve(jsonResponse(200, { ok: true }));
+          });
+        }),
+    );
+    // Unblock hanging deliveries from outside the alarm cycle so the claim
+    // phase's inflight cap is what limits concurrency.
+    const unblock = setInterval(() => {
+      for (const release of pending.splice(0)) release();
+    }, 5);
+
+    try {
+      for (let i = 0; i < 8; i++) {
+        await queue.enqueue(enqueueReq({ messageId: `msg_cap_${i}` }));
+      }
+      await tick(1);
+      expect(peakConcurrency).toBe(5); // DEFAULT_MAX_INFLIGHT
+      expect(fetchStub).toHaveBeenCalledTimes(5);
+      expect((await queue.stats()).pending).toBe(3);
+
+      await tick(1); // next alarm claims the remainder
+      expect(fetchStub).toHaveBeenCalledTimes(8);
+    } finally {
+      clearInterval(unblock);
+    }
+  });
+});

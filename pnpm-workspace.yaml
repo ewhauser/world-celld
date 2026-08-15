@@ -1,0 +1,9 @@
+packages:
+  - '.'
+  - 'examples/*'
+# pnpm 11: native/build scripts that are allowed to run (same set the
+# upstream worlds repo allows for these dependencies).
+allowBuilds:
+  '@swc/core': true
+  cbor-extract: true
+  esbuild: true
