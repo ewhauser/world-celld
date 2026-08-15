@@ -8,8 +8,8 @@ work is delivered with durable cell alarms. This gives Node applications a
 self-hosted alternative to platform-specific Workflow backends.
 
 > [!WARNING]
-> `world-celld` is experimental. The package has not been published to npm or
-> proven in production, and its API and storage layout may change before 1.0.
+> `world-celld` is experimental and has not been proven in production. Its API
+> and storage layout may change before 1.0.
 
 ## What it provides
 
@@ -40,16 +40,10 @@ source.
 
 ## Use it in an application
 
-Until the first npm release, clone and build this repository, then link it from
-your application:
+Install the package from npm:
 
 ```sh
-# In this repository
-pnpm install
-pnpm build
-
-# In your Workflow application
-pnpm add ../world-celld
+pnpm add @ewhauser/world-celld
 ```
 
 Workflow DevKit can load the package from environment variables:
@@ -183,10 +177,12 @@ pnpm check
 ```
 
 `pnpm check` runs formatting, linting, type checking, tests, the build, and the
-worker bundle check. Oxlint runs its correctness, suspicious, and performance
-categories with type-aware checks and warnings denied. The default test suite
-includes the upstream `@workflow/world-testing` conformance suite and does not
-require celld. To run the live fleet tests:
+worker and npm-package checks. The package check inspects the exact tarball and
+installs it in a clean temporary consumer with lifecycle scripts disabled.
+Oxlint runs its correctness, suspicious, and performance categories with
+type-aware checks and warnings denied. The default test suite includes the
+upstream `@workflow/world-testing` conformance suite and does not require celld.
+To run the live fleet tests:
 
 ```sh
 CELLD_FLEET_URL=http://fleet.internal:8080 \
@@ -271,6 +267,23 @@ and duplicate-success checks are always enforced.
 
 Bug reports and focused pull requests are welcome. Please include a regression
 test for behavior changes and run the checks above before submitting a PR.
+
+## Supply-chain security
+
+CI and release workflows start with no permissions and grant only the access a
+job needs. Third-party actions are pinned to verified release commits. Release
+builds do not use caches, and the exact npm tarball is checksummed, clean-room
+installed, and verified again before publication.
+
+Releases publish from GitHub-hosted runners through npm trusted publishing
+(OIDC), without a long-lived npm token. npm records provenance for public
+releases. The Git tag and GitHub release are created only after npm accepts the
+matching tarball; published GitHub releases are immutable. Dependency updates
+use cooldowns, and pnpm permits lifecycle scripts only for an explicit
+allowlist.
+
+See [`SECURITY.md`](./SECURITY.md) to report a vulnerability and
+[`RELEASING.md`](./RELEASING.md) for the release procedure.
 
 ## License
 

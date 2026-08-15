@@ -4,6 +4,7 @@ dist/
 .nitro/
 coverage/
 .perf-results/
+release-artifacts/
 *.log
 .DS_Store
 .env

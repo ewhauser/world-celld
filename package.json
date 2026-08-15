@@ -9,6 +9,10 @@
     "vercel-workflow",
     "workflow"
   ],
+  "homepage": "https://github.com/ewhauser/world-celld#readme",
+  "bugs": {
+    "url": "https://github.com/ewhauser/world-celld/issues"
+  },
   "license": "Apache-2.0",
   "author": "ewhauser",
   "repository": {
@@ -16,11 +20,15 @@
     "url": "https://github.com/ewhauser/world-celld.git"
   },
   "files": [
+    "CHANGELOG.md",
     "dist",
     "celld-worker",
     "NOTICE"
   ],
   "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -37,9 +45,13 @@
       "default": "./dist/testing.js"
     }
   },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "build": "tsdown",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm check:worker-bundle",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm check:worker-bundle && pnpm pack:check",
     "clean": "rm -rf dist",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
@@ -48,7 +60,10 @@
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:perf:minio": "bash test/perf/minio/run.sh",
     "typecheck": "tsc --noEmit",
-    "check:worker-bundle": "node scripts/check-worker-bundle.mjs"
+    "check:worker-bundle": "node scripts/check-worker-bundle.mjs",
+    "pack:check": "node scripts/check-package.mjs",
+    "pack:release": "node scripts/pack-release.mjs",
+    "prepack": "pnpm build"
   },
   "dependencies": {
     "@workflow/errors": "4.1.4",
@@ -71,5 +86,5 @@
   "engines": {
     "node": ">=22"
   },
-  "packageManager": "pnpm@11.15.0"
+  "packageManager": "pnpm@11.15.0+sha512.266f8957a30d2be6e9468e5e66bcdedd35a794175f71b067ba8504d686cce1d0c0f429b33c323c3c569ad4891e667574a49ff71d1b89a22cc66f13c65818c578"
 }

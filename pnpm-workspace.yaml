@@ -1,6 +1,63 @@
 packages:
   - '.'
   - 'examples/*'
+# Converge compatible ranges on the first releases patched for the advisories
+# that affect the demo app's Workflow transitive dependencies.
+overrides:
+  'nanoid@>=5.0.0 <5.1.16': 5.1.16
+  'undici@>=7.0.0 <7.29.0': 7.29.0
+# Give the ecosystem time to detect and remove compromised releases before
+# dependency updates can select them. Lockfile installs remain reproducible.
+minimumReleaseAge: 10080
+minimumReleaseAgeIgnoreMissingTime: false
+minimumReleaseAgeExclude:
+  - '@ewhauser/*'
+  # Exact bootstrap exceptions: these direct requirements had no release old
+  # enough to satisfy their declared range when the policy was introduced.
+  - 'hono@4.13.2'
+  - 'oxfmt@0.63.0'
+  - '@oxfmt/binding-android-arm-eabi@0.63.0'
+  - '@oxfmt/binding-android-arm64@0.63.0'
+  - '@oxfmt/binding-darwin-arm64@0.63.0'
+  - '@oxfmt/binding-darwin-x64@0.63.0'
+  - '@oxfmt/binding-freebsd-x64@0.63.0'
+  - '@oxfmt/binding-linux-arm-gnueabihf@0.63.0'
+  - '@oxfmt/binding-linux-arm-musleabihf@0.63.0'
+  - '@oxfmt/binding-linux-arm64-gnu@0.63.0'
+  - '@oxfmt/binding-linux-arm64-musl@0.63.0'
+  - '@oxfmt/binding-linux-ppc64-gnu@0.63.0'
+  - '@oxfmt/binding-linux-riscv64-gnu@0.63.0'
+  - '@oxfmt/binding-linux-riscv64-musl@0.63.0'
+  - '@oxfmt/binding-linux-s390x-gnu@0.63.0'
+  - '@oxfmt/binding-linux-x64-gnu@0.63.0'
+  - '@oxfmt/binding-linux-x64-musl@0.63.0'
+  - '@oxfmt/binding-openharmony-arm64@0.63.0'
+  - '@oxfmt/binding-win32-arm64-msvc@0.63.0'
+  - '@oxfmt/binding-win32-ia32-msvc@0.63.0'
+  - '@oxfmt/binding-win32-x64-msvc@0.63.0'
+  - 'oxlint@1.78.0'
+  - '@oxlint/binding-android-arm-eabi@1.78.0'
+  - '@oxlint/binding-android-arm64@1.78.0'
+  - '@oxlint/binding-darwin-arm64@1.78.0'
+  - '@oxlint/binding-darwin-x64@1.78.0'
+  - '@oxlint/binding-freebsd-x64@1.78.0'
+  - '@oxlint/binding-linux-arm-gnueabihf@1.78.0'
+  - '@oxlint/binding-linux-arm-musleabihf@1.78.0'
+  - '@oxlint/binding-linux-arm64-gnu@1.78.0'
+  - '@oxlint/binding-linux-arm64-musl@1.78.0'
+  - '@oxlint/binding-linux-ppc64-gnu@1.78.0'
+  - '@oxlint/binding-linux-riscv64-gnu@1.78.0'
+  - '@oxlint/binding-linux-riscv64-musl@1.78.0'
+  - '@oxlint/binding-linux-s390x-gnu@1.78.0'
+  - '@oxlint/binding-linux-x64-gnu@1.78.0'
+  - '@oxlint/binding-linux-x64-musl@1.78.0'
+  - '@oxlint/binding-openharmony-arm64@1.78.0'
+  - '@oxlint/binding-win32-arm64-msvc@1.78.0'
+  - '@oxlint/binding-win32-ia32-msvc@1.78.0'
+  - '@oxlint/binding-win32-x64-msvc@1.78.0'
+# Transitive dependencies must resolve through a configured registry rather
+# than arbitrary Git repositories or tarball URLs.
+blockExoticSubdeps: true
 # pnpm 11: native/build scripts that are allowed to run (same set the
 # upstream worlds repo allows for these dependencies).
 allowBuilds:

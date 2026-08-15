@@ -1,0 +1,8 @@
+# Release and supply-chain controls require maintainer review.
+/.github/ @ewhauser
+/package.json @ewhauser
+/pnpm-lock.yaml @ewhauser
+/pnpm-workspace.yaml @ewhauser
+/scripts/check-package.mjs @ewhauser
+/scripts/pack-release.mjs @ewhauser
+/RELEASING.md @ewhauser
