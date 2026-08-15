@@ -269,6 +269,41 @@ describe('Streamer (StreamDO RPC integration)', () => {
         streamer.getStreamChunks('any-stream', 'wrun_123', { cursor: 'bogus' }),
       ).rejects.toThrow(/Invalid stream cursor/);
     });
+
+    it('keeps a default page below the Worker memory limit after base64 encoding', async () => {
+      const oneMiB = new Uint8Array(1024 * 1024);
+      const largeChunkStub: StreamDOStub = {
+        writeChunk: vi.fn(),
+        closeStream: vi.fn(),
+        getChunks: vi.fn(async ({ limit }) => ({
+          // Reuse one allocation: the regression is the logical response size,
+          // not Node heap pressure inside the test process.
+          chunks: Array.from({ length: limit }, () => oneMiB),
+          done: false,
+          tailIndex: limit - 1,
+        })),
+        getInfo: vi.fn(async () => ({ tailIndex: -1, done: false })),
+        registerStream: vi.fn(),
+        listStreams: vi.fn(async () => []),
+      };
+      const boundedStreamer = createStreamer({
+        env: {
+          WORKFLOW_STREAMS: {
+            idFromName: (name: string) => ({ toString: () => name }),
+            get: () => largeChunkStub,
+          },
+        },
+      });
+
+      const page = await boundedStreamer.getStreamChunks('large-stream', 'wrun_large');
+      const base64Bytes = page.data.reduce(
+        (total, chunk) => total + 4 * Math.ceil(chunk.data.byteLength / 3),
+        0,
+      );
+
+      // This is a lower bound: tagged JSON and response buffering add overhead.
+      expect(base64Bytes).toBeLessThan(128 * 1024 * 1024);
+    });
   });
 
   describe('getStreamInfo()', () => {

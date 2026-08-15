@@ -9,6 +9,7 @@ import { createRemoteEnv } from '../src/remote/namespaces.js';
 import { createStorage } from '../src/storage.js';
 import { createStreamer } from '../src/streamer.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
+import { createRouter } from '../src/worker/router.js';
 
 const SECRET = 'test-secret';
 
@@ -77,6 +78,28 @@ describe('router auth and shape', () => {
   it('400s malformed bodies', async () => {
     const res = await rpc('/v1/rpc/runs/wrun_x/getRun', { not: 'an array' }, SECRET);
     expect(res.status).toBe(400);
+  });
+
+  it('413s an oversized RPC body even when content-length is absent', async () => {
+    const router = createRouter({
+      WORKFLOW_DB: harness.fleet.namespace('runs'),
+      WORKFLOW_STREAMS: harness.fleet.namespace('streams'),
+      WORKFLOW_INDEX: harness.fleet.namespace('index'),
+      WORKFLOW_QUEUE: harness.fleet.namespace('queue'),
+      WORLD_SECRET: SECRET,
+    });
+    const request = new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${SECRET}`,
+        'content-type': 'application/json',
+      },
+      body: ' '.repeat(32 * 1024 * 1024 + 1),
+    });
+    expect(request.headers.has('content-length')).toBe(false);
+
+    const response = await router(request);
+    expect(response.status).toBe(413);
   });
 });
 

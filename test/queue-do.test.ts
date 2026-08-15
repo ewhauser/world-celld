@@ -4,7 +4,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EnqueueRequest } from '../src/queue.js';
-import { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
+import { QueueDO, type MessageRow } from '../src/worker/durable-objects/QueueDO.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 
 type FetchStub = ReturnType<typeof vi.fn>;
@@ -78,6 +78,46 @@ describe('QueueDO', () => {
     expect(fresh.deduped).toBe(false);
     await tick();
     expect(fetchStub).toHaveBeenCalledTimes(2);
+  });
+
+  it('recovers when enqueue persistence is interrupted before the due index is written', async () => {
+    const request = enqueueReq({
+      messageId: 'msg_atomic_enqueue',
+      idempotencyKey: 'atomic-enqueue',
+    });
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    cellStorage.failNextMutation(
+      (mutation) => mutation.operation === 'put' && mutation.key.startsWith('due:'),
+      new Error('injected crash during enqueue'),
+    );
+
+    await expect(queue.enqueue(request)).rejects.toThrow('injected crash during enqueue');
+
+    // The caller did not receive an ack, so replaying the same enqueue must
+    // repair or recreate all state needed to eventually deliver the message.
+    await queue.enqueue(request);
+    await tick();
+    expect(fetchStub).toHaveBeenCalledOnce();
+  });
+
+  it('does not leave stale lifecycle state when acknowledgement is interrupted', async () => {
+    await queue.enqueue(
+      enqueueReq({ messageId: 'msg_atomic_ack', idempotencyKey: 'atomic-ack' }),
+    );
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    cellStorage.failNextMutation(
+      (mutation) =>
+        mutation.operation === 'delete' && mutation.key === 'inflight:msg_atomic_ack',
+      new Error('injected crash during ack'),
+    );
+
+    await tick();
+
+    const data = storage();
+    const messageIsRecoverable = data.has('msg:msg_atomic_ack');
+    const acknowledgementFullyCommitted =
+      !data.has('inflight:msg_atomic_ack') && !data.has('key:atomic-ack');
+    expect(messageIsRecoverable || acknowledgementFullyCommitted).toBe(true);
   });
 
   it('honors delaySeconds via the alarm', async () => {
@@ -176,6 +216,59 @@ describe('QueueDO', () => {
     expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
   });
 
+  it('keeps a transiently failed message recoverable if retry persistence is interrupted', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(500, { error: 'retry me' }));
+    await queue.enqueue(
+      enqueueReq({ messageId: 'msg_atomic_retry', idempotencyKey: 'atomic-retry' }),
+    );
+
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    cellStorage.failNextMutation(
+      (mutation) => {
+        const attempt =
+          mutation.value !== null &&
+          typeof mutation.value === 'object' &&
+          'attempt' in mutation.value
+            ? (mutation.value as { attempt?: unknown }).attempt
+            : undefined;
+        return mutation.operation === 'put' && mutation.key === 'msg:msg_atomic_retry' && attempt === 1;
+      },
+      new Error('injected crash between retry writes'),
+    );
+
+    await tick();
+
+    expect(storage().has('msg:msg_atomic_retry')).toBe(true);
+
+    // A crash must leave either a due schedule or an inflight recovery marker.
+    const stats = await queue.stats();
+    expect(stats.pending + stats.inflight).toBe(1);
+    expect(stats.alarmAt).not.toBeNull();
+  });
+
+  it('keeps a message recoverable if the dead-letter transition is interrupted', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(500, { error: 'dead letter me' }));
+    await queue.enqueue(
+      enqueueReq({ messageId: 'msg_atomic_dlq', idempotencyKey: 'atomic-dlq' }),
+    );
+    const data = storage();
+    const row = data.get('msg:msg_atomic_dlq') as MessageRow;
+    data.set('msg:msg_atomic_dlq', { ...row, attempt: 4 });
+
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    cellStorage.failNextMutation(
+      (mutation) => mutation.operation === 'put' && mutation.key.startsWith('dlq:'),
+      new Error('injected crash during dead-letter transition'),
+    );
+
+    await tick();
+
+    expect(data.has('msg:msg_atomic_dlq')).toBe(true);
+    const stats = await queue.stats();
+    expect(stats.pending + stats.inflight + stats.deadLetters).toBe(1);
+    expect(stats.alarmAt).not.toBeNull();
+  });
+
   it('recovers a lost inflight claim after its deadline (crash simulation)', async () => {
     // Simulate a claim whose delivery died with the node: message row +
     // expired inflight marker, no due entry.
@@ -239,6 +332,60 @@ describe('QueueDO', () => {
     expect((await queue.stats())).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
     const lastCall = fetchStub.mock.calls.at(-1)!;
     expect(lastCall[1].headers['x-vqs-message-attempt']).toBe('1');
+  });
+
+  it('does not redrive a dead letter when a newer message owns its idempotency key', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(500, { error: 'down' }));
+    await queue.enqueue(
+      enqueueReq({ messageId: 'msg_old_dead', idempotencyKey: 'shared-redrive-key' }),
+    );
+    for (const ms of [0, 2_100, 4_100, 8_100, 16_100]) {
+      await tick(ms);
+    }
+    expect((await queue.stats()).deadLetters).toBe(1);
+
+    const fresh = await queue.enqueue(
+      enqueueReq({
+        messageId: 'msg_new_live',
+        idempotencyKey: 'shared-redrive-key',
+        delaySeconds: 60,
+      }),
+    );
+    expect(fresh.deduped).toBe(false);
+
+    const redriven = await queue.redriveDeadLetter('msg_old_dead');
+    expect(redriven.ok).toBe(false);
+    expect(await queue.stats()).toMatchObject({ pending: 1, inflight: 0, deadLetters: 1 });
+    expect(storage().get('key:shared-redrive-key')).toBe('msg_new_live');
+    expect(storage().has('msg:msg_old_dead')).toBe(false);
+  });
+
+  it('never exposes both dead and live copies when redrive persistence is interrupted', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(500, { error: 'down' }));
+    await queue.enqueue(
+      enqueueReq({ messageId: 'msg_atomic_redrive', idempotencyKey: 'atomic-redrive' }),
+    );
+    for (const ms of [0, 2_100, 4_100, 8_100, 16_100]) {
+      await tick(ms);
+    }
+    expect((await queue.stats()).deadLetters).toBe(1);
+
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    cellStorage.failNextMutation(
+      (mutation) => mutation.operation === 'delete' && mutation.key.startsWith('dlq:'),
+      new Error('injected crash during redrive'),
+    );
+
+    await expect(queue.redriveDeadLetter('msg_atomic_redrive')).rejects.toThrow(
+      'injected crash during redrive',
+    );
+
+    const data = storage();
+    const hasDeadCopy = Array.from(data.keys()).some(
+      (key) => key.startsWith('dlq:') && key.endsWith(':msg_atomic_redrive'),
+    );
+    const hasLiveCopy = data.has('msg:msg_atomic_redrive');
+    expect(Number(hasDeadCopy) + Number(hasLiveCopy)).toBe(1);
   });
 
   it('purges dead letters', async () => {
