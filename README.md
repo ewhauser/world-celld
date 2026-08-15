@@ -16,6 +16,7 @@ self-hosted alternative to platform-specific Workflow backends.
 - Workflow run, step, event, and hook persistence
 - Durable streams
 - Delayed work, retries, deduplication, and dead-letter storage
+- Configurable cleanup of terminal workflow payloads
 - An authenticated HTTP connection between a Node application and a celld fleet
 - An in-process fleet for local development and conformance testing
 
@@ -64,6 +65,8 @@ const world = createCelldWorld({
   fleetUrl: 'http://fleet.internal:8080',
   secret: process.env.CELLD_WORLD_SECRET!,
   baseUrl: 'https://workflow.example.com',
+  // Keep completed, failed, and cancelled run payloads for 30 days.
+  runRetentionMs: 30 * 24 * 60 * 60 * 1000,
 });
 ```
 
@@ -135,15 +138,16 @@ cell that owns the data.
 Application options can be passed to `createCelldWorld()` unless an environment
 variable is shown below.
 
-| Option         | Environment variable  | Default                  |
-| -------------- | --------------------- | ------------------------ |
-| `fleetUrl`     | `CELLD_FLEET_URL`     | required                 |
-| `secret`       | `CELLD_WORLD_SECRET`  | required with `fleetUrl` |
-| `baseUrl`      | `WORKFLOW_BASE_URL`   | `http://localhost:$PORT` |
-| `deploymentId` | `CELLD_DEPLOYMENT_ID` | `celld-default`          |
-| `queueShards`  | —                     | `1`                      |
-| `readPollMs`   | —                     | `250`                    |
-| `rpcTimeoutMs` | —                     | `30000`                  |
+| Option           | Environment variable     | Default                  |
+| ---------------- | ------------------------ | ------------------------ |
+| `fleetUrl`       | `CELLD_FLEET_URL`        | required                 |
+| `secret`         | `CELLD_WORLD_SECRET`     | required with `fleetUrl` |
+| `baseUrl`        | `WORKFLOW_BASE_URL`      | `http://localhost:$PORT` |
+| `deploymentId`   | `CELLD_DEPLOYMENT_ID`    | `celld-default`          |
+| `queueShards`    | —                        | `1`                      |
+| `runRetentionMs` | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
+| `readPollMs`     | —                        | `250`                    |
+| `rpcTimeoutMs`   | —                        | `30000`                  |
 
 The deployed worker also accepts these celld variables:
 
@@ -158,12 +162,45 @@ The deployed worker also accepts these celld variables:
 `queueShards` is part of queue placement and is pinned when a queue cell is
 first used. Drain pending work before changing it.
 
+## Terminal run retention
+
+When `runRetentionMs` is greater than zero, a terminal transition atomically
+records the run's `expiredAt` and arms its cell alarm. The complete run, event,
+step, hook, and stream data remains readable until that deadline. Active and
+pending runs are never eligible for automatic cleanup.
+
+At expiration, the run cell fences new writes and removes the run's derived
+indexes, stream chunks, pending and dead-letter queue messages, and durable run
+payloads. Cleanup is a persisted, idempotent state machine: an interrupted
+phase records its error and re-arms itself with capped backoff.
+
+The final state is a metadata-only tombstone, not an empty cell. It prevents a
+delayed queue delivery or stale RPC from recreating an expired run. Reads and
+writes against that run return `RunExpiredError`, and the run no longer appears
+in listings. Tombstones contain no workflow input, output, event, step, hook,
+stream, or queue payload.
+
+The returned World exposes authenticated operational methods:
+
+```ts
+const status = await world.retention.getStatus(runId);
+await world.retention.schedule(runId); // requires runRetentionMs > 0
+await world.retention.cleanupNow(runId);
+await world.retention.rearm(runId); // recover a missed or abandoned alarm
+```
+
+The retention deadline is pinned when the run becomes terminal. Changing the
+configuration affects newly terminal runs; call `schedule()` explicitly for
+an existing terminal run that has no cleanup record.
+
 ## Operational notes
 
 - Delivery is at least once. Workflow steps and other external side effects
   must be idempotent.
 - Queue cells expose `stats`, `listDeadLetters`, `redriveDeadLetter`,
   `purgeDeadLetters`, and `rearmAlarm` through the authenticated RPC endpoint.
+- Run cells expose retention status, scheduling, immediate cleanup, and alarm
+  recovery through `world.retention`.
 - A new application URL applies to newly enqueued messages. Existing messages
   retain the callback URL with which they were created.
 - Fleet restarts can interrupt in-flight callbacks; expired claims are
@@ -176,7 +213,7 @@ pnpm format
 pnpm check
 ```
 
-`pnpm check` runs formatting, linting, type checking, tests, the build, and the
+`pnpm check` runs formatting, linting, type checking, the build, tests, and the
 worker and npm-package checks. The package check inspects the exact tarball and
 installs it in a clean temporary consumer with lifecycle scripts disabled.
 Oxlint runs its correctness, suspicious, and performance categories with
@@ -193,12 +230,12 @@ pnpm test:integration
 ### Local MinIO performance and loss test
 
 The opt-in performance harness starts a fresh MinIO bucket and a single celld
-node with Docker Compose, sends concurrent queue traffic, and verifies that
-every accepted message reaches a successful callback. A configurable portion
-of callbacks returns one `503` first, so the same run also exercises durable
-redelivery. The result includes enqueue and delivery throughput plus p50, p95,
-p99, and maximum latency for all deliveries, first-attempt successes, and
-retried messages. It is saved to `.perf-results/minio-latest.json`.
+node with Docker Compose. Its queue workload verifies that every accepted
+message reaches a successful callback, including forced `503` redeliveries. A
+second workload creates terminal runs with streams and delayed queue messages,
+then verifies complete payload cleanup without resurrection. Results include
+queue and cleanup throughput plus p50, p95, p99, and maximum latency and are
+saved under `.perf-results/`.
 
 > MinIO Community is **not a supported celld production store**. It does not
 > implement the conditional writes celld needs for ownership fencing. This

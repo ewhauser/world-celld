@@ -23,6 +23,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../../src/index.js';
 import { callDO } from '../../src/remote/rpc-client.js';
 import type { QueueStats } from '../../src/worker/durable-objects/QueueDO.js';
+import { RunExpiredError } from '@workflow/errors';
 
 const FLEET_URL = process.env.CELLD_FLEET_URL;
 const SECRET = process.env.CELLD_WORLD_SECRET;
@@ -120,6 +121,51 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     if (!('input' in run) || !run.input) throw new Error('expected run input');
     expect(run.input[0]).toBeInstanceOf(Uint8Array);
     expect(Array.from(run.input[0] as Uint8Array)).toEqual([0, 1, 2, 253, 254, 255]);
+  });
+
+  it('expires terminal payloads across run, stream, index, and queue cells', async () => {
+    const w = createCelldWorld({
+      fleetUrl: transport.fleetUrl,
+      secret: transport.secret,
+      baseUrl: callbackBaseUrl,
+      deploymentId: 'integration-retention',
+      runRetentionMs: 500,
+    });
+    const streamName = `it-retention-${randomUUID()}`;
+    const created = await w.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'integration-retention',
+        workflowName: `it-retention-${randomUUID()}`,
+        input: ['payload'],
+      },
+    });
+    const runId = created.run!.runId;
+    await w.writeToStream(streamName, runId, 'stream-payload');
+    await w.closeStream(streamName, runId);
+    await w.queue(
+      `__wkf_workflow_retention_${randomUUID().slice(0, 8)}`,
+      { runId },
+      { delaySeconds: 3_600, idempotencyKey: `retention:${runId}` },
+    );
+    await w.events.create(runId, {
+      eventType: 'run_completed',
+      eventData: { output: ['done'] },
+    });
+
+    const status = await waitFor(
+      async () => {
+        const current = await w.retention.getStatus(runId);
+        return current?.phase === 'tombstoned' ? current : null;
+      },
+      30_000,
+      'terminal retention cleanup',
+    );
+    expect(status.deletedStreams).toBe(1);
+    expect(status.deletedQueueMessages).toBe(1);
+    expect(status.deletedPayloadKeys).toBeGreaterThan(0);
+    await expect(w.runs.get(runId)).rejects.toSatisfy((error) => RunExpiredError.is(error));
+    await expect(w.writeToStream(streamName, runId, 'late')).rejects.toThrow(/expired/);
   });
 
   it('paginated event listing asc and desc (list options spike)', async () => {

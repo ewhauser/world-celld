@@ -114,6 +114,10 @@ services:
       PERF_MIN_DELIVERY_PER_SECOND: '${PERF_MIN_DELIVERY_PER_SECOND:-0}'
       PERF_MAX_DELIVERY_P99_MS: '${PERF_MAX_DELIVERY_P99_MS:-0}'
       PERF_RESULT_PATH: /workspace/.perf-results/minio-latest.json
+      PERF_RETENTION_RUNS: '${PERF_RETENTION_RUNS:-100}'
+      PERF_RETENTION_CONCURRENCY: '${PERF_RETENTION_CONCURRENCY:-16}'
+      PERF_RUN_RETENTION_MS: '${PERF_RUN_RETENTION_MS:-1000}'
+      PERF_RETENTION_RESULT_PATH: /workspace/.perf-results/minio-retention-latest.json
       PERF_CELLD_VERSION: v0.2.1
       PERF_MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
     command: pnpm vitest run --config vitest.perf.config.ts

@@ -25,6 +25,12 @@ import {
   STEP_KEY_PREFIX,
 } from './apply-event.js';
 import { parse } from './vendor/shared/index.js';
+import type {
+  CleanupRecord,
+  ExpireRunIndexesRequest,
+  RunReadOutcome,
+  ScheduleCleanupRequest,
+} from './retention.js';
 
 // In-memory storage for mock Durable Objects
 const durableObjectData = new Map<string, Map<string, unknown>>();
@@ -118,60 +124,85 @@ class MockWorkflowRunDOStub {
     return outcome;
   }
 
-  async getRun(): Promise<WorkflowRun | null> {
+  async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {
     const run = await this.store.get<WorkflowRun>('run');
-    return run ?? null;
+    return { ok: true, value: run ?? null };
   }
 
-  async getStep(stepId: string): Promise<Step | null> {
+  async getStep(stepId: string): Promise<RunReadOutcome<Step | null>> {
     const step = await this.store.get<Step>(`${STEP_KEY_PREFIX}${stepId}`);
-    return step ?? null;
+    return { ok: true, value: step ?? null };
   }
 
-  async getEvent(eventId: string): Promise<Event | null> {
+  async getEvent(eventId: string): Promise<RunReadOutcome<Event | null>> {
     const event = await this.store.get<Event>(`${EVENT_KEY_PREFIX}${eventId}`);
-    return event ?? null;
+    return { ok: true, value: event ?? null };
   }
 
   async listEvents(params?: {
     limit?: number;
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
-  }): Promise<{ data: Event[]; cursor: string | null; hasMore: boolean }> {
-    return listByPrefix<Event>(
-      this.store,
-      EVENT_KEY_PREFIX,
-      {
-        limit: params?.limit ?? 100,
-        cursor: params?.cursor,
-        sortOrder: params?.sortOrder ?? 'asc',
-      },
-      (event) => event.eventId,
-    );
+  }): Promise<RunReadOutcome<{ data: Event[]; cursor: string | null; hasMore: boolean }>> {
+    return {
+      ok: true,
+      value: await listByPrefix<Event>(
+        this.store,
+        EVENT_KEY_PREFIX,
+        {
+          limit: params?.limit ?? 100,
+          cursor: params?.cursor,
+          sortOrder: params?.sortOrder ?? 'asc',
+        },
+        (event) => event.eventId,
+      ),
+    };
   }
 
   async listSteps(params?: {
     limit?: number;
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
-  }): Promise<{ data: Step[]; cursor: string | null; hasMore: boolean }> {
-    return listByCreationTime<Step>(this.store, STEP_CREATED_KEY_PREFIX, STEP_KEY_PREFIX, {
-      limit: params?.limit ?? 20,
-      cursor: params?.cursor,
-      sortOrder: params?.sortOrder ?? 'asc',
-    });
+  }): Promise<RunReadOutcome<{ data: Step[]; cursor: string | null; hasMore: boolean }>> {
+    return {
+      ok: true,
+      value: await listByCreationTime<Step>(this.store, STEP_CREATED_KEY_PREFIX, STEP_KEY_PREFIX, {
+        limit: params?.limit ?? 20,
+        cursor: params?.cursor,
+        sortOrder: params?.sortOrder ?? 'asc',
+      }),
+    };
   }
 
   async listHooks(params?: {
     limit?: number;
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
-  }): Promise<{ data: Hook[]; cursor: string | null; hasMore: boolean }> {
-    return listByCreationTime<Hook>(this.store, HOOK_CREATED_KEY_PREFIX, HOOK_KEY_PREFIX, {
-      limit: params?.limit ?? 100,
-      cursor: params?.cursor,
-      sortOrder: params?.sortOrder ?? 'asc',
-    });
+  }): Promise<RunReadOutcome<{ data: Hook[]; cursor: string | null; hasMore: boolean }>> {
+    return {
+      ok: true,
+      value: await listByCreationTime<Hook>(this.store, HOOK_CREATED_KEY_PREFIX, HOOK_KEY_PREFIX, {
+        limit: params?.limit ?? 100,
+        cursor: params?.cursor,
+        sortOrder: params?.sortOrder ?? 'asc',
+      }),
+    };
+  }
+
+  async getCleanupStatus(): Promise<CleanupRecord | null> {
+    return null;
+  }
+
+  async scheduleCleanup(_request: ScheduleCleanupRequest): Promise<CleanupRecord | null> {
+    return null;
+  }
+
+  async cleanupNow(_request: ScheduleCleanupRequest): Promise<CleanupRecord | null> {
+    return null;
+  }
+
+  async rearmCleanup(): Promise<CleanupRecord | null> {
+    return null;
   }
 
   async claimInflight(params: { messageId: string; staleMs: number }): Promise<{
@@ -207,6 +238,30 @@ class MockKVNamespace {
 
   async put(key: string, value: string): Promise<void> {
     kvData.set(key, value);
+  }
+
+  async putOwned(runId: string, key: string, value: string): Promise<{ stored: boolean }> {
+    if (kvData.has(`expired:${runId}`)) return { stored: false };
+    kvData.set(key, value);
+    return { stored: true };
+  }
+
+  async expireRun(request: ExpireRunIndexesRequest): Promise<{ deleted: number }> {
+    kvData.set(`expired:${request.runId}`, String(request.expiredAt));
+    let deleted = 0;
+    for (const key of request.keys) {
+      if (kvData.delete(key)) deleted++;
+    }
+    for (const hook of request.hooks) {
+      for (const key of [
+        `hook:${hook.token}`,
+        `hookid:${hook.hookId}`,
+        `hookclaim:${hook.token}`,
+      ]) {
+        if (kvData.delete(key)) deleted++;
+      }
+    }
+    return { deleted };
   }
 
   async delete(key: string): Promise<void> {
@@ -331,8 +386,13 @@ class MockStreamDOStub {
   private chunks: Uint8Array[] = [];
   private closed = false;
   private registry = new Set<string>();
+  private ownerRunId: string | undefined;
+  private expired = false;
 
-  async writeChunk(data: Uint8Array): Promise<number> {
+  async writeChunk(runId: string, data: Uint8Array): Promise<number> {
+    if (this.expired) throw new Error('Stream has expired');
+    if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
+    this.ownerRunId = runId;
     if (this.closed) {
       throw new Error('Cannot write to a closed stream');
     }
@@ -340,7 +400,10 @@ class MockStreamDOStub {
     return this.chunks.length - 1;
   }
 
-  async closeStream(): Promise<void> {
+  async closeStream(runId: string): Promise<void> {
+    if (this.expired) throw new Error('Stream has expired');
+    if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
+    this.ownerRunId = runId;
     this.closed = true;
   }
 
@@ -361,12 +424,38 @@ class MockStreamDOStub {
     return { tailIndex: this.chunks.length - 1, done: this.closed };
   }
 
-  async registerStream(name: string): Promise<void> {
+  async registerStream(runId: string, name: string): Promise<void> {
+    if (this.expired) throw new Error('Stream registry has expired');
+    if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Registry owner mismatch');
+    this.ownerRunId = runId;
     this.registry.add(name);
   }
 
   async listStreams(): Promise<string[]> {
+    if (this.expired) throw new Error('Stream registry has expired');
     return Array.from(this.registry).toSorted();
+  }
+
+  async expireRegistry(runId: string): Promise<{ streams: string[] }> {
+    if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Registry owner mismatch');
+    this.ownerRunId = runId;
+    this.expired = true;
+    return { streams: Array.from(this.registry) };
+  }
+
+  async finalizeRegistry(runId: string): Promise<void> {
+    if (this.ownerRunId !== runId || !this.expired) throw new Error('Registry is not expired');
+    this.registry.clear();
+  }
+
+  async expireStream(runId: string): Promise<{ deleted: boolean; chunks: number }> {
+    if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
+    const chunks = this.chunks.length;
+    this.ownerRunId = runId;
+    this.chunks = [];
+    this.closed = true;
+    this.expired = true;
+    return { deleted: true, chunks };
   }
 }
 
@@ -392,6 +481,10 @@ class MockQueueCellStub implements QueueCellStub {
     }
     recordedEnqueues.push({ ...request, cellName: this.cellName });
     return { ok: true, messageId: request.messageId, deduped: false };
+  }
+
+  async expireRun(): Promise<{ deleted: number }> {
+    return { deleted: 0 };
   }
 }
 

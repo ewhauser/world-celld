@@ -19,6 +19,8 @@ export interface Harness {
 
 export interface HarnessOptions {
   secret?: string;
+  /** Use FakeFleet's manually advanced clock instead of wall-clock time. */
+  virtualClock?: boolean;
   /** Additional cell classes by binding key (e.g. { queue: QueueDO }). */
   extraClasses?: Record<string, new (ctx: unknown, env: unknown) => object>;
   /** env passed to cell constructors (celld `vars`). */
@@ -26,6 +28,7 @@ export interface HarnessOptions {
 }
 
 export async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
+  const cellEnv = { ...options.cellEnv };
   const fleet = new FakeFleet(
     {
       runs: WorkflowRunDO as never,
@@ -34,8 +37,19 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       queue: QueueDO as never,
       ...options.extraClasses,
     },
-    options.cellEnv ?? {},
+    cellEnv,
   );
+  cellEnv.clock ??= options.virtualClock ? () => fleet.now : () => Date.now();
+
+  // Durable Object constructors receive both vars and sibling bindings in a
+  // real celld deployment. Populate the same environment for cross-cell
+  // retention cleanup in the in-process fleet.
+  Object.assign(cellEnv, {
+    WORKFLOW_DB: fleet.namespace('runs'),
+    WORKFLOW_STREAMS: fleet.namespace('streams'),
+    WORKFLOW_INDEX: fleet.namespace('index'),
+    WORKFLOW_QUEUE: fleet.namespace('queue'),
+  });
 
   const env: WorkerEnv = {
     WORKFLOW_DB: fleet.namespace('runs'),

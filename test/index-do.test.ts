@@ -65,4 +65,24 @@ describe('IndexDO', () => {
     expect(page.list_complete).toBe(true);
     expect(page.cursor).toBeUndefined();
   });
+
+  it('atomically deletes owned indexes and fences delayed publication', async () => {
+    await index.putOwned('wrun_expired', 'run:wf:1:wrun_expired', 'run');
+    await index.putOwned('wrun_expired', 'correlation:c:1:e:wrun_expired', 'event');
+
+    expect(
+      await index.expireRun({
+        runId: 'wrun_expired',
+        keys: ['run:wf:1:wrun_expired', 'correlation:c:1:e:wrun_expired'],
+        hooks: [],
+        expiredAt: 123,
+      }),
+    ).toEqual({ deleted: 2 });
+    expect(await index.get('run:wf:1:wrun_expired')).toBeNull();
+    expect(await index.get('correlation:c:1:e:wrun_expired')).toBeNull();
+    expect(await index.putOwned('wrun_expired', 'run:wf:2:wrun_expired', 'late')).toEqual({
+      stored: false,
+    });
+    expect(await index.get('run:wf:2:wrun_expired')).toBeNull();
+  });
 });

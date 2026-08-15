@@ -44,6 +44,7 @@ import {
   WorkflowRunSchema,
 } from '@workflow/world';
 import { compact } from './util.js';
+import type { ScheduleCleanupRequest } from './retention.js';
 
 /** Storage key for the run entity. */
 const RUN_KEY = 'run';
@@ -93,6 +94,8 @@ export interface ApplyEventRequest {
    * (hook_created only). `null` means the token is unclaimed.
    */
   tokenHolder?: { runId: string; hookId: string } | null;
+  /** Internal world-celld retention policy captured with the event. */
+  cleanup?: ScheduleCleanupRequest;
 }
 
 export type ApplyEventErrorCode =

@@ -7,6 +7,10 @@ export interface IndexNamespace {
   get(key: string): Promise<string | null>;
   put(key: string, value: string): Promise<void>;
   delete(key: string): Promise<void>;
+  putOwned(runId: string, key: string, value: string): Promise<{ stored: boolean }>;
+  expireRun(
+    request: import('./retention.js').ExpireRunIndexesRequest,
+  ): Promise<import('./retention.js').ExpireRunIndexesResult>;
   list(options?: { prefix?: string; cursor?: string; limit?: number; reverse?: boolean }): Promise<{
     keys: Array<{ name: string }>;
     list_complete: boolean;
@@ -66,6 +70,12 @@ export interface CelldWorldConfig {
   baseUrl?: string;
   /** Number of queue cells to spread enqueues over. Default: 1 */
   queueShards?: number;
+  /**
+   * Keep terminal run payloads for this many milliseconds before replacing
+   * them with metadata-only tombstones. Zero disables automatic cleanup.
+   * Default: process.env.CELLD_RUN_RETENTION_MS || 0
+   */
+  runRetentionMs?: number;
   /** Poll interval (ms) while waiting for new chunks on a live stream. Default: 250 */
   readPollMs?: number;
   /** Per-attempt fleet RPC deadline in milliseconds. Default: 30000 */
@@ -79,11 +89,19 @@ export interface ResolvedCelldConfig {
   deploymentId: string;
   baseUrl?: string;
   queueShards: number;
+  runRetentionMs: number;
   readPollMs: number;
   rpcTimeoutMs: number;
 }
 
 export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
+  const retentionRaw = config?.runRetentionMs ?? process.env.CELLD_RUN_RETENTION_MS ?? 0;
+  const runRetentionMs =
+    typeof retentionRaw === 'number' ? retentionRaw : Number.parseInt(retentionRaw, 10);
+  if (!Number.isSafeInteger(runRetentionMs) || runRetentionMs < 0) {
+    throw new Error('world-celld: runRetentionMs must be a non-negative safe integer');
+  }
+
   return {
     fleetUrl: config?.fleetUrl ?? process.env.CELLD_FLEET_URL,
     secret: config?.secret ?? process.env.CELLD_WORLD_SECRET,
@@ -91,6 +109,7 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
     deploymentId: config?.deploymentId ?? process.env.CELLD_DEPLOYMENT_ID ?? 'celld-default',
     baseUrl: config?.baseUrl,
     queueShards: config?.queueShards ?? 1,
+    runRetentionMs,
     readPollMs: config?.readPollMs ?? 250,
     rpcTimeoutMs: config?.rpcTimeoutMs ?? 30_000,
   };

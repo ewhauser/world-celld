@@ -42,6 +42,12 @@ import { monotonicFactory } from 'ulid';
 import type { ApplyEventFailure, ApplyEventOutcome, ApplyEventRequest } from './apply-event.js';
 import type { HookTokenOwner, IndexNamespace } from './config.js';
 import { compact } from './util.js';
+import {
+  correlationIndexKey,
+  globalRunIndexKey,
+  type RunReadOutcome,
+  workflowRunIndexKey,
+} from './retention.js';
 
 /**
  * RPC surface of WorkflowRunDO used by the storage layer. Declared
@@ -49,24 +55,32 @@ import { compact } from './util.js';
  */
 export interface WorkflowRunDOStub {
   applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome>;
-  getRun(): Promise<WorkflowRun | null>;
-  getStep(stepId: string): Promise<Step | null>;
-  getEvent(eventId: string): Promise<Event | null>;
+  getRun(): Promise<RunReadOutcome<WorkflowRun | null>>;
+  getStep(stepId: string): Promise<RunReadOutcome<Step | null>>;
+  getEvent(eventId: string): Promise<RunReadOutcome<Event | null>>;
   listEvents(params?: {
     limit?: number;
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
-  }): Promise<{ data: Event[]; cursor: string | null; hasMore: boolean }>;
+  }): Promise<RunReadOutcome<{ data: Event[]; cursor: string | null; hasMore: boolean }>>;
   listSteps(params?: {
     limit?: number;
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
-  }): Promise<{ data: Step[]; cursor: string | null; hasMore: boolean }>;
+  }): Promise<RunReadOutcome<{ data: Step[]; cursor: string | null; hasMore: boolean }>>;
   listHooks(params?: {
     limit?: number;
     cursor?: string;
     sortOrder?: 'asc' | 'desc';
-  }): Promise<{ data: Hook[]; cursor: string | null; hasMore: boolean }>;
+  }): Promise<RunReadOutcome<{ data: Hook[]; cursor: string | null; hasMore: boolean }>>;
+  getCleanupStatus(): Promise<import('./retention.js').CleanupRecord | null>;
+  scheduleCleanup(
+    request: import('./retention.js').ScheduleCleanupRequest,
+  ): Promise<import('./retention.js').CleanupRecord | null>;
+  cleanupNow(
+    request: import('./retention.js').ScheduleCleanupRequest,
+  ): Promise<import('./retention.js').CleanupRecord | null>;
+  rearmCleanup(): Promise<import('./retention.js').CleanupRecord | null>;
 }
 
 export interface WorkflowRunDONamespace {
@@ -84,18 +98,8 @@ export interface CloudflareStorageConfig {
     WORKFLOW_INDEX: IndexNamespace;
   };
   deploymentId: string;
-}
-
-function sortableTimestamp(date: Date): string {
-  return date.getTime().toString().padStart(13, '0');
-}
-
-function workflowRunIndexKey(run: WorkflowRun): string {
-  return `run:${run.workflowName}:${sortableTimestamp(run.createdAt)}:${run.runId}`;
-}
-
-function globalRunIndexKey(run: WorkflowRun): string {
-  return `runall:${sortableTimestamp(run.createdAt)}:${run.runId}`;
+  runRetentionMs?: number;
+  queueShards?: number;
 }
 
 function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
@@ -170,8 +174,19 @@ const parseStep = (step: Step): Step => StepSchema.parse(compact(step));
 const parseHook = (hook: Hook): Hook => HookSchema.parse(compact(hook));
 const parseEvent = (event: Event): Event => EventSchema.parse(compact(event));
 
+function unwrapRead<T>(outcome: RunReadOutcome<T>): T {
+  if (!outcome.ok) {
+    throw new RunExpiredError(outcome.message);
+  }
+  return outcome.value;
+}
+
 export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
+  const cleanup = {
+    retentionMs: config.runRetentionMs ?? 0,
+    queueShards: config.queueShards ?? 1,
+  };
   const ulid = monotonicFactory();
 
   // Helper to get or create a DO for a run
@@ -185,7 +200,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
     params?: GetWorkflowRunParams,
   ): Promise<WorkflowRun | WorkflowRunWithoutData> => {
     const stub = getRunDO(runId);
-    const run = await stub.getRun();
+    const run = unwrapRead(await stub.getRun());
 
     if (!run) {
       throw new WorkflowRunNotFoundError(runId);
@@ -237,7 +252,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
                 if (matches.length > limit) break;
               }
             } catch (error) {
-              if (!WorkflowRunNotFoundError.is(error)) throw error;
+              if (!WorkflowRunNotFoundError.is(error) && !RunExpiredError.is(error)) throw error;
             }
           }
 
@@ -295,7 +310,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // before anything is persisted.
         let outcome: ApplyEventOutcome;
         try {
-          outcome = await stub.applyEvent({ runId: effectiveRunId, data, tokenHolder });
+          outcome = await stub.applyEvent({ runId: effectiveRunId, data, tokenHolder, cleanup });
         } catch (error) {
           if (hookReservation && data.eventType === 'hook_created') {
             await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
@@ -318,8 +333,8 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             createdAt: outcome.run.createdAt.toISOString(),
             status: outcome.run.status,
           });
-          await env.WORKFLOW_INDEX.put(workflowRunIndexKey(outcome.run), meta);
-          await env.WORKFLOW_INDEX.put(globalRunIndexKey(outcome.run), meta);
+          await env.WORKFLOW_INDEX.putOwned(effectiveRunId, workflowRunIndexKey(outcome.run), meta);
+          await env.WORKFLOW_INDEX.putOwned(effectiveRunId, globalRunIndexKey(outcome.run), meta);
         }
         if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
@@ -339,10 +354,14 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
         }
         if (outcome.event?.correlationId) {
-          const correlationKey = `correlation:${encodeURIComponent(
+          const correlationKey = correlationIndexKey(
             outcome.event.correlationId,
-          )}:${sortableTimestamp(outcome.event.createdAt)}:${outcome.event.eventId}:${effectiveRunId}`;
-          await env.WORKFLOW_INDEX.put(
+            outcome.event.createdAt,
+            outcome.event.eventId,
+            effectiveRunId,
+          );
+          await env.WORKFLOW_INDEX.putOwned(
+            effectiveRunId,
             correlationKey,
             JSON.stringify({ runId: effectiveRunId, eventId: outcome.event.eventId }),
           );
@@ -359,7 +378,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
       async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
         const stub = getRunDO(runId);
-        const event = await stub.getEvent(eventId);
+        const event = unwrapRead(await stub.getEvent(eventId));
 
         if (!event) {
           throw new WorkflowWorldError(`Event not found: ${eventId}`, {
@@ -375,11 +394,13 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 100;
 
         const stub = getRunDO(runId);
-        const result = await stub.listEvents({
-          limit,
-          cursor: params?.pagination?.cursor || undefined,
-          sortOrder: params.pagination?.sortOrder || 'asc',
-        });
+        const result = unwrapRead(
+          await stub.listEvents({
+            limit,
+            cursor: params?.pagination?.cursor || undefined,
+            sortOrder: params.pagination?.sortOrder || 'asc',
+          }),
+        );
 
         return {
           data: result.data.map(parseEvent),
@@ -402,7 +423,8 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             const raw = await env.WORKFLOW_INDEX.get(name);
             if (!raw) return null;
             const { runId, eventId } = JSON.parse(raw) as { runId: string; eventId: string };
-            return getRunDO(runId).getEvent(eventId);
+            const outcome = await getRunDO(runId).getEvent(eventId);
+            return outcome.ok ? outcome.value : null;
           }),
         );
         return {
@@ -421,7 +443,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           });
         }
         const stub = getRunDO(runId);
-        const step = await stub.getStep(stepId);
+        const step = unwrapRead(await stub.getStep(stepId));
 
         if (!step) {
           throw new WorkflowWorldError(`Step not found: ${stepId}`, {
@@ -439,11 +461,13 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 20;
 
         const stub = getRunDO(runId);
-        const result = await stub.listSteps({
-          limit,
-          cursor: params?.pagination?.cursor || undefined,
-          sortOrder: params?.pagination?.sortOrder ?? 'asc',
-        });
+        const result = unwrapRead(
+          await stub.listSteps({
+            limit,
+            cursor: params?.pagination?.cursor || undefined,
+            sortOrder: params?.pagination?.sortOrder ?? 'asc',
+          }),
+        );
 
         return {
           data: result.data.map((s) =>
@@ -488,11 +512,13 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const limit = params?.pagination?.limit ?? 100;
 
         const stub = getRunDO(runId);
-        const result = await stub.listHooks({
-          limit,
-          cursor: params?.pagination?.cursor || undefined,
-          sortOrder: params?.pagination?.sortOrder ?? 'asc',
-        });
+        const result = unwrapRead(
+          await stub.listHooks({
+            limit,
+            cursor: params?.pagination?.cursor || undefined,
+            sortOrder: params?.pagination?.sortOrder ?? 'asc',
+          }),
+        );
 
         return {
           data: result.data.map((h) => filterHookData(parseHook(h), params?.resolveData ?? 'all')),

@@ -16,13 +16,42 @@ interface MethodSpec {
 }
 
 const RUNS: MethodSpec = {
-  methods: ['applyEvent', 'getRun', 'getStep', 'getEvent', 'listEvents', 'listSteps', 'listHooks'],
-  mutating: new Set(['applyEvent']),
+  methods: [
+    'applyEvent',
+    'getRun',
+    'getStep',
+    'getEvent',
+    'listEvents',
+    'listSteps',
+    'listHooks',
+    'getCleanupStatus',
+    'scheduleCleanup',
+    'cleanupNow',
+    'rearmCleanup',
+  ],
+  mutating: new Set(['applyEvent', 'scheduleCleanup', 'cleanupNow', 'rearmCleanup']),
 };
 
 const STREAMS: MethodSpec = {
-  methods: ['writeChunk', 'closeStream', 'getChunks', 'getInfo', 'registerStream', 'listStreams'],
-  mutating: new Set(['writeChunk', 'closeStream', 'registerStream']),
+  methods: [
+    'writeChunk',
+    'closeStream',
+    'getChunks',
+    'getInfo',
+    'registerStream',
+    'listStreams',
+    'expireRegistry',
+    'finalizeRegistry',
+    'expireStream',
+  ],
+  mutating: new Set([
+    'writeChunk',
+    'closeStream',
+    'registerStream',
+    'expireRegistry',
+    'finalizeRegistry',
+    'expireStream',
+  ]),
 };
 
 const QUEUE: MethodSpec = {
@@ -33,8 +62,15 @@ const QUEUE: MethodSpec = {
     'redriveDeadLetter',
     'purgeDeadLetters',
     'rearmAlarm',
+    'expireRun',
   ],
-  mutating: new Set(['enqueue', 'redriveDeadLetter', 'purgeDeadLetters', 'rearmAlarm']),
+  mutating: new Set([
+    'enqueue',
+    'redriveDeadLetter',
+    'purgeDeadLetters',
+    'rearmAlarm',
+    'expireRun',
+  ]),
 };
 
 function makeStub<T>(transport: RpcTransport, binding: string, name: string, spec: MethodSpec): T {
@@ -69,6 +105,9 @@ function makeIndexNamespace(transport: RpcTransport): IndexNamespace {
     get: (key) => call<string | null>('get', [key], true),
     put: (key, value) => call<void>('put', [key, value], false),
     delete: (key) => call<void>('delete', [key], false),
+    putOwned: (runId, key, value) =>
+      call<{ stored: boolean }>('putOwned', [runId, key, value], false),
+    expireRun: (request) => call('expireRun', [request], false),
     list: (options) => call('list', [options], true),
     reserveHookToken: (token: string, owner: HookTokenOwner) =>
       call('reserveHookToken', [token, owner], false),

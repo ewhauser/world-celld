@@ -392,6 +392,87 @@ describe('QueueDO', () => {
     expect((await queue.stats()).deadLetters).toBe(0);
   });
 
+  it('purges every message state for an expired run and fences late enqueue', async () => {
+    const runId = 'wrun_queue_cleanup';
+    await queue.enqueue(
+      enqueueReq({
+        messageId: 'msg_pending',
+        runId,
+        idempotencyKey: 'pending-key',
+        delaySeconds: 60,
+      }),
+    );
+    await queue.enqueue(
+      enqueueReq({
+        messageId: 'msg_inflight',
+        runId,
+        idempotencyKey: 'inflight-key',
+        delaySeconds: 60,
+      }),
+    );
+    await queue.enqueue(
+      enqueueReq({
+        messageId: 'msg_dead',
+        runId,
+        idempotencyKey: 'dead-key',
+        delaySeconds: 60,
+      }),
+    );
+
+    const data = storage();
+    for (const key of Array.from(data.keys())) {
+      if (key.startsWith('due:') && key.endsWith(':msg_inflight')) data.delete(key);
+      if (key.startsWith('due:') && key.endsWith(':msg_dead')) data.delete(key);
+    }
+    data.set('inflight:msg_inflight', fleet.now + 30_000);
+    const dead = data.get('msg:msg_dead') as MessageRow;
+    data.delete('msg:msg_dead');
+    const deadKey = `dlq:${String(fleet.now).padStart(13, '0')}:msg_dead`;
+    data.set(deadKey, { ...dead, failedAt: fleet.now });
+    data.set(`run:${runId}:msg_dead`, {
+      messageId: 'msg_dead',
+      dlqKey: deadKey,
+      idempotencyKey: 'dead-key',
+    });
+
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 3 });
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+    expect(Array.from(data.keys()).filter((key) => key.startsWith(`run:${runId}:`))).toEqual([]);
+    expect(data.has(`expired-run:${runId}`)).toBe(true);
+    expect(data.has('key:pending-key')).toBe(false);
+    expect(data.has('key:inflight-key')).toBe(false);
+    expect(data.has('key:dead-key')).toBe(false);
+
+    const late = await queue.enqueue(enqueueReq({ messageId: 'msg_late', runId }));
+    expect(late).toMatchObject({ ok: false, code: 'RUN_EXPIRED' });
+  });
+
+  it('does not let an in-flight retry resurrect an expired run', async () => {
+    let finishDelivery!: (response: Response) => void;
+    fetchStub.mockImplementation(
+      () => new Promise<Response>((resolve) => (finishDelivery = resolve)),
+    );
+    const runId = 'wrun_expire_during_delivery';
+    await queue.enqueue(
+      enqueueReq({
+        messageId: 'msg_expiring',
+        runId,
+        idempotencyKey: 'expiring-key',
+      }),
+    );
+
+    const delivery = tick();
+    await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 1 });
+    finishDelivery(jsonResponse(500, { error: 'late failure' }));
+    await delivery;
+
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+    expect(storage().has('msg:msg_expiring')).toBe(false);
+    expect(storage().has('key:expiring-key')).toBe(false);
+    expect(Array.from(storage().keys()).some((key) => key.endsWith(':msg_expiring'))).toBe(false);
+  });
+
   it('rearmAlarm derives the alarm from pending work (abandonment recovery)', async () => {
     await queue.enqueue(enqueueReq({ messageId: 'msg_p', delaySeconds: 60 }));
     // Simulate celld abandoning the alarm.

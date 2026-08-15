@@ -18,6 +18,7 @@
  */
 import { setTimeout as delay } from 'node:timers/promises';
 import { WorkflowWorldError } from '@workflow/errors';
+import { RunExpiredError } from '@workflow/errors';
 import {
   MessageId,
   parseQueueName,
@@ -79,6 +80,8 @@ export interface EnqueueRequest {
   pathname: Pathname;
   /** `stringify(message)` — the exact bytes POSTed to the app on delivery. */
   body: string;
+  /** Owning workflow run; absent only for health-check messages. */
+  runId?: string;
   idempotencyKey?: string;
   delaySeconds?: number;
   /**
@@ -96,11 +99,15 @@ export interface QueueCellConfig {
 
 export type EnqueueOutcome =
   | { ok: true; messageId: string; deduped: boolean }
-  | { ok: false; code: 'CONFIG_MISMATCH'; message: string };
+  | { ok: false; code: 'CONFIG_MISMATCH' | 'RUN_EXPIRED'; message: string };
 
 /** RPC surface of QueueDO used by the queue producer. */
 export interface QueueCellStub {
   enqueue(request: EnqueueRequest): Promise<EnqueueOutcome>;
+  expireRun(
+    runId: string,
+    expiredAt: number,
+  ): Promise<import('./retention.js').ExpireQueueRunResult>;
 }
 
 export interface QueueCellNamespace {
@@ -315,6 +322,12 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
   return {
     async queue(queueName, message, opts) {
       const { kind } = parseQueueName(queueName);
+      const runId =
+        'runId' in message
+          ? message.runId
+          : 'workflowRunId' in message
+            ? message.workflowRunId
+            : undefined;
 
       if (isTestMode()) {
         // Dedup on idempotencyKey while a message with the same key is in
@@ -349,6 +362,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         queueName,
         pathname: QUEUE_PATHNAMES[kind],
         body: stringify(message),
+        runId,
         idempotencyKey: opts?.idempotencyKey,
         delaySeconds: opts?.delaySeconds,
         config: {
@@ -358,6 +372,9 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
       });
 
       if (!outcome.ok) {
+        if (outcome.code === 'RUN_EXPIRED') {
+          throw new RunExpiredError(outcome.message);
+        }
         throw new WorkflowWorldError(outcome.message, { status: 409 });
       }
 

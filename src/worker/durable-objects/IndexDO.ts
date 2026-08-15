@@ -2,6 +2,7 @@ import type { Hook } from '@workflow/world';
 import type { HookTokenOwner } from '../../config.js';
 import { parse } from '../../vendor/shared/index.js';
 import { DurableObject } from '../do-base.js';
+import type { ExpireRunIndexesRequest, ExpireRunIndexesResult } from '../../retention.js';
 
 interface HookClaim {
   owner: HookTokenOwner;
@@ -38,6 +39,17 @@ export class IndexDO extends DurableObject {
 
   async put(key: string, value: string): Promise<void> {
     await this.ctx.storage.put(key, value);
+  }
+
+  /** Publish a derived index only while its owning run is not expired. */
+  async putOwned(runId: string, key: string, value: string): Promise<{ stored: boolean }> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      if ((await txn.get(`expired:${runId}`)) !== undefined) {
+        return { stored: false };
+      }
+      await txn.put(key, value);
+      return { stored: true };
+    });
   }
 
   async delete(key: string): Promise<void> {
@@ -108,6 +120,13 @@ export class IndexDO extends DurableObject {
     owner: HookTokenOwner,
   ): Promise<void> {
     await this.ctx.storage.transaction(async (txn) => {
+      if ((await txn.get(`expired:${owner.runId}`)) !== undefined) {
+        const claim = await txn.get<HookClaim>(`hookclaim:${token}`);
+        if (claim !== undefined && sameOwner(claim.owner, owner)) {
+          await txn.delete(`hookclaim:${token}`);
+        }
+        return;
+      }
       const indexedHook = await txn.get<string>(`hook:${token}`);
       if (indexedHook !== undefined && !sameOwner(ownerFromHook(indexedHook), owner)) {
         throw new Error(`Hook token ${token} is owned by another hook`);
@@ -154,6 +173,45 @@ export class IndexDO extends DurableObject {
       if (claim !== undefined && sameOwner(claim.owner, owner)) {
         await txn.delete(claimKey);
       }
+    });
+  }
+
+  /**
+   * Fence a run and remove all of its known derived indexes atomically.
+   * Once the fence exists, putOwned() and hook finalization cannot resurrect
+   * entries from a delayed request.
+   */
+  async expireRun(request: ExpireRunIndexesRequest): Promise<ExpireRunIndexesResult> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      await txn.put(`expired:${request.runId}`, request.expiredAt);
+      let deleted = 0;
+
+      for (const key of new Set(request.keys)) {
+        if (await txn.delete(key)) deleted++;
+      }
+
+      for (const hook of request.hooks) {
+        const owner = { runId: request.runId, hookId: hook.hookId };
+        const tokenKey = `hook:${hook.token}`;
+        const idKey = `hookid:${hook.hookId}`;
+        const claimKey = `hookclaim:${hook.token}`;
+        const [byToken, byId, claim] = await Promise.all([
+          txn.get<string>(tokenKey),
+          txn.get<string>(idKey),
+          txn.get<HookClaim>(claimKey),
+        ]);
+        if (byToken !== undefined && sameOwner(ownerFromHook(byToken), owner)) {
+          if (await txn.delete(tokenKey)) deleted++;
+        }
+        if (byId !== undefined && sameOwner(ownerFromHook(byId), owner)) {
+          if (await txn.delete(idKey)) deleted++;
+        }
+        if (claim !== undefined && sameOwner(claim.owner, owner)) {
+          if (await txn.delete(claimKey)) deleted++;
+        }
+      }
+
+      return { deleted };
     });
   }
 }

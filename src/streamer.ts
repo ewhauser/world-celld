@@ -5,6 +5,7 @@ import type {
   StreamInfoResponse,
   Streamer,
 } from '@workflow/world';
+import type { ExpireRunStreamsResult, ExpireStreamResult } from './retention.js';
 
 export interface CelldStreamerConfig {
   env: {
@@ -24,15 +25,18 @@ export interface CelldStreamerConfig {
  * protocol.
  */
 export interface StreamDOStub {
-  writeChunk(data: Uint8Array): Promise<number>;
-  closeStream(): Promise<void>;
+  writeChunk(runId: string, data: Uint8Array): Promise<number>;
+  closeStream(runId: string): Promise<void>;
   getChunks(params: {
     startIndex: number;
     limit: number;
   }): Promise<{ chunks: Uint8Array[]; done: boolean; tailIndex: number }>;
   getInfo(): Promise<{ tailIndex: number; done: boolean }>;
-  registerStream(name: string): Promise<void>;
+  registerStream(runId: string, name: string): Promise<void>;
   listStreams(): Promise<string[]>;
+  expireRegistry(runId: string, expiredAt: number): Promise<ExpireRunStreamsResult>;
+  finalizeRegistry(runId: string): Promise<void>;
+  expireStream(runId: string, expiredAt: number): Promise<ExpireStreamResult>;
 }
 
 export interface StreamDONamespace {
@@ -76,7 +80,7 @@ export function createStreamer(config: CelldStreamerConfig): Streamer {
   async function registerStreamForRun(name: string, runId: string): Promise<void> {
     const cacheKey = `${runId}\0${name}`;
     if (registeredStreams.has(cacheKey)) return;
-    await getRunRegistryDO(runId).registerStream(name);
+    await getRunRegistryDO(runId).registerStream(runId, name);
     registeredStreams.add(cacheKey);
   }
 
@@ -84,13 +88,13 @@ export function createStreamer(config: CelldStreamerConfig): Streamer {
     async writeToStream(name: string, runId: string | Promise<string>, chunk: string | Uint8Array) {
       const resolvedRunId = await runId;
       await registerStreamForRun(name, resolvedRunId);
-      await getStreamDO(name).writeChunk(toBytes(chunk));
+      await getStreamDO(name).writeChunk(resolvedRunId, toBytes(chunk));
     },
 
     async closeStream(name: string, runId: string | Promise<string>) {
       const resolvedRunId = await runId;
       await registerStreamForRun(name, resolvedRunId);
-      await getStreamDO(name).closeStream();
+      await getStreamDO(name).closeStream(resolvedRunId);
     },
 
     async readFromStream(name: string, startIndex = 0) {
