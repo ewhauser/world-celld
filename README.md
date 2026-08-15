@@ -1,167 +1,203 @@
-# @ewhauser/world-celld
+# world-celld
 
-A [Vercel Workflow DevKit](https://useworkflow.dev) `World` backend
-implemented on [celld](https://github.com/denoland/celld) — self-hosted,
-distributed Durable Objects. Run durable workflows on your own machines with
-state in an S3-compatible bucket you own.
+A [Workflow DevKit](https://useworkflow.dev) `World` backed by
+[celld](https://github.com/denoland/celld).
 
-Closely mirrors
-[`@fantasticfour/world-cloudflare`](https://github.com/vinnymac/worlds/tree/main/packages/world-cloudflare)
-(portions vendored, Apache-2.0 — see [NOTICE](./NOTICE)), with celld cells
-standing in for Cloudflare's platform services:
+`world-celld` stores workflow runs, hooks, and streams in celld cells. Scheduled
+work is delivered with durable cell alarms. This gives Node applications a
+self-hosted alternative to platform-specific Workflow backends.
 
-| world-cloudflare | world-celld |
-| --- | --- |
-| `WorkflowRunDO` Durable Object | `WorkflowRunDO` cell (vendored, event-sourced `applyEvent`) |
-| `StreamDO` Durable Object | `StreamDO` cell (vendored) |
-| Workers KV global index | `IndexDO` cell — single serialized cell, **read-after-write consistent** (KV was eventually consistent) |
-| Cloudflare Queues | `QueueDO` cells — durable alarms, retries, dead-letter table |
-| Worker `env` bindings | authenticated HTTP RPC to the fleet's public listener |
+> [!WARNING]
+> `world-celld` is experimental. The package has not been published to npm or
+> proven in production, and its API and storage layout may change before 1.0.
 
-## Architecture
+## What it provides
 
-```
-Node app (workflow runtime + createCelldWorld({ fleetUrl, secret }))
-  │  HTTPS + Bearer, tagged-JSON RPC:  POST /v1/rpc/{binding}/{name}/{method}
-  ▼
-celld public listener → worker router (bearer auth, method whitelist)
-  ├─ WORKFLOW_DB      → WorkflowRunDO   (one cell per run; guards + event append + entity
-  │                                      mutation in one storage transaction)
-  ├─ WORKFLOW_STREAMS → StreamDO        (chunk store + per-run stream registry)
-  ├─ WORKFLOW_INDEX   → IndexDO         (run listing + hook token/id lookup)
-  └─ WORKFLOW_QUEUE   → QueueDO         (q:<shard> cells: due index, alarm-driven delivery
-                          │              loop, idempotency dedup, backoff, DLQ)
-                          │ outbound fetch (x-vqs-* dialect)
-                          ▼
-              app's POST {baseUrl}/.well-known/workflow/v1/{flow|step}
-              (the workflow runtime's createQueueHandler routes)
+- Workflow run, step, event, and hook persistence
+- Durable streams
+- Delayed work, retries, deduplication, and dead-letter storage
+- An authenticated HTTP connection between a Node application and a celld fleet
+- An in-process fleet for local development and conformance testing
+
+## Try the example
+
+You need Node.js 22 or later and pnpm 11.
+
+```sh
+pnpm install
+pnpm build
+pnpm --dir examples/demo-app build
+pnpm --dir examples/demo-app demo
 ```
 
-## Quick start (no fleet needed)
+The example starts an in-memory fleet and runs an order workflow through steps,
+a sleep, an approval hook, and an output stream. It uses the same worker, cell
+classes, and HTTP protocol as a celld deployment; only persistence and cell
+routing are emulated.
 
-```bash
-pnpm install && pnpm build
-cd examples/demo-app && pnpm build && pnpm demo
+See [`examples/demo-app`](./examples/demo-app) for the application and workflow
+source.
+
+## Use it in an application
+
+Until the first npm release, clone and build this repository, then link it from
+your application:
+
+```sh
+# In this repository
+pnpm install
+pnpm build
+
+# In your Workflow application
+pnpm add ../world-celld
 ```
 
-The demo runs an order workflow — steps, `sleep`, an approval hook, and a
-live output stream — against the in-process fleet emulation
-(`@ewhauser/world-celld/testing`): the real router and real cell classes over
-in-memory state, crossing the real wire protocol.
+Workflow DevKit can load the package from environment variables:
 
-## Deploying to a celld fleet
+```sh
+WORKFLOW_TARGET_WORLD=@ewhauser/world-celld
+CELLD_FLEET_URL=http://fleet.internal:8080
+CELLD_WORLD_SECRET=replace-with-a-secret
+WORKFLOW_BASE_URL=https://workflow.example.com
+```
 
-1. **Fleet prerequisites** ([celld docs](https://github.com/denoland/celld)):
-   the `celld` binary, `esbuild` on PATH, and a bucket with
-   **conditional-write support** — S3, R2, GCS, Azure Blob, or Tigris.
-   MinIO (community), B2, Hetzner, and DO Spaces do not qualify.
+You can also construct the World directly:
 
-2. **Deploy the world worker.** The deployable project ships in the package:
+```ts
+import { createCelldWorld } from '@ewhauser/world-celld';
 
-   ```bash
-   cp -r node_modules/@ewhauser/world-celld/celld-worker ./workflow-world
-   celld deploy ./workflow-world --bucket s3://my-cells-bucket
-   ```
+const world = createCelldWorld({
+  fleetUrl: 'http://fleet.internal:8080',
+  secret: process.env.CELLD_WORLD_SECRET!,
+  baseUrl: 'https://workflow.example.com',
+});
+```
 
-3. **Start nodes** with the secret injected as a var override:
+`WORKFLOW_BASE_URL` (or `baseUrl`) is where queue cells deliver flow and step
+requests. It must be reachable from every celld node.
 
-   ```bash
-   CELLD_VAR_WORLD_SECRET=$(openssl rand -hex 32) \
-   celld --bucket s3://my-cells-bucket --listen 0.0.0.0:8080 \
-         --internal-listen 10.0.0.12:8081 --advertise 10.0.0.12:8081
-   ```
+## Deploy the worker
 
-4. **Point the app at the fleet:**
+Before deploying, you need a celld fleet, `esbuild` on `PATH`, and an object
+store that meets celld's conditional-write requirements. Refer to the
+[celld documentation](https://github.com/denoland/celld) for fleet and storage
+setup.
 
-   ```ts
-   import { createCelldWorld } from '@ewhauser/world-celld';
+From a source checkout:
 
-   const world = createCelldWorld({
-     fleetUrl: 'http://fleet.internal:8080',   // or CELLD_FLEET_URL
-     secret: process.env.CELLD_WORLD_SECRET!,  // or CELLD_WORLD_SECRET
-     baseUrl: 'https://app.internal',          // queue cells deliver here
-   });
-   ```
+```sh
+celld deploy ./celld-worker --bucket s3://my-cells-bucket
+```
 
-   With the Workflow DevKit, set `WORKFLOW_TARGET_WORLD=@ewhauser/world-celld`
-   and the `CELLD_*` env vars; `createWorld()` picks them up.
+From an installed package, first copy the deployable worker into your project:
 
-`baseUrl` (or `WORKFLOW_BASE_URL`) must be reachable **from the fleet**:
-queue cells push `x-vqs-*` messages to
-`{baseUrl}/.well-known/workflow/v1/{flow|step}`.
+```sh
+cp -R node_modules/@ewhauser/world-celld/celld-worker ./workflow-world
+celld deploy ./workflow-world --bucket s3://my-cells-bucket
+```
 
-### Config reference
+The worker rejects stateful requests unless `WORLD_SECRET` is configured. Pass
+the same secret to the fleet and the application:
 
-| Option / env var | Default | Meaning |
+```sh
+CELLD_VAR_WORLD_SECRET="$CELLD_WORLD_SECRET" \
+celld --bucket s3://my-cells-bucket \
+  --listen 0.0.0.0:8080 \
+  --internal-listen 10.0.0.12:8081 \
+  --advertise 10.0.0.12:8081
+```
+
+Use a secret manager rather than putting the value in `wrangler.jsonc`. Keep
+celld's internal listener on a trusted network; the World bearer token protects
+the worker RPC routes, not celld's administrative endpoints.
+
+More deployment detail is in [`celld-worker/README.md`](./celld-worker/README.md).
+
+## How it works
+
+```text
+Workflow application
+  |
+  | authenticated HTTP RPC
+  v
+celld worker router
+  |-- WorkflowRunDO  one cell per workflow run
+  |-- StreamDO       stream chunks and run/stream indexes
+  |-- IndexDO        run and hook lookup indexes
+  `-- QueueDO        delayed delivery, retries, and dead letters
+          |
+          | HTTP callbacks
+          v
+Workflow application /.well-known/workflow/v1/{flow|step}
+```
+
+The application-side package implements the Workflow `World` interface and
+translates its storage, stream, and queue operations into RPC calls. The celld
+worker accepts only a fixed set of methods and routes each request to the named
+cell that owns the data.
+
+## Configuration
+
+Application options can be passed to `createCelldWorld()` unless an environment
+variable is shown below.
+
+| Option | Environment variable | Default |
 | --- | --- | --- |
-| `fleetUrl` / `CELLD_FLEET_URL` | — | any fleet node's public listener |
-| `secret` / `CELLD_WORLD_SECRET` | — | bearer secret (worker `WORLD_SECRET`) |
-| `baseUrl` / `WORKFLOW_BASE_URL` | `http://localhost:$PORT` | app callback base URL |
-| `deploymentId` / `CELLD_DEPLOYMENT_ID` | `celld-default` | reported deployment id |
-| `queueShards` | `1` | number of `q:<shard>` cells (pinned at first use; changing it requires a drained fleet) |
-| `readPollMs` | `250` | stream read poll interval |
-| `CELLD_QUEUE_MODE=cells` | — | force the live-queue path under a test runner |
+| `fleetUrl` | `CELLD_FLEET_URL` | required |
+| `secret` | `CELLD_WORLD_SECRET` | required with `fleetUrl` |
+| `baseUrl` | `WORKFLOW_BASE_URL` | `http://localhost:$PORT` |
+| `deploymentId` | `CELLD_DEPLOYMENT_ID` | `celld-default` |
+| `queueShards` | — | `1` |
+| `readPollMs` | — | `250` |
+| `rpcTimeoutMs` | — | `30000` |
 
-Worker vars: `WORLD_SECRET` (required), `WORKFLOW_CALLBACK_SECRET` (optional,
-sent as `x-workflow-callback-secret` on deliveries), `QUEUE_MAX_ATTEMPTS` (5),
-`QUEUE_MAX_INFLIGHT` (5), `QUEUE_DELIVERY_TIMEOUT_MS` (300000).
+The deployed worker also accepts these celld variables:
 
-## Operations
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `WORLD_SECRET` | none | Required bearer secret for RPC routes |
+| `WORKFLOW_CALLBACK_SECRET` | none | Sent with deliveries as `x-workflow-callback-secret` |
+| `QUEUE_MAX_ATTEMPTS` | `5` | Attempts before a message is dead-lettered |
+| `QUEUE_MAX_INFLIGHT` | `5` | Concurrent deliveries per queue cell |
+| `QUEUE_DELIVERY_TIMEOUT_MS` | `300000` | Timeout for an application callback |
 
-- **Delivery semantics**: at-least-once everywhere (celld's model). Handlers
-  are idempotent by construction — the runtime dedups on `idempotencyKey`
-  inside the queue cell, and permanent handler errors (404/409/410/422) drop
-  without burning retries.
-- **Dead letters**: after `QUEUE_MAX_ATTEMPTS` transient failures a message
-  moves to the cell's DLQ. Inspect and recover over RPC (bearer-authenticated):
-  `stats`, `listDeadLetters`, `redriveDeadLetter`, `purgeDeadLetters` on
-  `POST /v1/rpc/queue/q:0/<method>`.
-- **Alarm abandonment**: celld abandons a cell alarm after six counted
-  handler failures. QueueDO's alarm never throws for data conditions (backoff
-  reschedules instead), and `POST /v1/rpc/queue/q:0/rearmAlarm` re-derives and
-  arms the timer if it ever happens. Alert on `stats.alarmAt === null` while
-  `pending > 0`.
-- **Deploys restart the fleet** (celld has no staged rollout). In-flight
-  deliveries die with the isolate; the inflight-deadline sweep on the next
-  alarm redelivers them. App redeploys at a new URL are safe: the delivery
-  target travels per message, not pinned per cell.
-- **celld#144**: alarm handlers can overlap; QueueDO wraps its claim phase in
-  `blockConcurrencyWhile` and keeps delivery I/O outside the gate.
-- **Fleet tuning** (measured in eve-ambient's celld evaluation, re-measure in
-  your infra): `CELLD_TTL_MS=5000`, `CELLD_WAKER_TICK_MS=5000`, stable node
-  identities, and `CELLD_LTX_COMPACTION` enabled.
-- **Security**: all state-touching routes require the bearer secret and fail
-  closed (503) when unset; celld's *internal* listener exposes unauthenticated
-  `/shutdown`//`/evict` — firewall it separately.
+`queueShards` is part of queue placement and is pinned when a queue cell is
+first used. Drain pending work before changing it.
 
-## Testing
+## Operational notes
 
-```bash
-pnpm test              # unit + wire-protocol + conformance (no celld needed)
-pnpm test:integration  # against a real fleet (CELLD_FLEET_URL + CELLD_WORLD_SECRET)
+- Delivery is at least once. Workflow steps and other external side effects
+  must be idempotent.
+- Queue cells expose `stats`, `listDeadLetters`, `redriveDeadLetter`,
+  `purgeDeadLetters`, and `rearmAlarm` through the authenticated RPC endpoint.
+- A new application URL applies to newly enqueued messages. Existing messages
+  retain the callback URL with which they were created.
+- Fleet restarts can interrupt in-flight callbacks; expired claims are
+  delivered again.
+
+## Development
+
+```sh
+pnpm build
+pnpm typecheck
+pnpm test
+pnpm check:worker-bundle
 ```
 
-- `test/spec.test.ts` / `test/spec-queue.test.ts` run the full
-  `@workflow/world-testing` conformance suite over the real HTTP RPC protocol
-  (real router + real cell classes on in-memory state), with the queue on the
-  in-process pump and on live QueueDO cells respectively.
-- `test/integration/fleet.test.ts` doubles as the celld spike assertions:
-  DO-RPC Date/Uint8Array fidelity, storage list-option pagination, 1 MiB
-  stream chunks, live alarm delivery/delay/503-redeliver, DLQ + redrive.
-- `@ewhauser/world-celld/testing` exports the harness (`startHarness`,
-  `startDevFleet`, `FakeFleet`) for your own tests.
+The default test suite includes the upstream `@workflow/world-testing`
+conformance suite and does not require celld. To run the live fleet tests:
 
-## Package layout
+```sh
+CELLD_FLEET_URL=http://fleet.internal:8080 \
+CELLD_WORLD_SECRET=replace-with-a-secret \
+pnpm test:integration
+```
 
-- `.` — `createCelldWorld()` for the Node app (storage/streamer/queue over
-  HTTP RPC; in-process test pump under test runners).
-- `./worker` — the celld worker: 4 cell classes + the router (kept free of
-  Node built-ins; CI verifies with an esbuild pass under workerd conditions).
-- `./testing` — in-process fleet emulation.
-- `celld-worker/` — the copy-and-deploy project directory.
+Bug reports and focused pull requests are welcome. Please include a regression
+test for behavior changes and run the checks above before submitting a PR.
 
 ## License
 
-Apache-2.0. Portions vendored from
-[vinnymac/worlds](https://github.com/vinnymac/worlds) (Apache-2.0) — see
-[NOTICE](./NOTICE).
+Apache-2.0. Parts of the implementation are adapted from
+[`vinnymac/worlds`](https://github.com/vinnymac/worlds), also under Apache-2.0.
+See [`NOTICE`](./NOTICE) for details.
