@@ -3,6 +3,7 @@
  * node:http, driven by the real remote client. Everything except celld.
  */
 import { WorkflowRunNotFoundError } from '@workflow/errors';
+import { createConnection } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { rpcStringify } from '../src/codec.js';
 import { createRemoteEnv } from '../src/remote/namespaces.js';
@@ -33,6 +34,37 @@ function rpc(path: string, body: unknown, token?: string): Promise<Response> {
     body: rpcStringify(body),
   });
 }
+
+describe('test harness lifecycle', () => {
+  it('closes with an incomplete client connection still open', async () => {
+    const isolated = await startHarness({ secret: SECRET });
+    const target = new URL(isolated.url);
+    const socket = createConnection({ host: target.hostname, port: Number(target.port) });
+    let close: Promise<void> | undefined;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        socket.once('connect', resolve);
+        socket.once('error', reject);
+      });
+      socket.write(`GET /v1/health HTTP/1.1\r\nHost: ${target.host}\r\n`);
+
+      close = isolated.close();
+      await expect(
+        Promise.race([
+          close,
+          new Promise<never>((_, reject) => {
+            timeout = setTimeout(() => reject(new Error('harness close timed out')), 1_000);
+          }),
+        ]),
+      ).resolves.toBeUndefined();
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      socket.destroy();
+      await (close ?? isolated.close());
+    }
+  });
+});
 
 describe('router auth and shape', () => {
   it('serves /v1/health unauthenticated', async () => {

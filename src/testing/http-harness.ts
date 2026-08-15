@@ -75,8 +75,12 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     url: `http://127.0.0.1:${port}`,
     fleet,
     close: () =>
-      new Promise<void>((resolve, reject) =>
-        server.close((err) => (err ? reject(err) : resolve())),
-      ),
+      new Promise<void>((resolve, reject) => {
+        // Test clients may retain an active keep-alive connection after their
+        // assertions finish. Stop accepting connections first, then destroy
+        // any that remain so teardown cannot wait indefinitely.
+        server.close((err) => (err ? reject(err) : resolve()));
+        server.closeAllConnections();
+      }),
   };
 }
