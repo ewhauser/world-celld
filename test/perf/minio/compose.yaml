@@ -1,0 +1,125 @@
+name: world-celld-perf
+
+x-app: &app
+  build:
+    context: ../../..
+    dockerfile: test/perf/minio/Dockerfile
+  image: world-celld-perf:local
+  working_dir: /workspace
+
+x-storage-environment: &storage-environment
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  AWS_EC2_METADATA_DISABLED: 'true'
+
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: ['/bin/sh', '-c']
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command:
+      - |
+        until mc alias set local http://minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"; do
+          sleep 1
+        done
+        mc mb --ignore-existing local/world-celld-perf
+
+  deploy:
+    <<: *app
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment: *storage-environment
+    command:
+      - celld
+      - deploy
+      - celld-worker
+      - --bucket
+      - s3://world-celld-perf
+      - --endpoint
+      - http://minio:9000
+      - --region
+      - us-east-1
+
+  celld:
+    <<: *app
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
+    environment:
+      <<: *storage-environment
+      # MinIO Community does not enforce the conditional writes celld needs
+      # for multi-node fencing. This harness is deliberately single-node.
+      CELLD_STORAGE_PROBE: '0'
+      CELLD_VAR_WORLD_SECRET: world-celld-perf-secret
+      CELLD_VAR_QUEUE_MAX_INFLIGHT: '${PERF_QUEUE_MAX_INFLIGHT:-25}'
+      CELLD_VAR_QUEUE_DELIVERY_TIMEOUT_MS: '${PERF_DELIVERY_TIMEOUT_MS:-30000}'
+      CELLD_WATCH: /var/lib/celld/state
+    command:
+      - celld
+      - --bucket
+      - s3://world-celld-perf
+      - --endpoint
+      - http://minio:9000
+      - --region
+      - us-east-1
+      - --listen
+      - 0.0.0.0:8080
+      - --internal-listen
+      - 0.0.0.0:8081
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 1s
+      timeout: 5s
+      retries: 90
+    volumes:
+      - celld-state:/var/lib/celld
+
+  perf:
+    <<: *app
+    depends_on:
+      celld:
+        condition: service_healthy
+    environment:
+      CELLD_FLEET_URL: http://celld:8080
+      CELLD_WORLD_SECRET: world-celld-perf-secret
+      CELLD_CALLBACK_BASE_URL: http://perf:3000
+      PERF_CALLBACK_PORT: '3000'
+      PERF_MESSAGES: '${PERF_MESSAGES:-1000}'
+      PERF_CONCURRENCY: '${PERF_CONCURRENCY:-32}'
+      PERF_QUEUE_SHARDS: '${PERF_QUEUE_SHARDS:-8}'
+      PERF_PAYLOAD_BYTES: '${PERF_PAYLOAD_BYTES:-256}'
+      PERF_RETRY_EVERY: '${PERF_RETRY_EVERY:-20}'
+      PERF_TIMEOUT_MS: '${PERF_TIMEOUT_MS:-180000}'
+      PERF_MIN_ENQUEUE_PER_SECOND: '${PERF_MIN_ENQUEUE_PER_SECOND:-0}'
+      PERF_MIN_DELIVERY_PER_SECOND: '${PERF_MIN_DELIVERY_PER_SECOND:-0}'
+      PERF_MAX_DELIVERY_P99_MS: '${PERF_MAX_DELIVERY_P99_MS:-0}'
+      PERF_RESULT_PATH: /workspace/.perf-results/minio-latest.json
+      PERF_CELLD_VERSION: v0.2.1
+      PERF_MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
+    command: pnpm vitest run --config vitest.perf.config.ts
+    volumes:
+      - ${PERF_RESULTS_DIR:-../../../.perf-results}:/workspace/.perf-results
+
+volumes:
+  celld-state:
+  minio-data:

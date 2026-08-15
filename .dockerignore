@@ -1,0 +1,5 @@
+.git
+.perf-results
+dist
+node_modules
+*.log

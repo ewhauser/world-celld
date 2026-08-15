@@ -184,15 +184,85 @@ pnpm check
 
 `pnpm check` runs formatting, linting, type checking, tests, the build, and the
 worker bundle check. Oxlint runs its correctness, suspicious, and performance
-categories with type-aware checks and warnings denied. The default test suite includes the upstream
-`@workflow/world-testing` conformance suite and does not require celld. To run
-the live fleet tests:
+categories with type-aware checks and warnings denied. The default test suite
+includes the upstream `@workflow/world-testing` conformance suite and does not
+require celld. To run the live fleet tests:
 
 ```sh
 CELLD_FLEET_URL=http://fleet.internal:8080 \
 CELLD_WORLD_SECRET=replace-with-a-secret \
 pnpm test:integration
 ```
+
+### Local MinIO performance and loss test
+
+The opt-in performance harness starts a fresh MinIO bucket and a single celld
+node with Docker Compose, sends concurrent queue traffic, and verifies that
+every accepted message reaches a successful callback. A configurable portion
+of callbacks returns one `503` first, so the same run also exercises durable
+redelivery. The result includes enqueue and delivery throughput plus p50, p95,
+p99, and maximum latency, and is saved to `.perf-results/minio-latest.json`.
+
+> MinIO Community is **not a supported celld production store**. It does not
+> implement the conditional writes celld needs for ownership fencing. This
+> deliberately single-node harness disables celld's storage probe and tests
+> the queue's persistence, redelivery, and performance paths only; it does not
+> validate multi-node ownership or failover correctness.
+
+With Docker and the Compose plugin installed, run:
+
+```sh
+pnpm test:perf:minio
+```
+
+The defaults send 1,000 messages with concurrency 32 across eight queue cells,
+and force every twentieth message through one `503` redelivery.
+
+#### Reference result
+
+The following directional baseline was recorded on August 15, 2026. MinIO and
+celld ran as native arm64 processes because Docker was unavailable on the test
+machine; container results will differ.
+
+| Environment | Value                                                                                                    |
+| ----------- | -------------------------------------------------------------------------------------------------------- |
+| Machine     | MacBook Pro (Mac15,8), Apple M3 Max, 16 cores (12 performance, 4 efficiency), 64 GB RAM                  |
+| OS          | macOS 26.5.2 (25F84), arm64                                                                              |
+| Services    | celld v0.2.1; MinIO RELEASE.2025-09-07T16-13-09Z                                                         |
+| Workload    | 1,000 messages; concurrency 32; 8 queue shards; 256-byte target payload; every 20th message retried once |
+
+| Metric                      |                                                                            Result |
+| --------------------------- | --------------------------------------------------------------------------------: |
+| Delivery integrity          | 1,000 accepted, 1,000 delivered, 0 missing, 0 duplicate successes, 0 dead letters |
+| Callback attempts           |                                           1,050, including 50 forced redeliveries |
+| Enqueue throughput          |                                                                 248.18 messages/s |
+| Delivery throughput         |                                                                 235.93 messages/s |
+| Enqueue latency             |                        p50 118.70 ms; p95 201.90 ms; p99 250.69 ms; max 345.86 ms |
+| End-to-end delivery latency |                      p50 236.63 ms; p95 442.58 ms; p99 714.80 ms; max 1,049.85 ms |
+| Final queue state           |                        0 pending, 0 in flight, 0 dead letters across all 8 shards |
+
+Use these numbers as a smoke-test reference, not a portable performance
+guarantee. For regression tracking, compare repeated runs on the same machine
+and runtime configuration.
+
+Override the workload or set machine-specific regression budgets with
+environment variables:
+
+```sh
+PERF_MESSAGES=10000 \
+PERF_CONCURRENCY=64 \
+PERF_QUEUE_SHARDS=16 \
+PERF_MIN_DELIVERY_PER_SECOND=100 \
+PERF_MAX_DELIVERY_P99_MS=5000 \
+pnpm test:perf:minio
+```
+
+Useful controls are `PERF_PAYLOAD_BYTES`, `PERF_RETRY_EVERY`,
+`PERF_TIMEOUT_MS`, `PERF_QUEUE_MAX_INFLIGHT`,
+`PERF_MIN_ENQUEUE_PER_SECOND`, `PERF_MIN_DELIVERY_PER_SECOND`, and
+`PERF_MAX_DELIVERY_P99_MS`. Throughput and latency budgets default to disabled
+because local machines vary. Message-loss, dead-letter, message-ID, queue-drain,
+and duplicate-success checks are always enforced.
 
 Bug reports and focused pull requests are welcome. Please include a regression
 test for behavior changes and run the checks above before submitting a PR.

@@ -3,6 +3,7 @@ dist/
 .output/
 .nitro/
 coverage/
+.perf-results/
 *.log
 .DS_Store
 .env
