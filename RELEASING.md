@@ -30,6 +30,10 @@ npm cannot configure trusted publishing until a package exists. The initial
 5. Verify the npm provenance, registry integrity, tag target, attached checksum,
    and immutable GitHub release.
 
-The workflow is idempotent for recovery: it accepts an existing npm version
-only when its integrity matches the freshly built tarball, and it will finish a
-missing or draft GitHub release without republishing different bytes.
+The workflow is idempotent for recovery. It accepts an existing npm version
+only when its complete uncompressed tar stream matches the freshly built
+package, then uses the registry's recorded integrity. This permits harmless
+gzip-encoder differences without accepting different package contents. It will
+read the package back from npm so the registry tarball's exact bytes become the
+GitHub release artifact, then finish a missing or draft GitHub release without
+republishing different bytes.
