@@ -1,9 +1,11 @@
 packages:
   - '.'
   - 'examples/*'
-# Converge compatible ranges on the first releases patched for the advisories
-# that affect the demo app's Workflow transitive dependencies.
+# Converge compatible ranges on the first releases patched for advisories in
+# the demo and test tooling's Workflow transitive dependencies.
 overrides:
+  '@hono/node-server@<1.19.15': 1.19.15
+  'hono@<4.12.34': 4.12.34
   'nanoid@>=5.0.0 <5.1.16': 5.1.16
   'undici@>=7.0.0 <7.29.0': 7.29.0
 # Give the ecosystem time to detect and remove compromised releases before
