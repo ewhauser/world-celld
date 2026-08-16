@@ -263,7 +263,7 @@ describe('MinIO single-node queue performance and loss', () => {
       queueShards,
       rpcTimeoutMs: timeoutMs,
     });
-    const queueName = `__wkf_step_perf_${runId.replaceAll('-', '')}`;
+    const queueName = `__wkf_workflow_perf_${runId.replaceAll('-', '')}`;
     const padding = 'x'.repeat(Math.max(0, payloadBytes - 96));
     const workloadStart = performance.now();
 
@@ -426,7 +426,7 @@ describe('MinIO single-node queue performance and loss', () => {
           input: [`payload-${sequence}`, 'x'.repeat(payloadBytes)],
         },
       });
-      const workflowRunId = created.run!.runId;
+      const workflowRunId = created.run.runId;
       runIds.push(workflowRunId);
       const streamName = `retention-${workflowRunId}`;
       await world.writeToStream(streamName, workflowRunId, `stream-${sequence}`);

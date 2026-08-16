@@ -275,7 +275,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       async create(
         runId: string | null,
         data: RunCreatedEventRequest | CreateEventRequest,
-        _params?: CreateEventParams,
+        params?: CreateEventParams,
       ): Promise<EventResult> {
         // For run_created events, generate a runId server-side if absent.
         let effectiveRunId: string;
@@ -310,7 +310,13 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // before anything is persisted.
         let outcome: ApplyEventOutcome;
         try {
-          outcome = await stub.applyEvent({ runId: effectiveRunId, data, tokenHolder, cleanup });
+          outcome = await stub.applyEvent({
+            runId: effectiveRunId,
+            data,
+            params,
+            tokenHolder,
+            cleanup,
+          });
         } catch (error) {
           if (hookReservation && data.eventType === 'hook_created') {
             await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
@@ -367,12 +373,23 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           );
         }
 
+        const eventPage =
+          outcome.events === undefined
+            ? {}
+            : {
+                events: outcome.events,
+                cursor: outcome.cursor ?? null,
+                hasMore: outcome.hasMore ?? false,
+              };
         return {
           event: outcome.event,
           run: outcome.run,
           step: outcome.step,
           hook: outcome.hook,
-          events: outcome.events,
+          wait: outcome.wait,
+          stepCreated: outcome.stepCreated,
+          maxEvents: outcome.maxEvents,
+          ...eventPage,
         };
       },
 
@@ -411,26 +428,39 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
       async listByCorrelationId(params) {
         const limit = params.pagination?.limit ?? 100;
-        const prefix = `correlation:${encodeURIComponent(params.correlationId)}:`;
-        const listed = await env.WORKFLOW_INDEX.list({
-          prefix,
-          limit,
-          cursor: params.pagination?.cursor,
-          reverse: params.pagination?.sortOrder === 'desc',
-        });
-        const events = await Promise.all(
-          listed.keys.map(async ({ name }) => {
-            const raw = await env.WORKFLOW_INDEX.get(name);
-            if (!raw) return null;
-            const { runId, eventId } = JSON.parse(raw) as { runId: string; eventId: string };
-            const outcome = await getRunDO(runId).getEvent(eventId);
-            return outcome.ok ? outcome.value : null;
-          }),
-        );
+        const stub = getRunDO(params.runId);
+        const matches: Event[] = [];
+        let scanCursor = params.pagination?.cursor;
+        let exhausted = false;
+
+        // Workflow 5 scopes correlation IDs to a run. Scan that run's dense
+        // event log rather than the global derived index so identical step or
+        // wait IDs in different runs can never leak into this result.
+        while (matches.length <= limit && !exhausted) {
+          const page = unwrapRead(
+            await stub.listEvents({
+              limit: Math.min(1000, Math.max(50, limit + 1)),
+              cursor: scanCursor,
+              sortOrder: params.pagination?.sortOrder ?? 'asc',
+            }),
+          );
+          for (const event of page.data) {
+            if (event.correlationId === params.correlationId) {
+              matches.push(event);
+              if (matches.length > limit) break;
+            }
+          }
+          exhausted = !page.hasMore;
+          scanCursor = page.cursor ?? page.data.at(-1)?.eventId;
+          if (page.data.length === 0) exhausted = true;
+        }
+
+        const hasMore = matches.length > limit;
+        const data = matches.slice(0, limit);
         return {
-          data: events.filter((event): event is Event => event !== null).map(parseEvent),
-          cursor: listed.list_complete ? null : (listed.cursor ?? null),
-          hasMore: !listed.list_complete,
+          data: data.map(parseEvent),
+          cursor: hasMore ? (data.at(-1)?.eventId ?? null) : null,
+          hasMore,
         };
       },
     },

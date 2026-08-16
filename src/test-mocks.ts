@@ -7,11 +7,12 @@
  * storage medium (an in-memory sorted map) is mocked.
  */
 
-import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
+import { slotToEventId, type Event, type Hook, type Step, type WorkflowRun } from '@workflow/world';
 import type { HookTokenOwner } from './config.js';
 import type { EnqueueOutcome, EnqueueRequest, QueueCellStub } from './queue.js';
 import {
   applyEvent,
+  finalizeEventPage,
   type ApplyEventOutcome,
   type ApplyEventRequest,
   EVENT_KEY_PREFIX,
@@ -115,13 +116,13 @@ class MockWorkflowRunDOStub {
     let eventSequence = (await this.store.get<number>('event_sequence')) ?? 0;
     const outcome = await applyEvent(this.store, {
       ...request,
-      nextEventId: () => `wevt_z${String(++eventSequence).padStart(20, '0')}`,
+      nextEventId: () => slotToEventId(++eventSequence),
       now: new Date(),
     });
     if (outcome.ok) {
       await this.store.put('event_sequence', eventSequence);
     }
-    return outcome;
+    return finalizeEventPage(this.store, outcome, request.params);
   }
 
   async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {

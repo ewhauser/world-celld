@@ -49,7 +49,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         executionContext: opts.executionContext,
       },
     });
-    return result.run!;
+    return result.run;
   }
 
   describe('runs', () => {
@@ -67,7 +67,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
         expect(result.run).toBeDefined();
         expect(result.event).toBeDefined();
-        const run = result.run!;
+        const run = result.run;
         expect(run.runId).toMatch(/^wrun_/);
         expect(run.deploymentId).toBe('deployment-123');
         expect(run.status).toBe('pending');
@@ -92,7 +92,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
           },
         });
 
-        const run = result.run!;
+        const run = result.run;
         expect(run.executionContext).toBeUndefined();
         expect(run.input).toEqual([]);
       });
@@ -158,7 +158,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         const result = await storage.events.create(created.runId, {
           eventType: 'run_started',
         });
-        const updated = result.run!;
+        const updated = result.run;
         expect(updated.status).toBe('running');
         expect(updated.startedAt).toBeInstanceOf(Date);
       });
@@ -345,9 +345,9 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
           eventType: 'step_started',
           correlationId: 'step-123',
         });
-        expect(started.step!.attempt).toBe(1);
-        expect(started.step!.status).toBe('running');
-        expect(started.step!.startedAt).toBeInstanceOf(Date);
+        expect(started.step.attempt).toBe(1);
+        expect(started.step.status).toBe('running');
+        expect(started.step.startedAt).toBeInstanceOf(Date);
 
         const result = await storage.events.create(testRunId, {
           eventType: 'step_retrying',
@@ -368,7 +368,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
           eventType: 'step_started',
           correlationId: 'step-123',
         });
-        expect(restarted.step!.attempt).toBe(2);
+        expect(restarted.step.attempt).toBe(2);
       });
     });
 
@@ -429,7 +429,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
         const event = result.event!;
         expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
+        expect(event.eventId).toMatch(/^evnt_/);
         expect(event.eventType).toBe('step_started');
         expect(event.correlationId).toBe('corr_123');
         expect(event.createdAt).toBeInstanceOf(Date);
@@ -451,7 +451,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
         const event = result.event!;
         expect(event.runId).toBe(testRunId);
-        expect(event.eventId).toMatch(/^wevt_/);
+        expect(event.eventId).toMatch(/^evnt_/);
         expect(event.eventType).toBe('step_failed');
         expect(event.correlationId).toBe('corr_123');
         expect(event.createdAt).toBeInstanceOf(Date);
@@ -589,7 +589,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         },
       });
       expect(result1.run).toBeDefined();
-      const runId = result1.run!.runId;
+      const runId = result1.run.runId;
 
       // Duplicate run_created event (replay scenario)
       const result2 = await storage.events.create(runId, {
@@ -601,7 +601,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         },
       });
       expect(result2.run).toBeDefined();
-      expect(result2.run!.runId).toBe(runId);
+      expect(result2.run.runId).toBe(runId);
 
       const listResult = await storage.runs.list({ workflowName: 'test-workflow-idempotent' });
       expect(listResult.data.some((r) => r.runId === runId)).toBe(true);
@@ -651,7 +651,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       });
       expect(result1.run?.status).toBe('running');
       expect(result1.run?.startedAt).toBeInstanceOf(Date);
-      const originalStartedAt = result1.run!.startedAt!;
+      const originalStartedAt = result1.run.startedAt;
 
       // Second run_started (replay scenario — should be idempotent)
       const result2 = await storage.events.create(run.runId, {
@@ -659,7 +659,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       });
       expect(result2.run?.status).toBe('running');
       // startedAt should be preserved from first call
-      expect(result2.run!.startedAt!.getTime()).toBe(originalStartedAt.getTime());
+      expect(result2.run.startedAt.getTime()).toBe(originalStartedAt.getTime());
 
       // Only ONE run_started event should exist in the log
       const eventList = await storage.events.list({
@@ -876,7 +876,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       const result = await storage.events.create(run.runId, {
         eventType: 'step_failed',
         correlationId: 'step-1',
-        eventData: { error: 'string step failure', stack: 'at somewhere' },
+        eventData: { error: { message: 'string step failure', stack: 'at somewhere' } },
       });
 
       expect(result.step?.error?.message).toBe('string step failure');
@@ -884,7 +884,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
     });
   });
 
-  describe('Hook semantics (4.2.1)', () => {
+  describe('Hook semantics (Workflow 5)', () => {
     let testRunId: string;
 
     beforeEach(async () => {
@@ -1030,9 +1030,9 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
       // The bootstrap must return the run entity, already running
       expect(result.run).toBeDefined();
-      expect(result.run!.runId).toBe(runId);
-      expect(result.run!.status).toBe('running');
-      expect(result.run!.input).toEqual(['boot-input']);
+      expect(result.run.runId).toBe(runId);
+      expect(result.run.status).toBe('running');
+      expect(result.run.input).toEqual(['boot-input']);
 
       // A synthetic run_created event precedes run_started in the log
       const events = await storage.events.list({

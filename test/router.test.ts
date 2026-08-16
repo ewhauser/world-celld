@@ -149,14 +149,14 @@ describe('full stack: vendored storage over the wire', () => {
       eventData: { deploymentId: 'wire-test', workflowName: 'wire-hooks', input: [] },
     });
 
-    await storage.events.create(created.run!.runId, {
+    await storage.events.create(created.run.runId, {
       eventType: 'hook_created',
       correlationId: 'wire-hook',
       eventData: { token: 'wire-hook-token' },
     });
 
     await expect(storage.hooks.getByToken('wire-hook-token')).resolves.toMatchObject({
-      runId: created.run!.runId,
+      runId: created.run.runId,
       hookId: 'wire-hook',
     });
   });
@@ -177,9 +177,9 @@ describe('full stack: vendored storage over the wire', () => {
       },
     });
 
-    const runId = result.run!.runId;
+    const runId = result.run.runId;
     expect(runId).toMatch(/^wrun_/);
-    expect(result.run!.createdAt).toBeInstanceOf(Date);
+    expect(result.run.createdAt).toBeInstanceOf(Date);
 
     const run = await storage.runs.get(runId);
     expect(run.status).toBe('pending');
