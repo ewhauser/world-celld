@@ -156,6 +156,8 @@ function throwOutcomeError(
       throw new WorkflowWorldError(outcome.message, { status: 404 });
     case 'HOOK_NOT_FOUND':
       throw new HookNotFoundError(data.correlationId ?? runId);
+    case 'WAIT_NOT_FOUND':
+      throw new WorkflowWorldError(outcome.message, { status: 404 });
     case 'ENTITY_CONFLICT':
       throw new EntityConflictError(outcome.message);
     case 'RUN_EXPIRED':
@@ -164,8 +166,6 @@ function throwOutcomeError(
       throw new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds });
     case 'RUN_NOT_SUPPORTED':
       throw new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT);
-    case 'LEGACY_RUN_NOT_SUPPORTED':
-      throw new WorkflowWorldError(outcome.message, { status: 422 });
   }
 }
 
