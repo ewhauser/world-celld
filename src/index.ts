@@ -9,6 +9,7 @@ import { createRemoteEnv } from './remote/namespaces.js';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
 import { createStreamer } from './streamer.js';
+import type { CleanupRecord } from './retention.js';
 
 export type { CelldWorldConfig, CelldWorldEnv, IndexNamespace } from './config.js';
 export type {
@@ -20,8 +21,18 @@ export type {
 } from './queue.js';
 export type { WorkflowRunDONamespace, WorkflowRunDOStub } from './storage.js';
 export type { StreamDONamespace, StreamDOStub } from './streamer.js';
+export type { CleanupPhase, CleanupRecord, RunTombstone } from './retention.js';
 
-export function createCelldWorld(config?: CelldWorldConfig): World {
+export interface CelldRetentionAdmin {
+  getStatus(runId: string): Promise<CleanupRecord | null>;
+  schedule(runId: string): Promise<CleanupRecord | null>;
+  cleanupNow(runId: string): Promise<CleanupRecord | null>;
+  rearm(runId: string): Promise<CleanupRecord | null>;
+}
+
+export type CelldWorld = World & { retention: CelldRetentionAdmin };
+
+export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
   const resolved = resolveConfig(config);
 
   // Check for global test environment first (for @workflow/world-testing)
@@ -62,6 +73,8 @@ export function createCelldWorld(config?: CelldWorldConfig): World {
       WORKFLOW_INDEX: env.WORKFLOW_INDEX,
     },
     deploymentId: resolved.deploymentId,
+    runRetentionMs: resolved.runRetentionMs,
+    queueShards: resolved.queueShards,
   });
 
   const queue = createQueue({
@@ -80,10 +93,33 @@ export function createCelldWorld(config?: CelldWorldConfig): World {
     readPollMs: resolved.readPollMs,
   });
 
+  const runStub = (runId: string) => env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId));
+  const retention: CelldRetentionAdmin = {
+    getStatus: (runId) => runStub(runId).getCleanupStatus(),
+    schedule: (runId) => {
+      if (resolved.runRetentionMs === 0) {
+        throw new Error(
+          'world-celld: runRetentionMs must be greater than zero to schedule cleanup',
+        );
+      }
+      return runStub(runId).scheduleCleanup({
+        retentionMs: resolved.runRetentionMs,
+        queueShards: resolved.queueShards,
+      });
+    },
+    cleanupNow: (runId) =>
+      runStub(runId).cleanupNow({
+        retentionMs: Math.max(1, resolved.runRetentionMs),
+        queueShards: resolved.queueShards,
+      }),
+    rearm: (runId) => runStub(runId).rearmCleanup(),
+  };
+
   return {
     ...storage,
     ...queue,
     ...streamer,
+    retention,
     // Enables resilient start: runs are created at the current spec version,
     // so the queue message carries runInput and run_started can bootstrap the
     // run when run_created has not landed yet.

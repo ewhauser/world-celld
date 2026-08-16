@@ -1,5 +1,6 @@
 import { DurableObject } from '../do-base.js';
 import type { EnqueueOutcome, EnqueueRequest } from '../../queue.js';
+import type { ExpireQueueRunResult } from '../../retention.js';
 
 /**
  * Queue cell: the celld replacement for Cloudflare Queues.
@@ -16,6 +17,8 @@ import type { EnqueueOutcome, EnqueueRequest } from '../../queue.js';
  *   inflight:<messageId>         crash-recovery deadline (epoch ms)
  *   key:<idempotencyKey>         active dedup claim -> messageId
  *   dlq:<paddedMs>:<messageId>   DeadLetterRow
+ *   run:<runId>:<messageId>      QueueRunReference for retention cleanup
+ *   expired-run:<runId>          run fence preventing delayed enqueue
  *
  * celld gotchas designed around:
  * - celld#144 (alarm handlers can overlap): the storage-only claim phase runs
@@ -34,6 +37,7 @@ export interface MessageRow {
   pathname: 'flow' | 'step';
   /** Pre-encoded tagged-JSON payload — forwarded byte-identical. */
   body: string;
+  runId?: string;
   /**
    * Delivery target captured at enqueue time. Carried per message (not
    * pinned on the cell) so an app redeploy at a new URL never bricks the
@@ -59,6 +63,18 @@ export interface QueueStats {
   alarmAt: number | null;
 }
 
+interface QueueRunReference {
+  messageId: string;
+  dueKey?: string;
+  dlqKey?: string;
+  idempotencyKey?: string;
+}
+
+interface ExpiredRunFence {
+  expiredAt: number;
+  deleted: number;
+}
+
 const PERMANENT_STATUSES = new Set([404, 409, 410, 422]);
 
 const DEFAULT_MAX_ATTEMPTS = 5;
@@ -77,6 +93,14 @@ function pad(ms: number): string {
 
 function dueKey(atMs: number, messageId: string): string {
   return `due:${pad(atMs)}:${messageId}`;
+}
+
+function runReferenceKey(runId: string, messageId: string): string {
+  return `run:${runId}:${messageId}`;
+}
+
+function expiredRunKey(runId: string): string {
+  return `expired-run:${runId}`;
 }
 
 function backoffSeconds(attempt: number): number {
@@ -118,6 +142,13 @@ export class QueueDO extends DurableObject {
     const now = this.#now();
 
     const outcome = await storage.transaction<EnqueueOutcome>(async (txn) => {
+      if (request.runId && (await txn.get(expiredRunKey(request.runId))) !== undefined) {
+        return {
+          ok: false,
+          code: 'RUN_EXPIRED',
+          message: `Workflow run "${request.runId}" has expired`,
+        };
+      }
       // Pin the shard count from the first enqueue and reject drift loudly:
       // idempotencyKey -> cell affinity (and therefore dedup correctness)
       // depends on every producer agreeing on the shard count. The delivery
@@ -156,14 +187,23 @@ export class QueueDO extends DurableObject {
         queueName: request.queueName,
         pathname: request.pathname,
         body: request.body,
+        runId: request.runId,
         targetBaseUrl: request.config.targetBaseUrl,
         idempotencyKey: request.idempotencyKey,
         attempt: 0,
         enqueuedAt: now,
       };
       const dueAt = now + Math.max(0, request.delaySeconds ?? 0) * 1000;
+      const scheduleKey = dueKey(dueAt, row.messageId);
       await txn.put(`msg:${row.messageId}`, row);
-      await txn.put(dueKey(dueAt, row.messageId), row.messageId);
+      await txn.put(scheduleKey, row.messageId);
+      if (row.runId) {
+        await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+          messageId: row.messageId,
+          dueKey: scheduleKey,
+          idempotencyKey: row.idempotencyKey,
+        });
+      }
       await this.#armAlarmAtMost(txn, dueAt, now);
 
       return { ok: true, messageId: row.messageId, deduped: false };
@@ -214,8 +254,17 @@ export class QueueDO extends DurableObject {
         if (deadline <= now) {
           const messageId = key.slice('inflight:'.length);
           await txn.delete(key);
-          if (await txn.get(`msg:${messageId}`)) {
-            await txn.put(dueKey(now, messageId), messageId);
+          const row = await txn.get<MessageRow>(`msg:${messageId}`);
+          if (row) {
+            const scheduleKey = dueKey(now, messageId);
+            await txn.put(scheduleKey, messageId);
+            if (row.runId) {
+              await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+                messageId: row.messageId,
+                dueKey: scheduleKey,
+                idempotencyKey: row.idempotencyKey,
+              });
+            }
           }
         } else {
           inflightCount++;
@@ -288,8 +337,29 @@ export class QueueDO extends DurableObject {
       }
       if (typeof timeoutSeconds === 'number') {
         await storage.transaction(async (txn) => {
+          if (row.runId && (await txn.get(expiredRunKey(row.runId))) !== undefined) {
+            await txn.delete(`msg:${row.messageId}`);
+            await txn.delete(`inflight:${row.messageId}`);
+            await txn.delete(runReferenceKey(row.runId, row.messageId));
+            if (row.idempotencyKey) {
+              const dedupKey = `key:${row.idempotencyKey}`;
+              if ((await txn.get<string>(dedupKey)) === row.messageId) {
+                await txn.delete(dedupKey);
+              }
+            }
+            await this.#scheduleNextAlarm(txn, now);
+            return;
+          }
           await txn.delete(`inflight:${row.messageId}`);
-          await txn.put(dueKey(now + timeoutSeconds * 1000, row.messageId), row.messageId);
+          const scheduleKey = dueKey(now + timeoutSeconds * 1000, row.messageId);
+          await txn.put(scheduleKey, row.messageId);
+          if (row.runId) {
+            await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+              messageId: row.messageId,
+              dueKey: scheduleKey,
+              idempotencyKey: row.idempotencyKey,
+            });
+          }
           await this.#scheduleNextAlarm(txn, now);
         });
       } else {
@@ -318,6 +388,9 @@ export class QueueDO extends DurableObject {
           await txn.delete(`key:${row.idempotencyKey}`);
         }
       }
+      if (row.runId) {
+        await txn.delete(runReferenceKey(row.runId, row.messageId));
+      }
       await this.#scheduleNextAlarm(txn, this.#now());
     });
   }
@@ -329,11 +402,25 @@ export class QueueDO extends DurableObject {
     const attempt = row.attempt + 1;
 
     await storage.transaction(async (txn) => {
+      if (row.runId && (await txn.get(expiredRunKey(row.runId))) !== undefined) {
+        await txn.delete(`msg:${row.messageId}`);
+        await txn.delete(`inflight:${row.messageId}`);
+        await txn.delete(runReferenceKey(row.runId, row.messageId));
+        if (row.idempotencyKey) {
+          const dedupKey = `key:${row.idempotencyKey}`;
+          if ((await txn.get<string>(dedupKey)) === row.messageId) {
+            await txn.delete(dedupKey);
+          }
+        }
+        await this.#scheduleNextAlarm(txn, now);
+        return;
+      }
       await txn.delete(`inflight:${row.messageId}`);
 
       if (attempt >= maxAttempts) {
         const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt: now };
-        await txn.put(`dlq:${pad(now)}:${row.messageId}`, dead);
+        const deadKey = `dlq:${pad(now)}:${row.messageId}`;
+        await txn.put(deadKey, dead);
         await txn.delete(`msg:${row.messageId}`);
         if (row.idempotencyKey) {
           const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
@@ -341,13 +428,28 @@ export class QueueDO extends DurableObject {
             await txn.delete(`key:${row.idempotencyKey}`);
           }
         }
+        if (row.runId) {
+          await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+            messageId: row.messageId,
+            dlqKey: deadKey,
+            idempotencyKey: row.idempotencyKey,
+          });
+        }
         await this.#scheduleNextAlarm(txn, now);
         return;
       }
 
       const updated: MessageRow = { ...row, attempt, lastError: reason };
+      const scheduleKey = dueKey(now + backoffSeconds(attempt) * 1000, row.messageId);
       await txn.put(`msg:${row.messageId}`, updated);
-      await txn.put(dueKey(now + backoffSeconds(attempt) * 1000, row.messageId), row.messageId);
+      await txn.put(scheduleKey, row.messageId);
+      if (row.runId) {
+        await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+          messageId: row.messageId,
+          dueKey: scheduleKey,
+          idempotencyKey: row.idempotencyKey,
+        });
+      }
       await this.#scheduleNextAlarm(txn, now);
     });
   }
@@ -454,8 +556,16 @@ export class QueueDO extends DurableObject {
         }
 
         await txn.put(`msg:${row.messageId}`, row);
-        await txn.put(dueKey(now, row.messageId), row.messageId);
+        const scheduleKey = dueKey(now, row.messageId);
+        await txn.put(scheduleKey, row.messageId);
         await txn.delete(key);
+        if (row.runId) {
+          await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+            messageId: row.messageId,
+            dueKey: scheduleKey,
+            idempotencyKey: row.idempotencyKey,
+          });
+        }
         await this.#armAlarmAtMost(txn, now, now);
         return { ok: true };
       }
@@ -469,8 +579,12 @@ export class QueueDO extends DurableObject {
     const storage = this.ctx.storage;
     return await storage.transaction(async (txn) => {
       const dlq = await txn.list({ prefix: 'dlq:' });
-      for (const key of dlq.keys()) {
+      for (const [key, value] of dlq) {
         await txn.delete(key);
+        const dead = value as DeadLetterRow;
+        if (dead.runId) {
+          await txn.delete(runReferenceKey(dead.runId, dead.messageId));
+        }
       }
       return { purged: dlq.size };
     });
@@ -483,5 +597,33 @@ export class QueueDO extends DurableObject {
   async rearmAlarm(): Promise<{ alarmAt: number | null }> {
     await this.#rearm();
     return { alarmAt: await this.ctx.storage.getAlarm() };
+  }
+
+  /** Fence a run and purge every live, inflight, and dead-letter message it owns. */
+  async expireRun(runId: string, expiredAt: number): Promise<ExpireQueueRunResult> {
+    const storage = this.ctx.storage;
+    const deleted = await storage.transaction(async (txn) => {
+      const existing = await txn.get<ExpiredRunFence>(expiredRunKey(runId));
+      const references = await txn.list<QueueRunReference>({ prefix: `run:${runId}:` });
+      let count = existing?.deleted ?? 0;
+      for (const [key, reference] of references) {
+        await txn.delete(`msg:${reference.messageId}`);
+        await txn.delete(`inflight:${reference.messageId}`);
+        if (reference.dueKey) await txn.delete(reference.dueKey);
+        if (reference.dlqKey) await txn.delete(reference.dlqKey);
+        if (reference.idempotencyKey) {
+          const dedupKey = `key:${reference.idempotencyKey}`;
+          if ((await txn.get<string>(dedupKey)) === reference.messageId) {
+            await txn.delete(dedupKey);
+          }
+        }
+        await txn.delete(key);
+        count++;
+      }
+      await txn.put<ExpiredRunFence>(expiredRunKey(runId), { expiredAt, deleted: count });
+      await this.#scheduleNextAlarm(txn, this.#now());
+      return count;
+    });
+    return { deleted };
   }
 }

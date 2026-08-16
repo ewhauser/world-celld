@@ -51,7 +51,7 @@
   },
   "scripts": {
     "build": "tsdown",
-    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm test && pnpm build && pnpm check:worker-bundle && pnpm pack:check",
+    "check": "pnpm format:check && pnpm lint && pnpm typecheck && pnpm build && pnpm test && pnpm check:worker-bundle && pnpm pack:check",
     "clean": "rm -rf dist",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",

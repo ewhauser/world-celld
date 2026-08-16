@@ -41,6 +41,10 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'listEvents',
       'listSteps',
       'listHooks',
+      'getCleanupStatus',
+      'scheduleCleanup',
+      'cleanupNow',
+      'rearmCleanup',
     ]),
   },
   streams: {
@@ -52,6 +56,9 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'getInfo',
       'registerStream',
       'listStreams',
+      'expireRegistry',
+      'finalizeRegistry',
+      'expireStream',
     ]),
   },
   index: {
@@ -60,6 +67,8 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'get',
       'put',
       'delete',
+      'putOwned',
+      'expireRun',
       'list',
       'reserveHookToken',
       'finalizeHookIndexes',
@@ -76,6 +85,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'redriveDeadLetter',
       'purgeDeadLetters',
       'rearmAlarm',
+      'expireRun',
     ]),
   },
 };

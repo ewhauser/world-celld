@@ -70,20 +70,20 @@ describe('Storage regressions', () => {
       },
     };
     const index = mockEnv.WORKFLOW_INDEX;
-    const put = index.put.bind(index);
+    const putOwned = index.putOwned.bind(index);
     let failNextRunIndexWrite = true;
-    index.put = async (key, value) => {
+    index.putOwned = async (ownerRunId, key, value) => {
       if (failNextRunIndexWrite && key.startsWith('run:')) {
         failNextRunIndexWrite = false;
         throw new Error('injected index outage');
       }
-      await put(key, value);
+      return putOwned(ownerRunId, key, value);
     };
 
     try {
       await expect(storage.events.create(runId, event)).rejects.toThrow('injected index outage');
     } finally {
-      index.put = put;
+      index.putOwned = putOwned;
     }
 
     expect((await storage.runs.get(runId)).status).toBe('running');

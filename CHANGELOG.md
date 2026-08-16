@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- Add configurable terminal-run retention with durable cleanup alarms,
+  cross-cell ownership fences, payload-free tombstones, operational controls,
+  and MinIO correctness and performance coverage.
+
 ## 0.1.1 - 2026-08-15
 
 - Publish through npm trusted publishing with OIDC provenance.

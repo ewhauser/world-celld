@@ -46,6 +46,11 @@ describe('WorkflowRunDO event ordering regression', () => {
     expect(started.ok).toBe(true);
 
     const events = await secondInstance.listEvents({ sortOrder: 'asc' });
-    expect(events.data.map((event) => event.eventType)).toEqual(['run_created', 'run_started']);
+    expect(events.ok).toBe(true);
+    if (!events.ok) throw new Error(events.message);
+    expect(events.value.data.map((event) => event.eventType)).toEqual([
+      'run_created',
+      'run_started',
+    ]);
   });
 });

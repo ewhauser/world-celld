@@ -7,6 +7,8 @@ import { createCelldWorld } from '../../src/index.js';
 import { callDO } from '../../src/remote/rpc-client.js';
 import { parse } from '../../src/vendor/shared/index.js';
 import type { QueueStats } from '../../src/worker/durable-objects/QueueDO.js';
+import { RunExpiredError } from '@workflow/errors';
+import type { CleanupRecord } from '../../src/retention.js';
 
 function positiveInteger(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -121,6 +123,32 @@ interface PerfResult {
   budgets: Record<string, number>;
 }
 
+interface RetentionPerfResult {
+  schemaVersion: 1;
+  recordedAt: string;
+  backend: { name: 'minio'; version: string; celldVersion: string };
+  workload: { runs: number; concurrency: number; queueShards: number; retentionMs: number };
+  correctness: {
+    created: number;
+    tombstoned: number;
+    expiredReads: number;
+    deletedPayloadKeys: number;
+    deletedStreams: number;
+    deletedQueueMessages: number;
+    pending: number;
+    inflight: number;
+    deadLetters: number;
+  };
+  performance: {
+    setupDurationMs: number;
+    cleanupDurationMs: number;
+    setupRunsPerSecond: number;
+    cleanupRunsPerSecond: number;
+    terminalWriteLatencyMs: LatencySummary;
+    cleanupLagMs: LatencySummary;
+  };
+}
+
 describe('MinIO single-node queue performance and loss', () => {
   const fleetUrl = process.env.CELLD_FLEET_URL ?? '';
   const secret = process.env.CELLD_WORLD_SECRET ?? '';
@@ -135,6 +163,11 @@ describe('MinIO single-node queue performance and loss', () => {
   const minDeliveryPerSecond = nonNegativeNumber('PERF_MIN_DELIVERY_PER_SECOND');
   const maxDeliveryP99Ms = nonNegativeNumber('PERF_MAX_DELIVERY_P99_MS');
   const resultPath = process.env.PERF_RESULT_PATH ?? '.perf-results/minio-latest.json';
+  const retentionRuns = positiveInteger('PERF_RETENTION_RUNS', 100);
+  const retentionConcurrency = positiveInteger('PERF_RETENTION_CONCURRENCY', 16);
+  const retentionMs = positiveInteger('PERF_RUN_RETENTION_MS', 1_000);
+  const retentionResultPath =
+    process.env.PERF_RETENTION_RESULT_PATH ?? '.perf-results/minio-retention-latest.json';
   const runId = randomUUID();
   const startedAt = new Map<number, number>();
   const accepted = new Map<number, string>();
@@ -368,5 +401,146 @@ describe('MinIO single-node queue performance and loss', () => {
       maxDeliveryP99Ms === 0 || deliveryP99Ms <= maxDeliveryP99Ms,
       `delivery p99 ${deliveryP99Ms}ms exceeds ${maxDeliveryP99Ms}ms`,
     ).toBe(true);
+  });
+
+  it('reclaims terminal run payloads without loss or resurrection', async () => {
+    const world = createCelldWorld({
+      fleetUrl,
+      secret,
+      baseUrl: process.env.CELLD_CALLBACK_BASE_URL,
+      deploymentId: `retention-perf-${runId}`,
+      queueShards,
+      runRetentionMs: retentionMs,
+      rpcTimeoutMs: timeoutMs,
+    });
+    const runIds: string[] = [];
+    const terminalWriteLatencies: number[] = [];
+    const setupStart = performance.now();
+
+    await runPool(retentionRuns, retentionConcurrency, async (sequence) => {
+      const created = await world.events.create(null, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: `retention-perf-${runId}`,
+          workflowName: `retention-perf-${sequence}`,
+          input: [`payload-${sequence}`, 'x'.repeat(payloadBytes)],
+        },
+      });
+      const workflowRunId = created.run!.runId;
+      runIds.push(workflowRunId);
+      const streamName = `retention-${workflowRunId}`;
+      await world.writeToStream(streamName, workflowRunId, `stream-${sequence}`);
+      await world.closeStream(streamName, workflowRunId);
+      await world.queue(
+        `__wkf_workflow_retention_${runId.replaceAll('-', '')}`,
+        { runId: workflowRunId },
+        { delaySeconds: 3_600, idempotencyKey: `retention:${workflowRunId}` },
+      );
+      const terminalStart = performance.now();
+      await world.events.create(workflowRunId, {
+        eventType: 'run_completed',
+        eventData: { output: [`done-${sequence}`] },
+      });
+      terminalWriteLatencies.push(performance.now() - terminalStart);
+    });
+
+    const setupEnd = performance.now();
+    let completedStatuses: CleanupRecord[] = [];
+    const cleaned = await waitUntil(async () => {
+      const statuses = await Promise.all(runIds.map((id) => world.retention.getStatus(id)));
+      completedStatuses = statuses.filter(
+        (status): status is CleanupRecord => status?.phase === 'tombstoned',
+      );
+      return completedStatuses.length === runIds.length;
+    }, timeoutMs);
+    const finishedAt = performance.now();
+    if (!cleaned) {
+      throw new Error(`retention cleanup timed out after ${finishedAt - setupEnd}ms`);
+    }
+
+    const expiredReads = (
+      await Promise.all(
+        runIds.map(async (id) => {
+          try {
+            await world.runs.get(id);
+            return false;
+          } catch (error) {
+            return RunExpiredError.is(error);
+          }
+        }),
+      )
+    ).filter(Boolean).length;
+    const queueStats = await Promise.all(
+      Array.from({ length: queueShards }, (_, shard) =>
+        callDO<QueueStats>({ fleetUrl, secret }, 'queue', `q:${shard}`, 'stats', []),
+      ),
+    );
+    const cleanupLag = completedStatuses.map(
+      (status) => status.tombstonedAt!.getTime() - status.dueAt.getTime(),
+    );
+    const cleanupStart = Math.min(...completedStatuses.map((status) => status.dueAt.getTime()));
+    const cleanupEnd = Math.max(
+      ...completedStatuses.map((status) => status.tombstonedAt!.getTime()),
+    );
+    const setupDurationMs = setupEnd - setupStart;
+    const cleanupDurationMs = Math.max(0, cleanupEnd - cleanupStart);
+    const pending = queueStats.reduce((sum, entry) => sum + entry.pending, 0);
+    const inflight = queueStats.reduce((sum, entry) => sum + entry.inflight, 0);
+    const deadLetters = queueStats.reduce((sum, entry) => sum + entry.deadLetters, 0);
+
+    const result: RetentionPerfResult = {
+      schemaVersion: 1,
+      recordedAt: new Date().toISOString(),
+      backend: {
+        name: 'minio',
+        version: process.env.PERF_MINIO_VERSION ?? 'unknown',
+        celldVersion: process.env.PERF_CELLD_VERSION ?? 'unknown',
+      },
+      workload: {
+        runs: retentionRuns,
+        concurrency: retentionConcurrency,
+        queueShards,
+        retentionMs,
+      },
+      correctness: {
+        created: runIds.length,
+        tombstoned: completedStatuses.length,
+        expiredReads,
+        deletedPayloadKeys: completedStatuses.reduce(
+          (sum, status) => sum + status.deletedPayloadKeys,
+          0,
+        ),
+        deletedStreams: completedStatuses.reduce((sum, status) => sum + status.deletedStreams, 0),
+        deletedQueueMessages: completedStatuses.reduce(
+          (sum, status) => sum + status.deletedQueueMessages,
+          0,
+        ),
+        pending,
+        inflight,
+        deadLetters,
+      },
+      performance: {
+        setupDurationMs: Number(setupDurationMs.toFixed(2)),
+        cleanupDurationMs,
+        setupRunsPerSecond: rate(runIds.length, setupDurationMs),
+        cleanupRunsPerSecond: rate(completedStatuses.length, cleanupDurationMs),
+        terminalWriteLatencyMs: summarizeLatency(terminalWriteLatencies),
+        cleanupLagMs: summarizeLatency(cleanupLag),
+      },
+    };
+
+    await mkdir(path.dirname(retentionResultPath), { recursive: true });
+    await writeFile(retentionResultPath, `${JSON.stringify(result, null, 2)}\n`);
+    console.log(`\nworld-celld MinIO retention result\n${JSON.stringify(result, null, 2)}`);
+
+    expect(runIds).toHaveLength(retentionRuns);
+    expect(completedStatuses).toHaveLength(retentionRuns);
+    expect(expiredReads).toBe(retentionRuns);
+    expect(result.correctness.deletedPayloadKeys).toBeGreaterThan(0);
+    expect(result.correctness.deletedStreams).toBe(retentionRuns);
+    expect(result.correctness.deletedQueueMessages).toBe(retentionRuns);
+    expect(pending).toBe(0);
+    expect(inflight).toBe(0);
+    expect(deadLetters).toBe(0);
   });
 });

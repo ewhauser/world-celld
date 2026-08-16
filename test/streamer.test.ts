@@ -208,6 +208,9 @@ describe('Streamer (StreamDO RPC integration)', () => {
         getInfo: vi.fn<StreamDOStub['getInfo']>(fail),
         registerStream: vi.fn<StreamDOStub['registerStream']>(fail),
         listStreams: vi.fn<StreamDOStub['listStreams']>(fail),
+        expireRegistry: vi.fn<StreamDOStub['expireRegistry']>(fail),
+        finalizeRegistry: vi.fn<StreamDOStub['finalizeRegistry']>(fail),
+        expireStream: vi.fn<StreamDOStub['expireStream']>(fail),
       };
       const failingEnv = {
         WORKFLOW_STREAMS: {
@@ -286,6 +289,12 @@ describe('Streamer (StreamDO RPC integration)', () => {
         getInfo: vi.fn<StreamDOStub['getInfo']>(async () => ({ tailIndex: -1, done: false })),
         registerStream: vi.fn<StreamDOStub['registerStream']>(),
         listStreams: vi.fn<StreamDOStub['listStreams']>(async () => []),
+        expireRegistry: vi.fn<StreamDOStub['expireRegistry']>(async () => ({ streams: [] })),
+        finalizeRegistry: vi.fn<StreamDOStub['finalizeRegistry']>(),
+        expireStream: vi.fn<StreamDOStub['expireStream']>(async () => ({
+          deleted: true,
+          chunks: 0,
+        })),
       };
       const boundedStreamer = createStreamer({
         env: {
