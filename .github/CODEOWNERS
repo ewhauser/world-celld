@@ -3,6 +3,9 @@
 /package.json @ewhauser
 /pnpm-lock.yaml @ewhauser
 /pnpm-workspace.yaml @ewhauser
+/.release-please-manifest.json @ewhauser
+/release-please-config.json @ewhauser
+/CHANGELOG.md @ewhauser
 /scripts/check-package.mjs @ewhauser
 /scripts/pack-release.mjs @ewhauser
 /RELEASING.md @ewhauser

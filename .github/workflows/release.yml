@@ -1,10 +1,12 @@
 name: Release
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       version:
-        description: Exact package version from package.json
+        description: Exact package version for recovering an existing release
         required: true
         type: string
 
@@ -15,8 +17,166 @@ concurrency:
 permissions: {}
 
 jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # Open release PRs and create draft releases.
+      issues: write # Apply Release Please labels.
+      pull-requests: write # Open and update the release PR.
+    outputs:
+      release: ${{ steps.metadata.outputs.release }}
+      pr_branch: ${{ steps.metadata.outputs.pr_branch }}
+      version: ${{ steps.metadata.outputs.version }}
+      tag: ${{ steps.metadata.outputs.tag }}
+      tarball: ${{ steps.metadata.outputs.tarball }}
+      sha: ${{ steps.metadata.outputs.sha }}
+    steps:
+      - name: Create or update release
+        id: release_please
+        if: github.event_name == 'push'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - name: Resolve release metadata
+        id: metadata
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_VERSION: ${{ inputs.version }}
+          RELEASE_CREATED: ${{ steps.release_please.outputs.release_created }}
+          RELEASE_PR: ${{ steps.release_please.outputs.pr }}
+          RELEASE_SHA: ${{ steps.release_please.outputs.sha }}
+          RELEASE_TAG: ${{ steps.release_please.outputs.tag_name }}
+          RELEASE_VERSION: ${{ steps.release_please.outputs.version }}
+          WORKFLOW_REF: ${{ github.ref }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { execFileSync, spawnSync } from 'node:child_process';
+          import { appendFileSync } from 'node:fs';
+
+          const semver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+          const commit = /^[0-9a-f]{40}$/;
+          const outputs = {
+            release: 'false',
+            pr_branch: '',
+            version: '',
+            tag: '',
+            tarball: '',
+            sha: '',
+          };
+
+          if (process.env.RELEASE_PR) {
+            const pullRequest = JSON.parse(process.env.RELEASE_PR);
+            if (pullRequest.baseBranchName !== 'main') {
+              throw new Error(`unexpected release PR base: ${pullRequest.baseBranchName}`);
+            }
+            if (!pullRequest.headBranchName || /[\r\n]/.test(pullRequest.headBranchName)) {
+              throw new Error('invalid release PR branch');
+            }
+            outputs.pr_branch = pullRequest.headBranchName;
+          }
+
+          if (process.env.EVENT_NAME === 'push') {
+            if (process.env.RELEASE_CREATED === 'true') {
+              outputs.release = 'true';
+              outputs.version = process.env.RELEASE_VERSION;
+              outputs.tag = process.env.RELEASE_TAG;
+              outputs.sha = process.env.RELEASE_SHA;
+            }
+          } else if (process.env.EVENT_NAME === 'workflow_dispatch') {
+            if (process.env.WORKFLOW_REF !== 'refs/heads/main') {
+              throw new Error('manual recovery must run from main');
+            }
+            outputs.release = 'true';
+            outputs.version = process.env.MANUAL_VERSION;
+            outputs.tag = `v${outputs.version}`;
+            outputs.sha = process.env.WORKFLOW_SHA;
+
+            const remoteTags = execFileSync('git', [
+              'ls-remote',
+              `https://github.com/${process.env.GH_REPO}.git`,
+              `refs/tags/${outputs.tag}`,
+              `refs/tags/${outputs.tag}^{}`,
+            ], { encoding: 'utf8' }).trim().split('\n').filter(Boolean);
+            if (remoteTags.length > 0) {
+              const peeled = remoteTags.find(line => line.endsWith('^{}'));
+              outputs.sha = (peeled ?? remoteTags[0]).split('\t')[0];
+            }
+
+            const response = spawnSync('gh', [
+              'api',
+              `repos/${process.env.GH_REPO}/releases/tags/${outputs.tag}`,
+            ], { encoding: 'utf8' });
+            if (response.status === 0) {
+              const release = JSON.parse(response.stdout);
+              if (remoteTags.length === 0) {
+                const target = release.target_commitish;
+                if (commit.test(target)) {
+                  outputs.sha = target;
+                } else {
+                  const resolved = JSON.parse(execFileSync('gh', [
+                    'api',
+                    `repos/${process.env.GH_REPO}/commits/${target}`,
+                  ], { encoding: 'utf8' }));
+                  outputs.sha = resolved.sha;
+                }
+              }
+            } else if (!response.stderr.includes('HTTP 404')) {
+              throw new Error(`could not inspect an existing release: ${response.stderr.trim()}`);
+            }
+          } else {
+            throw new Error(`unsupported event: ${process.env.EVENT_NAME}`);
+          }
+
+          if (outputs.release === 'true') {
+            if (!semver.test(outputs.version)) {
+              throw new Error(`invalid semantic version: ${outputs.version}`);
+            }
+            if (outputs.tag !== `v${outputs.version}`) {
+              throw new Error(`unexpected tag: ${outputs.tag}`);
+            }
+            if (!commit.test(outputs.sha)) {
+              throw new Error(`invalid release commit: ${outputs.sha}`);
+            }
+            if (process.env.EVENT_NAME === 'push' && outputs.sha !== process.env.WORKFLOW_SHA) {
+              throw new Error('Release Please targeted a commit other than this main push');
+            }
+            outputs.tarball = `ewhauser-world-celld-${outputs.version}.tgz`;
+          }
+
+          appendFileSync(process.env.GITHUB_OUTPUT, Object.entries(outputs)
+            .map(([key, value]) => `${key}=${value}`)
+            .join('\n') + '\n');
+          EOF
+
+  check-release-pr:
+    name: Start release PR checks
+    needs: prepare
+    if: needs.prepare.outputs.pr_branch != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write # Dispatch CI for the Release Please branch without a PAT.
+    steps:
+      - name: Run CI on release PR branch
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_PR_BRANCH: ${{ needs.prepare.outputs.pr_branch }}
+        run: |
+          gh api --method POST \
+            "repos/$GH_REPO/actions/workflows/ci.yml/dispatches" \
+            -f "ref=$RELEASE_PR_BRANCH"
+
   build:
     name: Build release artifact
+    needs: prepare
+    if: needs.prepare.outputs.release == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -24,21 +184,19 @@ jobs:
     env:
       CI: true
       COREPACK_ENABLE_DOWNLOAD_PROMPT: 0
-      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
     outputs:
-      version: ${{ steps.release.outputs.version }}
-      tag: ${{ steps.release.outputs.tag }}
-      tarball: ${{ steps.release.outputs.tarball }}
-      sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.package.outputs.version }}
+      tag: ${{ steps.package.outputs.tag }}
+      tarball: ${{ steps.package.outputs.tarball }}
+      sha: ${{ steps.package.outputs.sha }}
     steps:
-      - name: Require main branch
-        env:
-          RELEASE_REF: ${{ github.ref }}
-        run: test "$RELEASE_REF" = refs/heads/main
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ needs.prepare.outputs.sha }}
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -50,25 +208,31 @@ jobs:
           corepack install
           pnpm --version
       - name: Validate release version
-        id: release
-        env:
-          RELEASE_SHA: ${{ github.sha }}
+        id: package
         run: |
           node --input-type=module <<'EOF'
+          import { execFileSync } from 'node:child_process';
           import { appendFileSync, readFileSync } from 'node:fs';
-          const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
+          const packageManifest = JSON.parse(readFileSync('package.json', 'utf8'));
+          const releaseManifest = JSON.parse(readFileSync('.release-please-manifest.json', 'utf8'));
           const requested = process.env.RELEASE_VERSION;
           if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(requested)) {
             throw new Error(`invalid semantic version: ${requested}`);
           }
-          if (manifest.version !== requested) {
-            throw new Error(`package.json is ${manifest.version}, requested ${requested}`);
+          if (packageManifest.version !== requested) {
+            throw new Error(`package.json is ${packageManifest.version}, requested ${requested}`);
           }
-          const tarball = `ewhauser-world-celld-${requested}.tgz`;
+          if (releaseManifest['.'] !== requested) {
+            throw new Error(`release manifest is ${releaseManifest['.']}, requested ${requested}`);
+          }
+          const checkedOut = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+          if (checkedOut !== process.env.RELEASE_SHA) {
+            throw new Error(`checked out ${checkedOut}, expected ${process.env.RELEASE_SHA}`);
+          }
           appendFileSync(process.env.GITHUB_OUTPUT, [
             `version=${requested}`,
             `tag=v${requested}`,
-            `tarball=${tarball}`,
+            `tarball=ewhauser-world-celld-${requested}.tgz`,
             `sha=${process.env.RELEASE_SHA}`,
             '',
           ].join('\n'));
@@ -84,7 +248,7 @@ jobs:
       - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: npm-package-${{ steps.release.outputs.version }}
+          name: npm-package-${{ steps.package.outputs.version }}
           path: release-artifacts/
           if-no-files-found: error
           retention-days: 7

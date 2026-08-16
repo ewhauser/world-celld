@@ -312,12 +312,13 @@ job needs. Third-party actions are pinned to verified release commits. Release
 builds do not use caches, and the exact npm tarball is checksummed, clean-room
 installed, and verified again before publication.
 
-Releases publish from GitHub-hosted runners through npm trusted publishing
-(OIDC), without a long-lived npm token. npm records provenance for public
-releases. The Git tag and GitHub release are created only after npm accepts the
-matching tarball; published GitHub releases are immutable. Dependency updates
-use cooldowns, and pnpm permits lifecycle scripts only for an explicit
-allowlist.
+Release Please maintains version and changelog pull requests. Releases publish
+from GitHub-hosted runners through npm trusted publishing (OIDC), without a
+long-lived npm token. npm records provenance for public releases. A draft
+GitHub release holds the release notes while the package is verified; the Git
+tag and public release are created only after npm accepts the matching tarball.
+Published GitHub releases are immutable. Dependency updates use cooldowns, and
+pnpm permits lifecycle scripts only for an explicit allowlist.
 
 See [`SECURITY.md`](./SECURITY.md) to report a vulnerability and
 [`RELEASING.md`](./RELEASING.md) for the release procedure.
