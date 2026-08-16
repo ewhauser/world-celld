@@ -1,39 +1,61 @@
 # Releasing
 
-Releases are built and published by GitHub Actions. Do not publish routine
-releases from a maintainer workstation.
+Release Please prepares versions and release notes. GitHub Actions builds the
+package, publishes it through npm trusted publishing, verifies the registry
+artifact, and only then publishes the Git tag and GitHub release. Do not publish
+routine releases from a maintainer workstation.
+
+## Preparing a release
+
+Pull request titles become squash commit messages, so use Conventional Commits:
+
+- `fix: ...` proposes a patch release.
+- `feat: ...` proposes a minor release.
+- `feat!: ...`, `fix!: ...`, or a `BREAKING CHANGE:` footer proposes a breaking
+  release. Before 1.0, breaking releases increment the minor version.
+
+Other commit types can be used, but do not create a release by themselves.
+GitHub-generated changelog notes still include all merged pull requests since
+the previous tag.
+
+After a releasable commit reaches `main`, the **Release** workflow creates or
+updates one Release Please pull request. That pull request updates
+`package.json`, `CHANGELOG.md`, and `.release-please-manifest.json`. CI is
+explicitly dispatched on the generated branch so the normal required checks
+must pass without a personal access token.
+
+Review the proposed version and release notes like any other pull request. Do
+not manually edit the version files outside the generated release pull request.
+
+## Publishing a release
+
+1. Merge the Release Please pull request after its required checks pass.
+2. The **Release** workflow creates a draft GitHub release and rebuilds the exact
+   merge commit on a GitHub-hosted runner.
+3. Review and approve the protected `release` environment deployment.
+4. The workflow publishes the checksummed tarball through npm trusted
+   publishing, reads the canonical package back from npm, and verifies its
+   integrity and complete uncompressed tar stream.
+5. Only after those checks succeed does the workflow attach the canonical
+   tarball and checksum, create the tag, and publish the immutable GitHub
+   release.
+
+## Recovering a failed release
+
+If the automated run fails after the Release Please pull request is merged,
+rerun the failed job first. If a fresh run is required, manually dispatch the
+**Release** workflow from `main` with the exact package version.
+
+Recovery is idempotent. When a draft or existing release is present, the
+workflow rebuilds its recorded target commit rather than the latest commit on
+`main`. It accepts an existing npm version only when its complete uncompressed
+tar stream matches the rebuilt package, then uses the registry's recorded
+integrity. This permits harmless gzip-encoder differences without accepting
+different package contents.
 
 ## One-time npm bootstrap
 
 npm cannot configure trusted publishing until a package exists. The initial
-`0.1.0` release is therefore the only interactive bootstrap:
-
-1. Run `pnpm check`, `pnpm audit --audit-level high`, and `pnpm pack:release`.
-2. Inspect the tarball and checksum in `release-artifacts/`.
-3. Publish that exact tarball with an npm account protected by 2FA:
-   `npm publish ./release-artifacts/ewhauser-world-celld-0.1.0.tgz --access public --ignore-scripts`.
-4. Create `v0.1.0` as an immutable GitHub release at the exact source commit and
-   attach the tarball and checksum.
-5. Configure npm trusted publishing for repository `ewhauser/world-celld`,
-   workflow `release.yml`, environment `release`, and `npm publish` permission:
-   `npm trust github @ewhauser/world-celld --repo ewhauser/world-celld --file release.yml --env release --allow-publish`.
-6. Require 2FA and disallow traditional tokens in the package publishing
-   settings, then revoke any temporary npm CLI session.
-
-## Subsequent releases
-
-1. Open a pull request that updates `package.json` and `CHANGELOG.md` to the
-   intended semantic version.
-2. Merge only after CI and review succeed.
-3. Run the **Release** workflow from `main`, entering the exact package version.
-4. Review and approve the protected `release` environment deployment.
-5. Verify the npm provenance, registry integrity, tag target, attached checksum,
-   and immutable GitHub release.
-
-The workflow is idempotent for recovery. It accepts an existing npm version
-only when its complete uncompressed tar stream matches the freshly built
-package, then uses the registry's recorded integrity. This permits harmless
-gzip-encoder differences without accepting different package contents. It will
-read the package back from npm so the registry tarball's exact bytes become the
-GitHub release artifact, then finish a missing or draft GitHub release without
-republishing different bytes.
+`0.1.0` release was the only interactive bootstrap. Trusted publishing is
+configured for repository `ewhauser/world-celld`, workflow `release.yml`,
+environment `release`, with no long-lived npm publication token.
