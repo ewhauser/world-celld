@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.0 (2026-08-16)
+
+## What's Changed
+* fix: split Release Please release and PR phases by @ewhauser in https://github.com/ewhauser/world-celld/pull/16
+* feat: target Workflow 5 beta by @ewhauser in https://github.com/ewhauser/world-celld/pull/17
+* fix: enforce Workflow 5 storage contracts by @ewhauser in https://github.com/ewhauser/world-celld/pull/19
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.2.0...v0.3.0
+
 ## 0.2.0 (2026-08-16)
 
 ## What's Changed
