@@ -33,13 +33,55 @@ jobs:
       tarball: ${{ steps.metadata.outputs.tarball }}
       sha: ${{ steps.metadata.outputs.sha }}
     steps:
-      - name: Create or update release
-        id: release_please
+      - name: Create release
+        id: release
         if: github.event_name == 'push'
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check current release tag
+        id: current_release
+        if: github.event_name == 'push' && steps.release.outputs.release_created != 'true'
+        env:
+          GH_REPO: ${{ github.repository }}
+        run: |
+          node --input-type=module <<'EOF'
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync, readFileSync } from 'node:fs';
+
+          const packageManifest = JSON.parse(readFileSync('package.json', 'utf8'));
+          const releaseManifest = JSON.parse(readFileSync('.release-please-manifest.json', 'utf8'));
+          if (packageManifest.version !== releaseManifest['.']) {
+            throw new Error(
+              `package version ${packageManifest.version} does not match release manifest ${releaseManifest['.']}`,
+            );
+          }
+          const tag = `v${packageManifest.version}`;
+          const remoteTags = execFileSync('git', [
+            'ls-remote',
+            `https://github.com/${process.env.GH_REPO}.git`,
+            `refs/tags/${tag}`,
+            `refs/tags/${tag}^{}`,
+          ], { encoding: 'utf8' }).trim();
+          appendFileSync(process.env.GITHUB_OUTPUT, `tag_exists=${remoteTags ? 'true' : 'false'}\n`);
+          EOF
+      - name: Create or update release PR
+        id: release_pr
+        if: >-
+          github.event_name == 'push' &&
+          steps.release.outputs.release_created != 'true' &&
+          steps.current_release.outputs.tag_exists == 'true'
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
       - name: Resolve release metadata
         id: metadata
         env:
@@ -47,11 +89,11 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
           MANUAL_VERSION: ${{ inputs.version }}
-          RELEASE_CREATED: ${{ steps.release_please.outputs.release_created }}
-          RELEASE_PR: ${{ steps.release_please.outputs.pr }}
-          RELEASE_SHA: ${{ steps.release_please.outputs.sha }}
-          RELEASE_TAG: ${{ steps.release_please.outputs.tag_name }}
-          RELEASE_VERSION: ${{ steps.release_please.outputs.version }}
+          RELEASE_CREATED: ${{ steps.release.outputs.release_created }}
+          RELEASE_PR: ${{ steps.release_pr.outputs.pr }}
+          RELEASE_SHA: ${{ steps.release.outputs.sha }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag_name }}
+          RELEASE_VERSION: ${{ steps.release.outputs.version }}
           WORKFLOW_REF: ${{ github.ref }}
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
