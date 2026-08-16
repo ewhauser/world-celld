@@ -75,7 +75,7 @@
     "@ewhauser/world-celld": "link:.",
     "@types/node": "^22.19.0",
     "@workflow/world-testing": "4.1.11",
-    "esbuild": "^0.25.0",
+    "esbuild": "^0.28.2",
     "oxfmt": "^0.63.0",
     "oxlint": "^1.78.0",
     "oxlint-tsgolint": "^7.0.2001",
