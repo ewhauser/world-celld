@@ -113,7 +113,7 @@ describe('terminal workflow retention', () => {
     expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
 
     const runKeys = Array.from(harness.fleet.cell('runs', runId).storage.data.keys()).toSorted();
-    expect(runKeys).toEqual(['retention:cleanup', 'retention:tombstone', 'schema_version']);
+    expect(runKeys).toEqual(['retention:cleanup', 'retention:tombstone']);
     expect(
       Array.from(
         harness.fleet.cell('streams', `run-streams:${runId}`).storage.data.keys(),

@@ -4,7 +4,7 @@
  * QueueDO cells instead of Cloudflare Queues, and the handler speaks the
  * single x-vqs dialect with permanent-error statuses.
  */
-import type { ValidQueueName } from '@workflow/world';
+import { SPEC_VERSION_CURRENT, type ValidQueueName } from '@workflow/world';
 import { WorkflowWorldError } from '@workflow/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createQueue, shardFor } from '../src/queue.js';
@@ -123,7 +123,12 @@ describe('Queue (celld QueueDO integration)', () => {
       const input = new Uint8Array([0, 1, 2, 250, 251, 252]);
       await queue.queue('__wkf_workflow_test', {
         runId: 'wrun_1',
-        runInput: { input, deploymentId: 'd', workflowName: 'w', specVersion: 3 },
+        runInput: {
+          input,
+          deploymentId: 'd',
+          workflowName: 'w',
+          specVersion: SPEC_VERSION_CURRENT,
+        },
       });
 
       const body = parse<{ runInput: { input: Uint8Array } }>(recordedEnqueues[0].body);

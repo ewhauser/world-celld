@@ -40,10 +40,9 @@ import {
   EventSchema,
   getMaxEventsPerRun,
   HookSchema,
-  isLegacySpecVersion,
+  isChildEntityCreationEvent,
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
-  requiresNewerWorld,
   SPEC_VERSION_CURRENT,
   slotToEventId,
   StepSchema,
@@ -60,6 +59,7 @@ const RUN_KEY = 'run';
 export const EVENT_KEY_PREFIX = 'event:';
 export const STEP_KEY_PREFIX = 'step:';
 export const HOOK_KEY_PREFIX = 'hook:';
+const WAIT_KEY_PREFIX = 'wait:';
 export const STEP_CREATED_KEY_PREFIX = 'stepcreated:';
 export const HOOK_CREATED_KEY_PREFIX = 'hookcreated:';
 /**
@@ -69,6 +69,16 @@ export const HOOK_CREATED_KEY_PREFIX = 'hookcreated:';
  * rejected as a duplicate instead of resurrecting the hook.
  */
 const HOOK_EVENT_MARKER_PREFIX = 'hookevent:';
+/** Workflow-authored attr_set correlation claims. */
+const ATTRIBUTE_EVENT_MARKER_PREFIX = 'attrevent:';
+/** Durable lazy-hook resume claims, scoped by the containing run DO. */
+const HOOK_RESUME_CLAIM_PREFIX = 'hookresume:';
+
+interface HookResumeClaim {
+  hookId: string;
+  eventId: string;
+  payloadDigest?: string;
+}
 
 export interface EventStoreListOptions {
   prefix: string;
@@ -112,11 +122,11 @@ export type ApplyEventErrorCode =
   | 'RUN_NOT_FOUND'
   | 'STEP_NOT_FOUND'
   | 'HOOK_NOT_FOUND'
+  | 'WAIT_NOT_FOUND'
   | 'ENTITY_CONFLICT'
   | 'RUN_EXPIRED'
   | 'TOO_EARLY'
-  | 'RUN_NOT_SUPPORTED'
-  | 'LEGACY_RUN_NOT_SUPPORTED';
+  | 'RUN_NOT_SUPPORTED';
 
 export interface ApplyEventFailure {
   ok: false;
@@ -281,12 +291,28 @@ async function releaseAllHooks(
   return released;
 }
 
+/** Delete all persisted waits once their owning run becomes terminal. */
+async function releaseAllWaits(store: EventStore): Promise<void> {
+  const waits = await store.list<Wait>({ prefix: WAIT_KEY_PREFIX });
+  for (const key of waits.keys()) {
+    await store.delete(key);
+  }
+}
+
 export async function applyEvent(
   store: EventStore,
   ctx: ApplyEventContext,
 ): Promise<ApplyEventOutcome> {
   const { runId, data, now } = ctx;
   const specVersion = data.specVersion ?? SPEC_VERSION_CURRENT;
+
+  if (specVersion !== SPEC_VERSION_CURRENT) {
+    return failure(
+      'RUN_NOT_SUPPORTED',
+      `Run "${runId}" uses unsupported specVersion ${specVersion}; this world requires ${SPEC_VERSION_CURRENT}`,
+      { runSpecVersion: specVersion },
+    );
+  }
 
   /** Build and validate the stored event BEFORE anything is persisted. */
   const buildEvent = (record: Record<string, unknown>): Event => {
@@ -299,6 +325,20 @@ export async function applyEvent(
       resumeId: ctx.params?.resumeId,
       specVersion,
     };
+    if (record.eventType !== 'hook_received') {
+      delete withMeta.resumeId;
+    }
+    if (record.eventType === 'run_started') {
+      delete withMeta.eventData;
+    }
+    if (
+      record.eventType === 'step_started' &&
+      withMeta.eventData !== null &&
+      typeof withMeta.eventData === 'object'
+    ) {
+      const { input: _input, ...eventData } = withMeta.eventData as Record<string, unknown>;
+      withMeta.eventData = eventData;
+    }
     return EventSchema.parse(compact(withMeta));
   };
 
@@ -380,22 +420,14 @@ export async function applyEvent(
   }
 
   // ============================================================
-  // VERSION COMPATIBILITY
+  // WORKFLOW 5 PROTOCOL BOUNDARY
   // ============================================================
-  if (currentRun) {
-    if (requiresNewerWorld(currentRun.specVersion)) {
-      return failure(
-        'RUN_NOT_SUPPORTED',
-        `Run "${runId}" requires a newer world (run specVersion ${currentRun.specVersion}, world ${SPEC_VERSION_CURRENT})`,
-        { runSpecVersion: currentRun.specVersion },
-      );
-    }
-    if (isLegacySpecVersion(currentRun.specVersion)) {
-      return failure(
-        'LEGACY_RUN_NOT_SUPPORTED',
-        `Run "${runId}" was created with a legacy spec version (${currentRun.specVersion ?? 'undefined'}) not supported by this world`,
-      );
-    }
+  if (currentRun && currentRun.specVersion !== SPEC_VERSION_CURRENT) {
+    return failure(
+      'RUN_NOT_SUPPORTED',
+      `Run "${runId}" uses unsupported specVersion ${currentRun.specVersion}; this world requires ${SPEC_VERSION_CURRENT}`,
+      { runSpecVersion: currentRun.specVersion },
+    );
   }
 
   // ============================================================
@@ -425,14 +457,16 @@ export async function applyEvent(
         `Cannot transition run from terminal state "${currentRun.status}"`,
       );
     }
-    if (
-      data.eventType === 'step_created' ||
-      data.eventType === 'hook_created' ||
-      data.eventType === 'wait_created'
-    ) {
+    if (isChildEntityCreationEvent(data)) {
       return failure(
         'ENTITY_CONFLICT',
         `Cannot create new entities on run in terminal state "${currentRun.status}"`,
+      );
+    }
+    if (data.eventType === 'attr_set') {
+      return failure(
+        'ENTITY_CONFLICT',
+        `Cannot set attributes on run in terminal state "${currentRun.status}"`,
       );
     }
   }
@@ -447,15 +481,14 @@ export async function applyEvent(
     data.eventType === 'step_failed' ||
     data.eventType === 'step_retrying'
   ) {
+    const lazyStepStart = data.eventType === 'step_started' && isChildEntityCreationEvent(data);
     validatedStep = await store.get<Step>(`${STEP_KEY_PREFIX}${data.correlationId}`);
     if (!validatedStep) {
-      const isLazyCreate =
-        data.eventType === 'step_started' &&
-        data.eventData?.input !== undefined &&
-        data.eventData.stepName !== undefined;
-      if (!isLazyCreate) {
+      if (!lazyStepStart) {
         return failure('STEP_NOT_FOUND', `Step "${data.correlationId}" not found`);
       }
+    } else if (lazyStepStart) {
+      return failure('ENTITY_CONFLICT', `Step "${data.correlationId}" already exists`);
     }
     if (validatedStep && isTerminalStepStatus(validatedStep.status)) {
       return failure(
@@ -480,6 +513,43 @@ export async function applyEvent(
   // ============================================================
   // GUARDS: hook event ordering
   // ============================================================
+  if (data.eventType === 'hook_received' && ctx.params?.resumeId) {
+    const claim = await store.get<HookResumeClaim>(
+      `${HOOK_RESUME_CLAIM_PREFIX}${ctx.params.resumeId}`,
+    );
+    if (claim) {
+      if (claim.hookId !== data.correlationId) {
+        return failure(
+          'ENTITY_CONFLICT',
+          `hook_received resumeId "${ctx.params.resumeId}" already recorded for a different hook`,
+        );
+      }
+      if (
+        claim.payloadDigest &&
+        ctx.params.resumePayloadDigest &&
+        claim.payloadDigest !== ctx.params.resumePayloadDigest
+      ) {
+        return failure(
+          'ENTITY_CONFLICT',
+          `hook_received resumeId "${ctx.params.resumeId}" already recorded with a different payload`,
+        );
+      }
+      const committed = await store.get<Event>(`${EVENT_KEY_PREFIX}${claim.eventId}`);
+      if (
+        committed?.eventType === 'hook_received' &&
+        committed.correlationId === claim.hookId &&
+        committed.resumeId === ctx.params.resumeId
+      ) {
+        return { ok: true, event: committed, releasedHooks: [] };
+      }
+      if (committed) {
+        return failure(
+          'ENTITY_CONFLICT',
+          `hook_received resumeId "${ctx.params.resumeId}" points to a different event`,
+        );
+      }
+    }
+  }
   if (
     (data.eventType === 'hook_disposed' || data.eventType === 'hook_received') &&
     data.correlationId
@@ -552,7 +622,25 @@ export async function applyEvent(
       // Idempotent for concurrent invocations / queue redeliveries: if the
       // run is already running this is a replay — no duplicate event.
       if (currentRun.status === 'running') {
-        return { ok: true, run: currentRun, releasedHooks: [] };
+        const result: ApplyEventSuccess = {
+          ok: true,
+          run: currentRun,
+          releasedHooks: [],
+          maxEvents: getMaxEventsPerRun(),
+        };
+        if (ctx.params?.skipPreload) return result;
+        const allEvents = await listByPrefix<Event>(
+          store,
+          EVENT_KEY_PREFIX,
+          { limit: getMaxEventsPerRun(), sortOrder: 'asc' },
+          (event) => event.eventId,
+        );
+        return {
+          ...result,
+          events: allEvents.data,
+          cursor: allEvents.cursor,
+          hasMore: allEvents.hasMore,
+        };
       }
       const run = WorkflowRunSchema.parse(
         compact({
@@ -610,6 +698,7 @@ export async function applyEvent(
       await store.put(RUN_KEY, run);
       await putEvent(event);
       const releasedHooks = await releaseAllHooks(store);
+      await releaseAllWaits(store);
       return { ok: true, event, run, releasedHooks };
     }
 
@@ -633,6 +722,7 @@ export async function applyEvent(
       await store.put(RUN_KEY, run);
       await putEvent(event);
       const releasedHooks = await releaseAllHooks(store);
+      await releaseAllWaits(store);
       return { ok: true, event, run, releasedHooks };
     }
 
@@ -654,6 +744,7 @@ export async function applyEvent(
       await store.put(RUN_KEY, run);
       await putEvent(event);
       const releasedHooks = await releaseAllHooks(store);
+      await releaseAllWaits(store);
       return { ok: true, event, run, releasedHooks };
     }
 
@@ -665,6 +756,13 @@ export async function applyEvent(
         existingKeys: Object.keys(currentRun.attributes),
         allowReservedAttributes: data.eventData.allowReservedAttributes,
       });
+      const markerKey =
+        data.correlationId && data.eventData.writer.type === 'workflow'
+          ? `${ATTRIBUTE_EVENT_MARKER_PREFIX}${data.correlationId}`
+          : undefined;
+      if (markerKey && (await store.get<string>(markerKey)) !== undefined) {
+        return failure('ENTITY_CONFLICT', `Attribute event "${data.correlationId}" already exists`);
+      }
       const run = WorkflowRunSchema.parse(
         compact({
           ...currentRun,
@@ -674,6 +772,7 @@ export async function applyEvent(
       );
       const event = buildEvent({ ...data });
       await store.put(RUN_KEY, run);
+      if (markerKey) await store.put(markerKey, event.eventId);
       await putEvent(event);
       return { ok: true, event, run, releasedHooks: [] };
     }
@@ -923,8 +1022,12 @@ export async function applyEvent(
     }
 
     case 'wait_created': {
+      const waitKey = `${WAIT_KEY_PREFIX}${data.correlationId}`;
+      if ((await store.get<Wait>(waitKey)) !== undefined) {
+        return failure('ENTITY_CONFLICT', `Wait "${data.correlationId}" already exists`);
+      }
       const wait = WaitSchema.parse({
-        waitId: data.correlationId,
+        waitId: `${runId}-${data.correlationId}`,
         runId,
         status: 'waiting',
         resumeAt: data.eventData.resumeAt,
@@ -933,30 +1036,46 @@ export async function applyEvent(
         specVersion,
       });
       const event = buildEvent({ ...data });
+      await store.put(waitKey, wait);
       await putEvent(event);
       return { ok: true, event, wait, releasedHooks: [] };
     }
 
     case 'wait_completed': {
+      const waitKey = `${WAIT_KEY_PREFIX}${data.correlationId}`;
+      const existing = await store.get<Wait>(waitKey);
+      if (!existing) {
+        return failure('WAIT_NOT_FOUND', `Wait "${data.correlationId}" not found`);
+      }
+      if (existing.status === 'completed') {
+        return failure('ENTITY_CONFLICT', `Wait "${data.correlationId}" already completed`);
+      }
       const event = buildEvent({ ...data });
       const wait = WaitSchema.parse({
-        waitId: data.correlationId,
-        runId,
+        ...existing,
         status: 'completed',
-        resumeAt: data.eventData?.resumeAt,
+        resumeAt: data.eventData?.resumeAt ?? existing.resumeAt,
         completedAt: now,
-        createdAt: now,
         updatedAt: now,
-        specVersion,
       });
+      await store.put(waitKey, wait);
       await putEvent(event);
       return { ok: true, event, wait, releasedHooks: [] };
     }
 
-    // hook_received and hook_conflict are event-only at the storage level.
+    // hook_received and hook_conflict are event-only at the entity level.
     default: {
       const event = buildEvent({ ...data });
       await putEvent(event);
+      if (data.eventType === 'hook_received' && ctx.params?.resumeId) {
+        await store.put<HookResumeClaim>(`${HOOK_RESUME_CLAIM_PREFIX}${ctx.params.resumeId}`, {
+          hookId: data.correlationId,
+          eventId: event.eventId,
+          ...(ctx.params.resumePayloadDigest
+            ? { payloadDigest: ctx.params.resumePayloadDigest }
+            : {}),
+        });
+      }
       return { ok: true, event, releasedHooks: [] };
     }
   }
@@ -973,7 +1092,12 @@ export async function finalizeEventPage(
   outcome: ApplyEventOutcome,
   params?: CreateEventParams,
 ): Promise<ApplyEventOutcome> {
-  if (!outcome.ok || !outcome.event) return outcome;
+  if (!outcome.ok) return outcome;
+  const result: ApplyEventSuccess =
+    outcome.run && outcome.maxEvents === undefined
+      ? { ...outcome, maxEvents: getMaxEventsPerRun() }
+      : outcome;
+  if (!result.event) return result;
 
   if (typeof params?.sinceCursor === 'string') {
     const page = await listByPrefix<Event>(
@@ -982,12 +1106,12 @@ export async function finalizeEventPage(
       { limit: 100, cursor: params.sinceCursor, sortOrder: 'asc' },
       (event) => event.eventId,
     );
-    return { ...outcome, events: page.data, cursor: page.cursor, hasMore: page.hasMore };
+    return { ...result, events: page.data, cursor: page.cursor, hasMore: page.hasMore };
   }
 
-  if (params?.eventCount === undefined) return outcome;
-  const committedSlot = eventIdToSlot(outcome.event.eventId);
-  if (committedSlot === null || committedSlot <= params.eventCount + 1) return outcome;
+  if (params?.eventCount === undefined) return result;
+  const committedSlot = eventIdToSlot(result.event.eventId);
+  if (committedSlot === null || committedSlot <= params.eventCount + 1) return result;
 
   const skippedCount = committedSlot - params.eventCount - 1;
   const page = await listByPrefix<Event>(
@@ -1000,9 +1124,9 @@ export async function finalizeEventPage(
     },
     (event) => event.eventId,
   );
-  const events = page.data.filter((event) => event.eventId < outcome.event!.eventId);
+  const events = page.data.filter((event) => event.eventId < result.event!.eventId);
   return {
-    ...outcome,
+    ...result,
     events,
     cursor: null,
     hasMore: events.length < skippedCount,

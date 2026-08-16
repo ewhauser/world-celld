@@ -1,11 +1,6 @@
 import { DurableObject } from '../do-base.js';
 import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
-import {
-  eventIdToSlot,
-  isTerminalWorkflowRunStatus,
-  slotToEventId,
-  WorkflowRunSchema,
-} from '@workflow/world';
+import { isTerminalWorkflowRunStatus, slotToEventId, WorkflowRunSchema } from '@workflow/world';
 import {
   applyEvent,
   finalizeEventPage,
@@ -81,146 +76,6 @@ const CLEANUP_RETRY_MAX_MS = 60 * 60 * 1000;
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
 
 /**
- * Current schema version for DO storage.
- * Increment when making breaking changes to the storage layout.
- * Migrations run lazily on first request after deploy.
- *
- * v2: one storage key per event ('event:<eventId>'), step ('step:<stepId>')
- * and hook ('hook:<hookId>') instead of single aggregate values.
- * v3: creation-time indexes for step and hook pagination.
- * v4: Workflow 5 dense, slot-numbered event IDs.
- */
-const CURRENT_SCHEMA_VERSION = 4;
-
-const EVENT_SLOT_MIGRATION_STATE_KEY = 'migration:event-slots';
-
-interface EventSlotMigrationState {
-  scanAfterKey?: string;
-  nextSlot: number;
-}
-
-/**
- * Renumber pre-Workflow-5 event IDs in their existing lexicographic log order.
- * Each rename and checkpoint is one storage transaction, so eviction can only
- * leave a committed prefix and retry resumes after that prefix without gaps.
- */
-async function migrateEventSlots(storage: DurableObjectStorage): Promise<void> {
-  const storedState = await storage.get<EventSlotMigrationState>(EVENT_SLOT_MIGRATION_STATE_KEY);
-  let state: EventSlotMigrationState;
-  if (storedState) {
-    state = storedState;
-  } else {
-    state = { nextSlot: 0 };
-    await storage.put(EVENT_SLOT_MIGRATION_STATE_KEY, state);
-  }
-
-  while (true) {
-    const page: Map<string, Event> = await storage.list<Event>({
-      prefix: EVENT_KEY_PREFIX,
-      startAfter: state.scanAfterKey,
-      limit: 100,
-    });
-    if (page.size === 0) break;
-
-    for (const [key, event] of page) {
-      const fallbackState = state;
-      state = await storage.transaction(async (txn): Promise<EventSlotMigrationState> => {
-        const current =
-          (await txn.get<EventSlotMigrationState>(EVENT_SLOT_MIGRATION_STATE_KEY)) ?? fallbackState;
-        const existingSlot = eventIdToSlot(event.eventId);
-        if (existingSlot !== null) {
-          const next: EventSlotMigrationState = {
-            scanAfterKey: key,
-            nextSlot: Math.max(current.nextSlot, existingSlot),
-          };
-          await txn.put(EVENT_SLOT_MIGRATION_STATE_KEY, next);
-          return next;
-        }
-
-        const nextSlot = current.nextSlot + 1;
-        const eventId = slotToEventId(nextSlot);
-        await txn.put(`${EVENT_KEY_PREFIX}${eventId}`, { ...event, eventId });
-        await txn.delete(key);
-        const next: EventSlotMigrationState = { scanAfterKey: key, nextSlot };
-        await txn.put(EVENT_SLOT_MIGRATION_STATE_KEY, next);
-        return next;
-      });
-    }
-  }
-
-  await storage.put('event_sequence', state.nextSlot);
-  await storage.delete(EVENT_SLOT_MIGRATION_STATE_KEY);
-}
-
-/**
- * Idempotent migration functions keyed by target version. The schema version
- * is written only after the migration completes, so eviction safely retries
- * an interrupted migration.
- */
-const MIGRATIONS: Record<number, (storage: DurableObjectStorage) => Promise<void>> = {
-  2: async (storage) => {
-    await storage.transaction(async (txn) => {
-      // Pre-production layout change: drop the v1 aggregate values.
-      await txn.delete('events');
-      await txn.delete('steps');
-      await txn.delete('hooks');
-    });
-  },
-  3: async (storage) => {
-    await backfillCreationIndex<Step>(
-      storage,
-      STEP_KEY_PREFIX,
-      STEP_CREATED_KEY_PREFIX,
-      (step) => step.stepId,
-    );
-    await backfillCreationIndex<Hook>(
-      storage,
-      HOOK_KEY_PREFIX,
-      HOOK_CREATED_KEY_PREFIX,
-      (hook) => hook.hookId,
-    );
-  },
-  4: migrateEventSlots,
-};
-
-async function backfillCreationIndex<T extends { createdAt: Date }>(
-  storage: DurableObjectStorage,
-  entityPrefix: string,
-  indexPrefix: string,
-  getId: (entity: T) => string,
-): Promise<void> {
-  let startAfter: string | undefined;
-  while (true) {
-    const entities = await storage.list<T>({ prefix: entityPrefix, startAfter, limit: 100 });
-    if (entities.size === 0) return;
-    for (const [key, entity] of entities) {
-      const id = getId(entity);
-      await storage.put(`${indexPrefix}${entity.createdAt.toISOString()}:${id}`, id);
-      startAfter = key;
-    }
-    if (entities.size < 100) return;
-  }
-}
-
-/**
- * Ensure the DO storage schema is up to date.
- * Runs any pending migrations sequentially inside transactions,
- * persisting the version after each successful migration.
- * Safe to call on every request -- it's a no-op when already current.
- */
-async function ensureSchemaUpToDate(storage: DurableObjectStorage): Promise<void> {
-  const stored = (await storage.get<number>('schema_version')) ?? 1;
-
-  for (let v = stored + 1; v <= CURRENT_SCHEMA_VERSION; v++) {
-    const migration = MIGRATIONS[v];
-    if (migration) {
-      await migration(storage);
-    }
-    await storage.put('schema_version', v);
-  }
-}
-
-/**
  * Adapt DO storage (or a transaction) to the {@link EventStore} interface
  * shared with the test mocks. No casts: the methods line up structurally,
  * this just pins the subset we rely on.
@@ -250,18 +105,9 @@ interface InflightClaim {
  * queue-message dedup claims (see claimInflight/releaseInflight).
  */
 export class WorkflowRunDO extends DurableObject {
-  private schemaReady: Promise<void> | null = null;
-
   private now(): number {
     const clock = (this.env as WorkflowRunDOEnv)?.clock;
     return typeof clock === 'function' ? clock() : Date.now();
-  }
-
-  private ensureSchema(): Promise<void> {
-    if (!this.schemaReady) {
-      this.schemaReady = ensureSchemaUpToDate(this.ctx.storage);
-    }
-    return this.schemaReady;
   }
 
   private async expiredTombstone(
@@ -276,7 +122,6 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   private async read<T>(reader: () => Promise<T>): Promise<RunReadOutcome<T>> {
-    await this.ensureSchema();
     const tombstone = await this.expiredTombstone(this.ctx.storage);
     if (tombstone) return expiredRead(tombstone);
     return { ok: true, value: await reader() };
@@ -284,7 +129,6 @@ export class WorkflowRunDO extends DurableObject {
 
   /** Apply an event and capture all retention metadata in the same transaction. */
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
-    await this.ensureSchema();
     return await this.ctx.storage.transaction(async (txn) => {
       const now = new Date(this.now());
       const tombstone = await this.expiredTombstone(txn, now.getTime());
@@ -433,13 +277,11 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async getCleanupStatus(): Promise<CleanupRecord | null> {
-    await this.ensureSchema();
     return (await this.ctx.storage.get<CleanupRecord>(CLEANUP_RECORD_KEY)) ?? null;
   }
 
   /** Explicitly schedule an existing terminal run, used for opt-in backfills. */
   async scheduleCleanup(request: ScheduleCleanupRequest): Promise<CleanupRecord | null> {
-    await this.ensureSchema();
     if (request.retentionMs <= 0) return this.getCleanupStatus();
     return await this.ctx.storage.transaction(async (txn) => {
       const existing = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
@@ -473,7 +315,6 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async cleanupNow(request: ScheduleCleanupRequest): Promise<CleanupRecord | null> {
-    await this.ensureSchema();
     if (!(await this.ctx.storage.get<CleanupRecord>(CLEANUP_RECORD_KEY))) {
       await this.scheduleCleanup({ ...request, retentionMs: Math.max(1, request.retentionMs) });
     }
@@ -495,7 +336,6 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async rearmCleanup(): Promise<CleanupRecord | null> {
-    await this.ensureSchema();
     const cleanup = await this.ctx.storage.get<CleanupRecord>(CLEANUP_RECORD_KEY);
     if (!cleanup) return null;
     if (cleanup.phase === 'tombstoned') {
@@ -507,7 +347,6 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async alarm(): Promise<void> {
-    await this.ensureSchema();
     try {
       await this.executeCleanup();
     } catch (error) {
@@ -635,9 +474,7 @@ export class WorkflowRunDO extends DurableObject {
       if (!cleanup || cleanup.phase !== 'payload') return true;
       const entries = await txn.list({ limit: PAYLOAD_DELETE_BATCH + 3 });
       const keys = Array.from(entries.keys())
-        .filter(
-          (key) => key !== CLEANUP_RECORD_KEY && key !== TOMBSTONE_KEY && key !== 'schema_version',
-        )
+        .filter((key) => key !== CLEANUP_RECORD_KEY && key !== TOMBSTONE_KEY)
         .slice(0, PAYLOAD_DELETE_BATCH);
       const now = new Date(this.now());
       await txn.put(TOMBSTONE_KEY, cleanupTombstone(cleanup, now));
@@ -685,7 +522,6 @@ export class WorkflowRunDO extends DurableObject {
     messageId: string;
     staleMs: number;
   }): Promise<{ claimed: boolean }> {
-    await this.ensureSchema();
     return await this.ctx.storage.transaction(async (txn) => {
       const existing = await txn.get<InflightClaim>('claim');
       const now = this.now();
@@ -702,7 +538,6 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async releaseInflight(): Promise<void> {
-    await this.ensureSchema();
     await this.ctx.storage.delete('claim');
   }
 }
