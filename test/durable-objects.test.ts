@@ -36,7 +36,7 @@ describe('Cloudflare Durable Objects Features', () => {
         input: opts.input,
       },
     });
-    return result.run!;
+    return result.run;
   }
 
   describe('Durable Object Isolation', () => {

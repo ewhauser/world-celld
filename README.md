@@ -125,7 +125,7 @@ celld worker router
           |
           | HTTP callbacks
           v
-Workflow application /.well-known/workflow/v1/{flow|step}
+Workflow application /.well-known/workflow/v1/flow
 ```
 
 The application-side package implements the Workflow `World` interface and

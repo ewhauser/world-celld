@@ -66,15 +66,15 @@
     "prepack": "pnpm build"
   },
   "dependencies": {
-    "@workflow/errors": "4.2.1",
-    "@workflow/world": "4.3.1",
+    "@workflow/errors": "5.0.0-beta.17",
+    "@workflow/world": "5.0.0-beta.27",
     "ulid": "^3.0.2"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260708.1",
     "@ewhauser/world-celld": "link:.",
     "@types/node": "^22.19.0",
-    "@workflow/world-testing": "4.1.11",
+    "@workflow/world-testing": "5.0.0-beta.42",
     "esbuild": "^0.28.2",
     "oxfmt": "^0.63.0",
     "oxlint": "^1.78.0",

@@ -14,7 +14,7 @@ async function createCompletedRun(world: ReturnType<typeof createCelldWorld>, su
       input: [`input-${suffix}`],
     },
   });
-  const runId = created.run!.runId;
+  const runId = created.run.runId;
   await world.events.create(runId, { eventType: 'run_started' });
   await world.events.create(runId, {
     eventType: 'step_created',

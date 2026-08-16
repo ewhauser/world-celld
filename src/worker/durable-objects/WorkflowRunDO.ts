@@ -1,8 +1,14 @@
 import { DurableObject } from '../do-base.js';
 import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
-import { isTerminalWorkflowRunStatus, WorkflowRunSchema } from '@workflow/world';
+import {
+  eventIdToSlot,
+  isTerminalWorkflowRunStatus,
+  slotToEventId,
+  WorkflowRunSchema,
+} from '@workflow/world';
 import {
   applyEvent,
+  finalizeEventPage,
   type ApplyEventOutcome,
   type ApplyEventRequest,
   EVENT_KEY_PREFIX,
@@ -80,10 +86,71 @@ type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'canc
  * Migrations run lazily on first request after deploy.
  *
  * v2: one storage key per event ('event:<eventId>'), step ('step:<stepId>')
- * and hook ('hook:<hookId>') instead of single aggregate values. This package
- * is pre-production, so the migration simply drops the legacy aggregates.
+ * and hook ('hook:<hookId>') instead of single aggregate values.
+ * v3: creation-time indexes for step and hook pagination.
+ * v4: Workflow 5 dense, slot-numbered event IDs.
  */
-const CURRENT_SCHEMA_VERSION = 3;
+const CURRENT_SCHEMA_VERSION = 4;
+
+const EVENT_SLOT_MIGRATION_STATE_KEY = 'migration:event-slots';
+
+interface EventSlotMigrationState {
+  scanAfterKey?: string;
+  nextSlot: number;
+}
+
+/**
+ * Renumber pre-Workflow-5 event IDs in their existing lexicographic log order.
+ * Each rename and checkpoint is one storage transaction, so eviction can only
+ * leave a committed prefix and retry resumes after that prefix without gaps.
+ */
+async function migrateEventSlots(storage: DurableObjectStorage): Promise<void> {
+  const storedState = await storage.get<EventSlotMigrationState>(EVENT_SLOT_MIGRATION_STATE_KEY);
+  let state: EventSlotMigrationState;
+  if (storedState) {
+    state = storedState;
+  } else {
+    state = { nextSlot: 0 };
+    await storage.put(EVENT_SLOT_MIGRATION_STATE_KEY, state);
+  }
+
+  while (true) {
+    const page: Map<string, Event> = await storage.list<Event>({
+      prefix: EVENT_KEY_PREFIX,
+      startAfter: state.scanAfterKey,
+      limit: 100,
+    });
+    if (page.size === 0) break;
+
+    for (const [key, event] of page) {
+      const fallbackState = state;
+      state = await storage.transaction(async (txn): Promise<EventSlotMigrationState> => {
+        const current =
+          (await txn.get<EventSlotMigrationState>(EVENT_SLOT_MIGRATION_STATE_KEY)) ?? fallbackState;
+        const existingSlot = eventIdToSlot(event.eventId);
+        if (existingSlot !== null) {
+          const next: EventSlotMigrationState = {
+            scanAfterKey: key,
+            nextSlot: Math.max(current.nextSlot, existingSlot),
+          };
+          await txn.put(EVENT_SLOT_MIGRATION_STATE_KEY, next);
+          return next;
+        }
+
+        const nextSlot = current.nextSlot + 1;
+        const eventId = slotToEventId(nextSlot);
+        await txn.put(`${EVENT_KEY_PREFIX}${eventId}`, { ...event, eventId });
+        await txn.delete(key);
+        const next: EventSlotMigrationState = { scanAfterKey: key, nextSlot };
+        await txn.put(EVENT_SLOT_MIGRATION_STATE_KEY, next);
+        return next;
+      });
+    }
+  }
+
+  await storage.put('event_sequence', state.nextSlot);
+  await storage.delete(EVENT_SLOT_MIGRATION_STATE_KEY);
+}
 
 /**
  * Idempotent migration functions keyed by target version. The schema version
@@ -113,6 +180,7 @@ const MIGRATIONS: Record<number, (storage: DurableObjectStorage) => Promise<void
       (hook) => hook.hookId,
     );
   },
+  4: migrateEventSlots,
 };
 
 async function backfillCreationIndex<T extends { createdAt: Date }>(
@@ -231,7 +299,7 @@ export class WorkflowRunDO extends DurableObject {
       let eventSequence = (await txn.get<number>('event_sequence')) ?? 0;
       const outcome = await applyEvent(storeFrom(txn), {
         ...request,
-        nextEventId: () => `wevt_z${String(++eventSequence).padStart(20, '0')}`,
+        nextEventId: () => slotToEventId(++eventSequence),
         now,
       });
       if (!outcome.ok) return outcome;
@@ -287,7 +355,7 @@ export class WorkflowRunDO extends DurableObject {
         await txn.setAlarm(dueAt);
         outcome.run = run;
       }
-      return outcome;
+      return finalizeEventPage(storeFrom(txn), outcome, request.params);
     });
   }
 

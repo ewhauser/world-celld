@@ -64,7 +64,7 @@ export interface CelldWorldConfig {
   deploymentId?: string;
   /**
    * Base URL the app's workflow endpoints are mounted on; QueueDO cells
-   * deliver to `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+   * deliver to `${baseUrl}/.well-known/workflow/v1/flow`.
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${PORT ?? 3000}`
    */
   baseUrl?: string;

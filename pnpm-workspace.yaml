@@ -8,12 +8,41 @@ overrides:
   'hono@<4.12.34': 4.12.34
   'nanoid@>=5.0.0 <5.1.16': 5.1.16
   'undici@>=7.0.0 <7.29.0': 7.29.0
+# The Workflow meta-package installs every framework adapter. Nest's peers are
+# irrelevant to this Nitro demo and should not force unused framework packages
+# into the development graph.
+peerDependencyRules:
+  ignoreMissing:
+    - '@nestjs/common'
+    - '@nestjs/core'
+    - '@swc/cli'
 # Give the ecosystem time to detect and remove compromised releases before
 # dependency updates can select them. Lockfile installs remain reproducible.
 minimumReleaseAge: 10080
 minimumReleaseAgeIgnoreMissingTime: false
 minimumReleaseAgeExclude:
   - '@ewhauser/*'
+  # Workflow 5 is currently published only on the beta channel. Keep this
+  # compatibility set exact while allowing the requested newest beta through
+  # the normal seven-day package-age quarantine.
+  - 'workflow@5.0.0-beta.42'
+  - '@workflow/astro@5.0.0-beta.42'
+  - '@workflow/builders@5.0.0-beta.42'
+  - '@workflow/cli@5.0.0-beta.42'
+  - '@workflow/core@5.0.0-beta.42'
+  - '@workflow/errors@5.0.0-beta.17'
+  - '@workflow/nest@5.0.0-beta.42'
+  - '@workflow/next@5.0.0-beta.42'
+  - '@workflow/nitro@5.0.0-beta.42'
+  - '@workflow/nuxt@5.0.0-beta.42'
+  - '@workflow/rollup@5.0.0-beta.42'
+  - '@workflow/sveltekit@5.0.0-beta.42'
+  - '@workflow/vite@5.0.0-beta.42'
+  - '@workflow/web@5.0.0-beta.42'
+  - '@workflow/world@5.0.0-beta.27'
+  - '@workflow/world-local@5.0.0-beta.36'
+  - '@workflow/world-testing@5.0.0-beta.42'
+  - '@workflow/world-vercel@5.0.0-beta.38'
   # Exact bootstrap exceptions: these direct requirements had no release old
   # enough to satisfy their declared range when the policy was introduced.
   - 'hono@4.13.2'

@@ -23,7 +23,6 @@ import {
   MessageId,
   parseQueueName,
   type Queue,
-  type QueueKind,
   type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
@@ -54,12 +53,9 @@ export function computeBackoff(attempt: number): number {
   return Math.min(60, 2 ** attempt);
 }
 
-type Pathname = 'flow' | 'step';
+type Pathname = 'flow';
 
-const QUEUE_PATHNAMES = {
-  workflow: 'flow',
-  step: 'step',
-} as const satisfies Record<QueueKind, Pathname>;
+const QUEUE_PATHNAME: Pathname = 'flow';
 
 function isTestMode(): boolean {
   // Explicit override: force the production QueueDO path even under a test
@@ -92,7 +88,7 @@ export interface EnqueueRequest {
 }
 
 export interface QueueCellConfig {
-  /** Base URL of the app; deliveries POST to `${baseUrl}/.well-known/workflow/v1/{flow|step}`. */
+  /** Base URL of the app; deliveries POST to `${baseUrl}/.well-known/workflow/v1/flow`. */
   targetBaseUrl: string;
   queueShards: number;
 }
@@ -122,7 +118,7 @@ export interface CelldQueueConfig {
   deploymentId: string;
   /**
    * Base URL the app's workflow endpoints are mounted on. QueueDO cells
-   * deliver to `${baseUrl}/.well-known/workflow/v1/{flow|step}`; the test
+   * deliver to `${baseUrl}/.well-known/workflow/v1/flow`; the test
    * pump uses the same value.
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
    */
@@ -167,9 +163,8 @@ export function shardFor(key: string, shards: number): number {
 }
 
 /**
- * In-process test pump. Holds two in-memory FIFOs and HTTP-dispatches
- * envelopes to the user's server at
- * `${baseUrl}/.well-known/workflow/v1/{flow|step}`.
+ * In-process test pump. Holds an in-memory FIFO and HTTP-dispatches envelopes
+ * to the user's server at `${baseUrl}/.well-known/workflow/v1/flow`.
  *
  * Mirrors world-local's idempotency semantics: messages are deduplicated on
  * `idempotencyKey` while a message with the same key is in flight, and the
@@ -184,8 +179,8 @@ function createTestPump(config: CelldQueueConfig) {
   const maxAttempts = config.maxAttempts ?? 5;
   const baseBackoffMs = config.backoffDelayMs ?? 1000;
 
-  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [], step: [] };
-  const wakers: Record<Pathname, Array<() => void>> = { flow: [], step: [] };
+  const queues: Record<Pathname, PumpEnvelope[]> = { flow: [] };
+  const wakers: Record<Pathname, Array<() => void>> = { flow: [] };
   /** Inflight messageIds by idempotencyKey (world-local queue.js semantics). */
   const inflightMessages = new Map<string, MessageId>();
   let running = false;
@@ -298,7 +293,6 @@ function createTestPump(config: CelldQueueConfig) {
       if (running) return;
       running = true;
       void loop('flow');
-      void loop('step');
     },
     stop() {
       running = false;
@@ -321,13 +315,9 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
 
   return {
     async queue(queueName, message, opts) {
-      const { kind } = parseQueueName(queueName);
+      parseQueueName(queueName);
       const runId =
-        'runId' in message
-          ? message.runId
-          : 'workflowRunId' in message
-            ? message.workflowRunId
-            : undefined;
+        'runId' in message && typeof message.runId === 'string' ? message.runId : undefined;
 
       if (isTestMode()) {
         // Dedup on idempotencyKey while a message with the same key is in
@@ -339,7 +329,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         }
         const messageId = MessageId.parse(`msg_${generateMessageId()}`);
         testPump.push(
-          QUEUE_PATHNAMES[kind],
+          QUEUE_PATHNAME,
           {
             messageId,
             queueName,
@@ -360,7 +350,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
       const outcome = await getQueueStub(shard).enqueue({
         messageId,
         queueName,
-        pathname: QUEUE_PATHNAMES[kind],
+        pathname: QUEUE_PATHNAME,
         body: stringify(message),
         runId,
         idempotencyKey: opts?.idempotencyKey,

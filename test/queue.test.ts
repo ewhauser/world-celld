@@ -59,7 +59,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should enqueue into a queue cell with a tagged-JSON body', async () => {
-      const queueName = '__wkf_step_test' as ValidQueueName;
+      const queueName = '__wkf_workflow_test' as ValidQueueName;
       const message = { data: 'test-message' };
 
       const result = await queue.queue(queueName, message);
@@ -68,7 +68,7 @@ describe('Queue (celld QueueDO integration)', () => {
       const enq = recordedEnqueues[0];
       expect(enq.cellName).toBe('q:0');
       expect(enq.queueName).toBe(queueName);
-      expect(enq.pathname).toBe('step');
+      expect(enq.pathname).toBe('flow');
       expect(enq.messageId).toMatch(/^msg_/);
       expect(parse(enq.body)).toEqual(message);
       expect(enq.config).toEqual({
@@ -85,18 +85,18 @@ describe('Queue (celld QueueDO integration)', () => {
 
     it('should include the idempotency key in the enqueue request', async () => {
       const idempotencyKey = 'unique-key-123';
-      await queue.queue('__wkf_step_test', { data: 'test' }, { idempotencyKey });
+      await queue.queue('__wkf_workflow_test', { data: 'test' }, { idempotencyKey });
       expect(recordedEnqueues[0].idempotencyKey).toBe(idempotencyKey);
     });
 
     it('should pass delaySeconds through to the queue cell', async () => {
-      await queue.queue('__wkf_step_test', {}, { delaySeconds: 42 });
+      await queue.queue('__wkf_workflow_test', {}, { delaySeconds: 42 });
       expect(recordedEnqueues[0].delaySeconds).toBe(42);
     });
 
     it('should generate unique monotonic message IDs', async () => {
-      const first = await queue.queue('__wkf_step_test', {});
-      const second = await queue.queue('__wkf_step_test', {});
+      const first = await queue.queue('__wkf_workflow_test', {});
+      const second = await queue.queue('__wkf_workflow_test', {});
 
       expect(first.messageId).toMatch(/^msg_/);
       expect(second.messageId).toMatch(/^msg_/);
@@ -104,8 +104,16 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should return the original messageId when the cell dedups on idempotencyKey', async () => {
-      const first = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
-      const second = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
+      const first = await queue.queue(
+        '__wkf_workflow_a',
+        { data: 1 },
+        { idempotencyKey: 'step-abc' },
+      );
+      const second = await queue.queue(
+        '__wkf_workflow_a',
+        { data: 1 },
+        { idempotencyKey: 'step-abc' },
+      );
 
       expect(second.messageId).toBe(first.messageId);
       expect(recordedEnqueues).toHaveLength(1);
@@ -113,7 +121,7 @@ describe('Queue (celld QueueDO integration)', () => {
 
     it('should round-trip Uint8Array payloads (binary-safe transport)', async () => {
       const input = new Uint8Array([0, 1, 2, 250, 251, 252]);
-      await queue.queue('__wkf_step_test', {
+      await queue.queue('__wkf_workflow_test', {
         runId: 'wrun_1',
         runInput: { input, deploymentId: 'd', workflowName: 'w', specVersion: 3 },
       });
@@ -131,8 +139,8 @@ describe('Queue (celld QueueDO integration)', () => {
         queueShards: 4,
       });
 
-      await queue.queue('__wkf_step_a', { n: 1 }, { idempotencyKey: 'k-1' });
-      await queue.queue('__wkf_step_b', { n: 2 }, { idempotencyKey: 'k-1' });
+      await queue.queue('__wkf_workflow_a', { n: 1 }, { idempotencyKey: 'k-1' });
+      await queue.queue('__wkf_workflow_b', { n: 2 }, { idempotencyKey: 'k-1' });
 
       // Cell-level dedup on the same key means only the first enqueue lands.
       expect(recordedEnqueues).toHaveLength(1);
@@ -150,7 +158,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should not enqueue into queue cells in test mode', async () => {
-      await queue.queue('__wkf_step_q', { data: 'test' });
+      await queue.queue('__wkf_workflow_q', { data: 'test' });
       expect(recordedEnqueues).toHaveLength(0);
     });
 
@@ -163,18 +171,26 @@ describe('Queue (celld QueueDO integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      await queue.queue('__wkf_step_q', { data: 'test' });
+      await queue.queue('__wkf_workflow_q', { data: 'test' });
       expect(recordedEnqueues).toHaveLength(0);
     });
 
     it('should dedup messages on idempotencyKey while inflight', async () => {
-      const first = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
-      const second = await queue.queue('__wkf_step_a', { data: 1 }, { idempotencyKey: 'step-abc' });
+      const first = await queue.queue(
+        '__wkf_workflow_a',
+        { data: 1 },
+        { idempotencyKey: 'step-abc' },
+      );
+      const second = await queue.queue(
+        '__wkf_workflow_a',
+        { data: 1 },
+        { idempotencyKey: 'step-abc' },
+      );
 
       expect(second.messageId).toBe(first.messageId);
 
       const third = await queue.queue(
-        '__wkf_step_a',
+        '__wkf_workflow_a',
         { data: 2 },
         { idempotencyKey: 'step-other' },
       );

@@ -111,7 +111,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
       },
     });
 
-    const runId = created.run!.runId;
+    const runId = created.run.runId;
     const run = await w.runs.get(runId);
     expect(run.status).toBe('pending');
     expect(run.createdAt).toBeInstanceOf(Date);
@@ -140,7 +140,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
         input: ['payload'],
       },
     });
-    const runId = created.run!.runId;
+    const runId = created.run.runId;
     await w.writeToStream(streamName, runId, 'stream-payload');
     await w.closeStream(streamName, runId);
     await w.queue(
@@ -178,7 +178,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
         input: [],
       },
     });
-    const runId = created.run!.runId;
+    const runId = created.run.runId;
     await w.events.create(runId, { eventType: 'run_started', eventData: {} });
     await w.events.create(runId, {
       eventType: 'step_created',
@@ -222,7 +222,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     const marker = randomUUID();
     const before = deliveries.length;
 
-    await w.queue(`__wkf_step_it_${marker.slice(0, 8)}`, { marker });
+    await w.queue(`__wkf_workflow_it_${marker.slice(0, 8)}`, { marker });
 
     const delivered = await waitFor(
       async () => deliveries.slice(before).find((d) => d.body.includes(marker)),
@@ -240,7 +240,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     const enqueuedAt = Date.now();
 
     await w.queue(
-      `__wkf_step_delay_${marker.slice(0, 8)}`,
+      `__wkf_workflow_delay_${marker.slice(0, 8)}`,
       { marker },
       {
         delaySeconds: 3,
@@ -262,7 +262,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     const before = deliveries.length;
     responseQueue.push({ status: 503, body: { timeoutSeconds: 2 } });
 
-    await w.queue(`__wkf_step_retry_${marker.slice(0, 8)}`, { marker });
+    await w.queue(`__wkf_workflow_retry_${marker.slice(0, 8)}`, { marker });
 
     await waitFor(
       async () => deliveries.slice(before).filter((d) => d.body.includes(marker)).length >= 2,
@@ -280,7 +280,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     // 5 permanent-500 responses -> DLQ.
     for (let i = 0; i < 5; i++) responseQueue.push({ status: 500, body: { error: 'down' } });
 
-    const { messageId } = await w.queue(`__wkf_step_dlq_${marker.slice(0, 8)}`, {
+    const { messageId } = await w.queue(`__wkf_workflow_dlq_${marker.slice(0, 8)}`, {
       marker,
     });
 

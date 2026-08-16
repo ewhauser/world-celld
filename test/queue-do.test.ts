@@ -15,8 +15,8 @@ function jsonResponse(status: number, body?: unknown, headers?: Record<string, s
 
 const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
   messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
-  queueName: '__wkf_step_test',
-  pathname: 'step',
+  queueName: '__wkf_workflow_test',
+  pathname: 'flow',
   body: '{"data":"payload"}',
   config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
   ...over,
@@ -58,8 +58,8 @@ describe('QueueDO', () => {
 
     expect(fetchStub).toHaveBeenCalledOnce();
     const [url, init] = fetchStub.mock.calls[0];
-    expect(url).toBe('http://app.test:3000/.well-known/workflow/v1/step');
-    expect(init.headers['x-vqs-queue-name']).toBe('__wkf_step_test');
+    expect(url).toBe('http://app.test:3000/.well-known/workflow/v1/flow');
+    expect(init.headers['x-vqs-queue-name']).toBe('__wkf_workflow_test');
     expect(init.headers['x-vqs-message-id']).toBe('msg_1');
     expect(init.headers['x-vqs-message-attempt']).toBe('1');
     expect(init.body).toBe('{"data":"payload"}');
@@ -306,8 +306,8 @@ describe('QueueDO', () => {
 
     await tick();
     const urls = fetchStub.mock.calls.map((c) => c[0]);
-    expect(urls).toContain('http://app.test:3000/.well-known/workflow/v1/step');
-    expect(urls).toContain('http://moved.test:4000/.well-known/workflow/v1/step');
+    expect(urls).toContain('http://app.test:3000/.well-known/workflow/v1/flow');
+    expect(urls).toContain('http://moved.test:4000/.well-known/workflow/v1/flow');
   });
 
   it('redrives a dead letter with attempts reset', async () => {

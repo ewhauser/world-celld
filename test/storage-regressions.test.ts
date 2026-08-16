@@ -1,4 +1,5 @@
 import { setTimeout } from 'node:timers/promises';
+import { eventIdToSlot, slotToEventId } from '@workflow/world';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createStorage } from '../src/storage.js';
 import { clearMockData, createMockEnv } from '../src/test-mocks.js';
@@ -25,7 +26,7 @@ describe('Storage regressions', () => {
         input: [],
       },
     });
-    return result.run!;
+    return result.run;
   }
 
   it('admits only one hook when two runs concurrently claim the same token', async () => {
@@ -134,13 +135,20 @@ describe('Storage regressions', () => {
 
   it('returns events that match listByCorrelationId', async () => {
     const run = await createRun('correlation-index');
+    const otherRun = await createRun('correlation-index');
     await storage.events.create(run.runId, {
       eventType: 'step_created',
       correlationId: 'correlation-123',
       eventData: { stepName: 'correlated-step', input: [] },
     });
+    await storage.events.create(otherRun.runId, {
+      eventType: 'step_created',
+      correlationId: 'correlation-123',
+      eventData: { stepName: 'other-run-step', input: [] },
+    });
 
     const result = await storage.events.listByCorrelationId({
+      runId: run.runId,
       correlationId: 'correlation-123',
       pagination: { sortOrder: 'asc' },
     });
@@ -151,6 +159,36 @@ describe('Storage regressions', () => {
       correlationId: 'correlation-123',
       eventType: 'step_created',
     });
+  });
+
+  it('uses dense Workflow 5 event slots and reports writes skipped by a stale replay', async () => {
+    const run = await createRun('slot-reporting');
+    await storage.events.create(run.runId, {
+      eventType: 'step_created',
+      correlationId: 'step-a',
+      eventData: { stepName: 'step-a', input: [] },
+    });
+
+    const result = await storage.events.create(
+      run.runId,
+      {
+        eventType: 'step_created',
+        correlationId: 'step-b',
+        eventData: { stepName: 'step-b', input: [] },
+      },
+      { eventCount: 1 },
+    );
+
+    expect(result.event?.eventId).toBe(slotToEventId(3));
+    expect(result.events?.map((event) => event.eventId)).toEqual([slotToEventId(2)]);
+    expect(result.cursor).toBeNull();
+    expect(result.hasMore).toBe(false);
+
+    const page = await storage.events.list({
+      runId: run.runId,
+      pagination: { sortOrder: 'asc' },
+    });
+    expect(page.data.map((event) => eventIdToSlot(event.eventId))).toEqual([1, 2, 3]);
   });
 
   it('orders runs by creation time in descending order', async () => {
