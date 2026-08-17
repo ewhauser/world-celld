@@ -275,7 +275,7 @@ class MockKVNamespace {
     limit?: number;
     reverse?: boolean;
   }): Promise<{
-    keys: Array<{ name: string }>;
+    keys: Array<{ name: string; value: string }>;
     list_complete: boolean;
     cursor?: string;
   }> {
@@ -299,7 +299,7 @@ class MockKVNamespace {
     const listComplete = matchingKeys.length <= limit;
 
     return {
-      keys: page.map((name) => ({ name })),
+      keys: page.map((name) => ({ name, value: kvData.get(name)! })),
       list_complete: listComplete,
       cursor: listComplete ? undefined : page.at(-1),
     };

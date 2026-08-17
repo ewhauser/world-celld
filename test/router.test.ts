@@ -193,6 +193,159 @@ describe('full stack: vendored storage over the wire', () => {
     expect(listed.data.some((r) => r.runId === runId)).toBe(true);
   });
 
+  it('lists runs with N+1 public RPCs, bounded run fanout, and value-bearing index pages', async () => {
+    let publicRpcs = 0;
+    let activeRunReads = 0;
+    let maxActiveRunReads = 0;
+    const paths = new Map<string, number>();
+    const countedFetch: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      publicRpcs++;
+      paths.set(url.pathname, (paths.get(url.pathname) ?? 0) + 1);
+
+      const isRunRead = url.pathname.endsWith('/getRun');
+      if (isRunRead) {
+        activeRunReads++;
+        maxActiveRunReads = Math.max(maxActiveRunReads, activeRunReads);
+        // Make overlap deterministic so the assertion distinguishes serial,
+        // bounded, and unbounded implementations.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      try {
+        return await fetch(input, init);
+      } finally {
+        if (isRunRead) activeRunReads--;
+      }
+    };
+    const env = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: countedFetch,
+    });
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-test',
+    });
+    const runIds: string[] = [];
+    for (let i = 0; i < 20; i++) {
+      const created = await storage.events.create(null, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'wire-test',
+          workflowName: 'wire-list-fanout',
+          input: [i],
+        },
+      });
+      runIds.push(created.run.runId);
+    }
+
+    let indexLists = 0;
+    let indexGets = 0;
+    let runStorageGets = 0;
+    const restorers: Array<() => void> = [];
+    const indexStorage = harness.fleet.cell('index', 'index').storage;
+    const originalIndexList = indexStorage.list.bind(indexStorage);
+    const originalIndexGet = indexStorage.get.bind(indexStorage);
+    indexStorage.list = async <T>(options) => {
+      indexLists++;
+      return originalIndexList<T>(options);
+    };
+    indexStorage.get = async <T>(key: string) => {
+      indexGets++;
+      return originalIndexGet<T>(key);
+    };
+    restorers.push(() => {
+      indexStorage.list = originalIndexList;
+      indexStorage.get = originalIndexGet;
+    });
+    for (const runId of runIds) {
+      const runStorage = harness.fleet.cell('runs', runId).storage;
+      const originalGet = runStorage.get.bind(runStorage);
+      runStorage.get = async <T>(key: string) => {
+        runStorageGets++;
+        return originalGet<T>(key);
+      };
+      restorers.push(() => {
+        runStorage.get = originalGet;
+      });
+    }
+
+    try {
+      // Reproduce the legacy 2N+1 protocol against the same cells so the
+      // before/after counts include identical router and storage layers.
+      publicRpcs = 0;
+      paths.clear();
+      const legacyPage = await env.WORKFLOW_INDEX.list({
+        prefix: 'run:wire-list-fanout:',
+        limit: 50,
+      });
+      for (const key of legacyPage.keys) {
+        const raw = await env.WORKFLOW_INDEX.get(key.name);
+        if (!raw) continue;
+        const { runId } = JSON.parse(raw) as { runId: string };
+        await env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId)).getRun();
+      }
+      expect(publicRpcs).toBe(41);
+      expect(maxActiveRunReads).toBe(1);
+      expect(indexLists).toBe(1);
+      expect(indexGets).toBe(20);
+      expect(runStorageGets).toBe(60);
+
+      publicRpcs = 0;
+      maxActiveRunReads = 0;
+      paths.clear();
+      indexLists = 0;
+      indexGets = 0;
+      runStorageGets = 0;
+      const listed = await storage.runs.list({
+        workflowName: 'wire-list-fanout',
+        pagination: { limit: 20 },
+      });
+
+      expect(listed.data).toHaveLength(20);
+      expect(publicRpcs).toBe(21);
+      expect(paths.get('/v1/rpc/index/index/list')).toBe(1);
+      expect(paths.get('/v1/rpc/index/index/get')).toBeUndefined();
+      expect(Array.from(paths.entries()).filter(([path]) => path.endsWith('/getRun'))).toHaveLength(
+        20,
+      );
+      expect(maxActiveRunReads).toBe(8);
+      expect(indexLists).toBe(1);
+      expect(indexGets).toBe(0);
+      expect(runStorageGets).toBe(60);
+
+      await Promise.all(
+        runIds.map((runId) =>
+          storage.events.create(runId, {
+            eventType: 'run_completed',
+            eventData: { output: [] },
+          }),
+        ),
+      );
+      publicRpcs = 0;
+      maxActiveRunReads = 0;
+      paths.clear();
+      indexLists = 0;
+      indexGets = 0;
+      runStorageGets = 0;
+
+      const pending = await storage.runs.list({
+        workflowName: 'wire-list-fanout',
+        status: 'pending',
+        pagination: { limit: 20 },
+      });
+      expect(pending.data).toEqual([]);
+      expect(publicRpcs).toBe(1);
+      expect(paths.get('/v1/rpc/index/index/list')).toBe(1);
+      expect(maxActiveRunReads).toBe(0);
+      expect(indexLists).toBe(1);
+      expect(indexGets).toBe(0);
+      expect(runStorageGets).toBe(0);
+    } finally {
+      for (const restore of restorers) restore();
+    }
+  });
+
   it('reconstructs typed errors across the wire', async () => {
     const env = transport();
     const storage = createStorage({
