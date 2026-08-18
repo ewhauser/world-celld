@@ -14,7 +14,8 @@ import type { ExpireQueueRunResult } from '../../retention.js';
  *   cfg                          pinned QueueCellConfig (first-enqueue wins)
  *   msg:<messageId>              MessageRow
  *   due:<paddedMs>:<messageId>   schedule index -> messageId
- *   inflight:<messageId>         crash-recovery deadline (epoch ms)
+ *   inflight-deadline:<paddedMs>:<messageId>
+ *                                ordered crash-recovery index -> messageId
  *   key:<idempotencyKey>         active dedup claim -> messageId
  *   dlq:<paddedMs>:<messageId>   DeadLetterRow
  *   run:<runId>:<messageId>      QueueRunReference for retention cleanup
@@ -66,8 +67,15 @@ export interface QueueStats {
 interface QueueRunReference {
   messageId: string;
   dueKey?: string;
+  inflightKey?: string;
   dlqKey?: string;
   idempotencyKey?: string;
+}
+
+interface InflightClaim {
+  row: MessageRow;
+  /** The exact index key is also the lease token for this delivery attempt. */
+  inflightKey: string;
 }
 
 interface ExpiredRunFence {
@@ -84,6 +92,10 @@ const DEFAULT_DELIVERY_TIMEOUT_MS = 300_000;
 const INFLIGHT_GRACE_MS = 30_000;
 /** Move overdue alarms to a new timestamp so celld observes a fresh edge. */
 const MIN_ALARM_DELAY_MS = 1;
+/** Bound expiry recovery so one alarm cannot monopolize the cell. */
+const EXPIRED_INFLIGHT_BATCH = 128;
+
+const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
 
 type AlarmStorage = Pick<DurableObjectStorage, 'list' | 'getAlarm' | 'setAlarm' | 'deleteAlarm'>;
 
@@ -93,6 +105,17 @@ function pad(ms: number): string {
 
 function dueKey(atMs: number, messageId: string): string {
   return `due:${pad(atMs)}:${messageId}`;
+}
+
+function inflightKey(deadlineMs: number, messageId: string): string {
+  return `${INFLIGHT_DEADLINE_PREFIX}${pad(deadlineMs)}:${messageId}`;
+}
+
+function deadlineFromInflightKey(key: string): number {
+  return Number.parseInt(
+    key.slice(INFLIGHT_DEADLINE_PREFIX.length, INFLIGHT_DEADLINE_PREFIX.length + 13),
+    10,
+  );
 }
 
 function runReferenceKey(runId: string, messageId: string): string {
@@ -105,6 +128,15 @@ function expiredRunKey(runId: string): string {
 
 function backoffSeconds(attempt: number): number {
   return Math.min(60, 2 ** attempt);
+}
+
+async function cancelUnusedResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // The delivery outcome is already known from the status. A cancellation
+    // failure must not turn an acknowledged callback into a retry.
+  }
 }
 
 interface QueueCellEnv {
@@ -216,7 +248,7 @@ export class QueueDO extends DurableObject {
     // celld#144: alarm handlers can overlap while awaiting. The storage-only
     // claim phase runs under the input gate; a failure is carried out and
     // rethrown outside so a failed critical section cannot reset the cell.
-    let claimed: MessageRow[] = [];
+    let claimed: InflightClaim[] = [];
     let failure: unknown = null;
     const attempt = async () => {
       try {
@@ -232,8 +264,8 @@ export class QueueDO extends DurableObject {
     }
     if (failure !== null) throw failure;
 
-    for (const row of claimed) {
-      this.ctx.waitUntil(this.#deliver(row));
+    for (const claim of claimed) {
+      this.ctx.waitUntil(this.#deliver(claim));
     }
   }
 
@@ -241,38 +273,49 @@ export class QueueDO extends DurableObject {
    * Storage-only: recover lost inflight claims, claim due messages up to the
    * inflight cap, and re-arm the alarm. Never throws for data conditions.
    */
-  async #claimPhase(): Promise<MessageRow[]> {
+  async #claimPhase(): Promise<InflightClaim[]> {
     const storage = this.ctx.storage;
     const now = this.#now();
     const maxInflight = this.#intVar('QUEUE_MAX_INFLIGHT', DEFAULT_MAX_INFLIGHT);
-    const claimed = await storage.transaction<MessageRow[]>(async (txn) => {
+    const claimed = await storage.transaction<InflightClaim[]>(async (txn) => {
       // 1. Recover: an inflight entry past its deadline is a lost delivery
       // (node crash, deploy restart) — back to due for redelivery.
-      const inflight = await txn.list<number>({ prefix: 'inflight:' });
-      let inflightCount = 0;
-      for (const [key, deadline] of inflight) {
-        if (deadline <= now) {
-          const messageId = key.slice('inflight:'.length);
-          await txn.delete(key);
-          const row = await txn.get<MessageRow>(`msg:${messageId}`);
-          if (row) {
-            const scheduleKey = dueKey(now, messageId);
-            await txn.put(scheduleKey, messageId);
-            if (row.runId) {
-              await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
-                messageId: row.messageId,
-                dueKey: scheduleKey,
-                idempotencyKey: row.idempotencyKey,
-              });
-            }
+      const expiredPage = await txn.list<string>({
+        prefix: INFLIGHT_DEADLINE_PREFIX,
+        end: `${INFLIGHT_DEADLINE_PREFIX}${pad(now + 1)}`,
+        limit: EXPIRED_INFLIGHT_BATCH + 1,
+      });
+      const expired = Array.from(expiredPage.entries()).slice(0, EXPIRED_INFLIGHT_BATCH);
+      for (const [key, messageId] of expired) {
+        await txn.delete(key);
+        const row = await txn.get<MessageRow>(`msg:${messageId}`);
+        if (row) {
+          const scheduleKey = dueKey(now, messageId);
+          await txn.put(scheduleKey, messageId);
+          if (row.runId) {
+            await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+              messageId: row.messageId,
+              dueKey: scheduleKey,
+              idempotencyKey: row.idempotencyKey,
+            });
           }
-        } else {
-          inflightCount++;
         }
       }
+      if (expiredPage.size > EXPIRED_INFLIGHT_BATCH) {
+        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
+        return [];
+      }
+
+      // Only the configured concurrency cap matters here. Reading at most the
+      // cap avoids replacing the expiry scan with an unbounded count scan.
+      const activeInflight = await txn.list<string>({
+        prefix: INFLIGHT_DEADLINE_PREFIX,
+        limit: maxInflight,
+      });
+      const inflightCount = activeInflight.size;
 
       // 2. Claim due messages up to the cap.
-      const rows: MessageRow[] = [];
+      const rows: InflightClaim[] = [];
       if (inflightCount < maxInflight) {
         const due = await txn.list<string>({
           prefix: 'due:',
@@ -284,8 +327,16 @@ export class QueueDO extends DurableObject {
           await txn.delete(key);
           const row = await txn.get<MessageRow>(`msg:${messageId}`);
           if (!row) continue; // orphaned schedule entry
-          await txn.put(`inflight:${messageId}`, now + timeoutMs + INFLIGHT_GRACE_MS);
-          rows.push(row);
+          const claimKey = inflightKey(now + timeoutMs + INFLIGHT_GRACE_MS, messageId);
+          await txn.put(claimKey, messageId);
+          if (row.runId) {
+            await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+              messageId: row.messageId,
+              inflightKey: claimKey,
+              idempotencyKey: row.idempotencyKey,
+            });
+          }
+          rows.push({ row, inflightKey: claimKey });
         }
       }
       await this.#scheduleNextAlarm(txn, now);
@@ -295,7 +346,7 @@ export class QueueDO extends DurableObject {
     return claimed;
   }
 
-  async #deliver(row: MessageRow): Promise<void> {
+  async #deliver({ row, inflightKey: claimKey }: InflightClaim): Promise<void> {
     const storage = this.ctx.storage;
     const timeoutMs = this.#intVar('QUEUE_DELIVERY_TIMEOUT_MS', DEFAULT_DELIVERY_TIMEOUT_MS);
     const callbackSecret = (this.env as QueueCellEnv)?.WORKFLOW_CALLBACK_SECRET;
@@ -324,7 +375,8 @@ export class QueueDO extends DurableObject {
 
     if (response?.ok) {
       // Ack: the message is done; release the dedup claim.
-      await this.#ack(row);
+      await cancelUnusedResponseBody(response);
+      await this.#ack(row, claimKey);
     } else if (response && response.status === 503) {
       // {timeoutSeconds} means "redeliver later, same message": the attempt
       // count does not advance and the dedup key stays claimed.
@@ -337,9 +389,11 @@ export class QueueDO extends DurableObject {
       }
       if (typeof timeoutSeconds === 'number') {
         await storage.transaction(async (txn) => {
+          // Deleting the exact deadline key doubles as a lease-token check. A
+          // late response from an expired claim must not mutate a newer claim.
+          if (!(await txn.delete(claimKey))) return;
           if (row.runId && (await txn.get(expiredRunKey(row.runId))) !== undefined) {
             await txn.delete(`msg:${row.messageId}`);
-            await txn.delete(`inflight:${row.messageId}`);
             await txn.delete(runReferenceKey(row.runId, row.messageId));
             if (row.idempotencyKey) {
               const dedupKey = `key:${row.idempotencyKey}`;
@@ -350,7 +404,6 @@ export class QueueDO extends DurableObject {
             await this.#scheduleNextAlarm(txn, now);
             return;
           }
-          await txn.delete(`inflight:${row.messageId}`);
           const scheduleKey = dueKey(now + timeoutSeconds * 1000, row.messageId);
           await txn.put(scheduleKey, row.messageId);
           if (row.runId) {
@@ -363,25 +416,27 @@ export class QueueDO extends DurableObject {
           await this.#scheduleNextAlarm(txn, now);
         });
       } else {
-        await this.#retry(row, 'HTTP 503');
+        await this.#retry(row, claimKey, 'HTTP 503');
       }
     } else if (response && PERMANENT_STATUSES.has(response.status)) {
       // Permanent: drop without burning retries; the handler already
       // classified this as unreplayable.
-      await this.#ack(row);
+      await cancelUnusedResponseBody(response);
+      await this.#ack(row, claimKey);
     } else {
       const reason = response
         ? `HTTP ${response.status}`
         : `transport error: ${String(transportError)}`;
-      await this.#retry(row, reason);
+      if (response) await cancelUnusedResponseBody(response);
+      await this.#retry(row, claimKey, reason);
     }
   }
 
-  async #ack(row: MessageRow): Promise<void> {
+  async #ack(row: MessageRow, claimKey: string): Promise<void> {
     const storage = this.ctx.storage;
     await storage.transaction(async (txn) => {
+      if (!(await txn.delete(claimKey))) return;
       await txn.delete(`msg:${row.messageId}`);
-      await txn.delete(`inflight:${row.messageId}`);
       if (row.idempotencyKey) {
         const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
         if (holder === row.messageId) {
@@ -395,16 +450,16 @@ export class QueueDO extends DurableObject {
     });
   }
 
-  async #retry(row: MessageRow, reason: string): Promise<void> {
+  async #retry(row: MessageRow, claimKey: string, reason: string): Promise<void> {
     const storage = this.ctx.storage;
     const now = this.#now();
     const maxAttempts = this.#intVar('QUEUE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS);
     const attempt = row.attempt + 1;
 
     await storage.transaction(async (txn) => {
+      if (!(await txn.delete(claimKey))) return;
       if (row.runId && (await txn.get(expiredRunKey(row.runId))) !== undefined) {
         await txn.delete(`msg:${row.messageId}`);
-        await txn.delete(`inflight:${row.messageId}`);
         await txn.delete(runReferenceKey(row.runId, row.messageId));
         if (row.idempotencyKey) {
           const dedupKey = `key:${row.idempotencyKey}`;
@@ -415,7 +470,6 @@ export class QueueDO extends DurableObject {
         await this.#scheduleNextAlarm(txn, now);
         return;
       }
-      await txn.delete(`inflight:${row.messageId}`);
 
       if (attempt >= maxAttempts) {
         const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt: now };
@@ -482,8 +536,9 @@ export class QueueDO extends DurableObject {
       next = Number.parseInt(key.slice('due:'.length, 'due:'.length + 13), 10);
     }
 
-    const inflight = await storage.list<number>({ prefix: 'inflight:' });
-    for (const deadline of inflight.values()) {
+    const inflight = await storage.list<string>({ prefix: INFLIGHT_DEADLINE_PREFIX, limit: 1 });
+    for (const key of inflight.keys()) {
+      const deadline = deadlineFromInflightKey(key);
       if (next === null || deadline < next) next = deadline;
     }
 
@@ -500,7 +555,7 @@ export class QueueDO extends DurableObject {
     const storage = this.ctx.storage;
     const [due, inflight, dlq, alarmAt] = await Promise.all([
       storage.list({ prefix: 'due:' }),
-      storage.list({ prefix: 'inflight:' }),
+      storage.list({ prefix: INFLIGHT_DEADLINE_PREFIX }),
       storage.list({ prefix: 'dlq:' }),
       storage.getAlarm(),
     ]);
@@ -608,7 +663,7 @@ export class QueueDO extends DurableObject {
       let count = existing?.deleted ?? 0;
       for (const [key, reference] of references) {
         await txn.delete(`msg:${reference.messageId}`);
-        await txn.delete(`inflight:${reference.messageId}`);
+        if (reference.inflightKey) await txn.delete(reference.inflightKey);
         if (reference.dueKey) await txn.delete(reference.dueKey);
         if (reference.dlqKey) await txn.delete(reference.dlqKey);
         if (reference.idempotencyKey) {
