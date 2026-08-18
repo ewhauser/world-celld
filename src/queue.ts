@@ -219,6 +219,12 @@ function createTestPump(config: CelldQueueConfig) {
     });
 
     if (response.ok) {
+      try {
+        await response.body?.cancel();
+      } catch {
+        // The status already determines the queue outcome. Do not turn an ack
+        // into a retry solely because releasing an unused body failed.
+      }
       release(envelope);
       return;
     }
@@ -405,7 +411,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
               { status: 503, headers: { 'Retry-After': String(result.timeoutSeconds) } },
             );
           }
-          return Response.json({ ok: true });
+          return new Response(null, { status: 204 });
         } catch (error) {
           // Permanent vs transient distinction: permanent errors surface as
           // their own status so the sender drops instead of retrying.
