@@ -19,7 +19,6 @@ import {
   CLEANUP_RECORD_KEY,
   type CleanupRecord,
   cleanupTombstone,
-  correlationIndexKey,
   type ExpireQueueRunResult,
   type ExpireRunIndexesRequest,
   type ExpireRunIndexesResult,
@@ -31,7 +30,6 @@ import {
   type HookIndexReference,
   hookMarkerKey,
   INDEX_MARKER_PREFIX,
-  indexMarkerKey,
   type RunReadOutcome,
   type RunTombstone,
   type ScheduleCleanupRequest,
@@ -149,15 +147,6 @@ export class WorkflowRunDO extends DurableObject {
       if (!outcome.ok) return outcome;
 
       await txn.put('event_sequence', eventSequence);
-      if (outcome.event?.correlationId) {
-        const key = correlationIndexKey(
-          outcome.event.correlationId,
-          outcome.event.createdAt,
-          outcome.event.eventId,
-          request.runId,
-        );
-        await txn.put(indexMarkerKey(key), key);
-      }
       if (outcome.hookToIndex) {
         const reference = {
           hookId: outcome.hookToIndex.hookId,
@@ -401,6 +390,9 @@ export class WorkflowRunDO extends DurableObject {
       }
 
       if (cleanup.phase === 'index') {
+        // Older deployments wrote correlation-index keys plus per-run markers.
+        // New events no longer create either, but keep consuming old markers so
+        // retention still removes already-persisted global keys.
         const [indexMarkers, hookMarkers] = await Promise.all([
           this.ctx.storage.list<string>({ prefix: INDEX_MARKER_PREFIX }),
           this.ctx.storage.list<HookIndexReference>({ prefix: HOOK_MARKER_PREFIX }),

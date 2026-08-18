@@ -43,12 +43,7 @@ import { monotonicFactory } from 'ulid';
 import type { ApplyEventFailure, ApplyEventOutcome, ApplyEventRequest } from './apply-event.js';
 import type { HookTokenOwner, IndexNamespace } from './config.js';
 import { compact } from './util.js';
-import {
-  correlationIndexKey,
-  globalRunIndexKey,
-  type RunReadOutcome,
-  workflowRunIndexKey,
-} from './retention.js';
+import { globalRunIndexKey, type RunReadOutcome, workflowRunIndexKey } from './retention.js';
 
 /**
  * RPC surface of WorkflowRunDO used by the storage layer. Declared
@@ -419,19 +414,6 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             runId: effectiveRunId,
             hookId: released.hookId,
           });
-        }
-        if (outcome.event?.correlationId) {
-          const correlationKey = correlationIndexKey(
-            outcome.event.correlationId,
-            outcome.event.createdAt,
-            outcome.event.eventId,
-            effectiveRunId,
-          );
-          await env.WORKFLOW_INDEX.putOwned(
-            effectiveRunId,
-            correlationKey,
-            JSON.stringify({ runId: effectiveRunId, eventId: outcome.event.eventId }),
-          );
         }
 
         const eventPage =

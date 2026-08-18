@@ -2,6 +2,7 @@ import type { TerminalWorkflowRunStatus, WorkflowRun } from '@workflow/world';
 
 export const CLEANUP_RECORD_KEY = 'retention:cleanup';
 export const TOMBSTONE_KEY = 'retention:tombstone';
+/** Legacy correlation-index markers retained for upgrade cleanup compatibility. */
 export const INDEX_MARKER_PREFIX = 'retention:index:';
 export const HOOK_MARKER_PREFIX = 'retention:hook:';
 
@@ -85,19 +86,6 @@ export function workflowRunIndexKey(
 
 export function globalRunIndexKey(run: Pick<WorkflowRun, 'createdAt' | 'runId'>) {
   return `runall:${sortableTimestamp(run.createdAt)}:${run.runId}`;
-}
-
-export function correlationIndexKey(
-  correlationId: string,
-  createdAt: Date,
-  eventId: string,
-  runId: string,
-): string {
-  return `correlation:${encodeURIComponent(correlationId)}:${sortableTimestamp(createdAt)}:${eventId}:${runId}`;
-}
-
-export function indexMarkerKey(indexKey: string): string {
-  return `${INDEX_MARKER_PREFIX}${encodeURIComponent(indexKey)}`;
 }
 
 export function hookMarkerKey(reference: HookIndexReference): string {
