@@ -4,10 +4,12 @@
  */
 import { WorkflowRunNotFoundError } from '@workflow/errors';
 import { createConnection } from 'node:net';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { rpcStringify } from '../src/codec.js';
 import { createRemoteEnv } from '../src/remote/namespaces.js';
 import {
+  MAX_STREAM_CHUNK_BYTES,
+  MAX_STREAM_READ_BYTES,
   MAX_STREAM_WRITE_CHUNKS,
   STREAM_BATCH_CONTENT_TYPE,
   decodeStreamWriteBatch,
@@ -125,6 +127,15 @@ describe('router auth and shape', () => {
       body: new Uint8Array(),
     });
     expect(malformed.status).toBe(400);
+
+    const undersizedRead = await fetch(
+      `${harness.url}${path}&startIndex=0&maxChunks=1&maxBytes=${MAX_STREAM_CHUNK_BYTES - 1}&waitMs=0`,
+      { headers: { authorization: `Bearer ${SECRET}` } },
+    );
+    expect(undersizedRead.status).toBe(400);
+    await expect(undersizedRead.json()).resolves.toMatchObject({
+      error: { name: 'StreamProtocolError' },
+    });
   });
 
   it('400s malformed bodies', async () => {
@@ -432,8 +443,17 @@ describe('full stack: vendored storage over the wire', () => {
     expect(calls[1].body).toBeInstanceOf(Uint8Array);
     expect(decodeStreamWriteBatch(calls[1].body!)).toEqual(chunks);
 
-    calls.length = 0;
     const streamStorage = harness.fleet.cell('streams', `stream:${name}`).storage;
+    const storedPayloads = Array.from(streamStorage.data.entries())
+      .filter(([key]) => key.startsWith('chunk:'))
+      .map(([, value]) => value as Uint8Array);
+    expect(storedPayloads).toHaveLength(MAX_STREAM_WRITE_CHUNKS);
+    for (const chunk of storedPayloads) {
+      expect(chunk.byteOffset).toBe(0);
+      expect(chunk.buffer.byteLength).toBe(chunk.byteLength);
+    }
+
+    calls.length = 0;
     streamStorage.resetOperationCounts();
     await streamer.streams.writeMulti!(runId, name, chunks);
 
@@ -447,6 +467,7 @@ describe('full stack: vendored storage over the wire', () => {
     });
 
     calls.length = 0;
+    streamStorage.resetOperationCounts();
     const page = await streamer.getStreamChunks(name, runId, { limit: 32 });
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toContain('/v1/streams/');
@@ -454,6 +475,11 @@ describe('full stack: vendored storage over the wire', () => {
     expect(page.data.map((chunk) => Array.from(chunk.data))).toEqual(
       chunks.map((chunk) => Array.from(chunk)),
     );
+    expect(streamStorage.operationCounts).toMatchObject({
+      get: 0,
+      getMany: 2,
+      list: 0,
+    });
   });
 
   it('holds one idle public read and wakes it on close without storage polling', async () => {
@@ -489,5 +515,33 @@ describe('full stack: vendored storage over the wire', () => {
 
     await streamer.closeStream(name, runId);
     await expect(pending).resolves.toMatchObject({ done: true });
+  });
+
+  it('removes the DO waiter when an HTTP long-poll client disconnects', async () => {
+    const name = `stream:wire-abort-${Date.now()}`;
+    const runId = `wrun_abort_${Date.now()}`;
+    const controller = new AbortController();
+    const url = new URL(`${harness.url}/v1/streams/${encodeURIComponent(name)}/chunks`);
+    url.searchParams.set('runId', runId);
+    url.searchParams.set('startIndex', '0');
+    url.searchParams.set('maxChunks', '32');
+    url.searchParams.set('maxBytes', String(MAX_STREAM_READ_BYTES));
+    url.searchParams.set('waitMs', '1000');
+
+    const pending = fetch(url, {
+      headers: { authorization: `Bearer ${SECRET}` },
+      signal: controller.signal,
+    });
+    const waiterCount = () =>
+      (
+        harness.fleet.cell('streams', name).instance as unknown as {
+          waiters: Set<unknown>;
+        }
+      ).waiters.size;
+    await vi.waitFor(() => expect(waiterCount()).toBe(1));
+
+    controller.abort(new DOMException('test disconnect', 'AbortError'));
+    await expect(pending).rejects.toMatchObject({ name: 'AbortError' });
+    await vi.waitFor(() => expect(waiterCount()).toBe(0));
   });
 });

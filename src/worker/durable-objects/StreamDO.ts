@@ -1,5 +1,6 @@
 import type { ExpireRunStreamsResult, ExpireStreamResult } from '../../retention.js';
 import {
+  MAX_STREAM_CHUNK_BYTES,
   normalizeStreamError,
   validateStreamReadRequest,
   validateStreamWriteChunks,
@@ -31,6 +32,7 @@ interface StreamWaiter {
 
 const META_KEY = 'meta';
 const CHUNK_KEY_PREFIX = 'chunk:';
+const CHUNK_SIZE_KEY_PREFIX = 'chunk-size:';
 /** Registry keys used when this DO instance acts as a per-run stream index. */
 const STREAM_REGISTRY_PREFIX = 'stream:';
 const REGISTRY_OWNER_KEY = 'registry:owner';
@@ -59,6 +61,28 @@ function validateMeta(meta: StreamMeta): StreamMeta {
 /** Zero-padding keeps storage.list() results in stream offset order. */
 function chunkKey(index: number): string {
   return `${CHUNK_KEY_PREFIX}${index.toString().padStart(12, '0')}`;
+}
+
+function chunkSizeKey(index: number): string {
+  return `${CHUNK_SIZE_KEY_PREFIX}${index.toString().padStart(12, '0')}`;
+}
+
+function validateChunkSize(size: unknown, index: number): number {
+  if (
+    typeof size !== 'number' ||
+    !Number.isSafeInteger(size) ||
+    size < 0 ||
+    size > MAX_STREAM_CHUNK_BYTES
+  ) {
+    throw new Error(`Invalid persisted stream chunk size at index ${index}`);
+  }
+  return size;
+}
+
+function compactChunk(chunk: Uint8Array): Uint8Array {
+  return chunk.byteOffset === 0 && chunk.byteLength === chunk.buffer.byteLength
+    ? chunk
+    : new Uint8Array(chunk);
 }
 
 function abortReason(signal: AbortSignal): unknown {
@@ -180,16 +204,28 @@ export class StreamDO extends DurableObject {
         : Math.max(0, Math.min(request.maxChunks, meta.count - request.startIndex));
     const chunks: Uint8Array[] = [];
     if (available > 0) {
-      const entries = await this.ctx.storage.list<Uint8Array>({
-        prefix: CHUNK_KEY_PREFIX,
-        start: chunkKey(request.startIndex),
-        limit: available,
-      });
+      const indexes = Array.from({ length: available }, (_, offset) => request.startIndex + offset);
+      const sizeKeys = indexes.map(chunkSizeKey);
+      const storedSizes = await this.ctx.storage.get<number>(sizeKeys);
+      const selectedIndexes: number[] = [];
+      const selectedSizes: number[] = [];
       let bytes = 0;
-      for (const chunk of entries.values()) {
-        if (bytes + chunk.byteLength > request.maxBytes) break;
+      for (const index of indexes) {
+        const size = validateChunkSize(storedSizes.get(chunkSizeKey(index)), index);
+        if (bytes + size > request.maxBytes) break;
+        selectedIndexes.push(index);
+        selectedSizes.push(size);
+        bytes += size;
+      }
+
+      const payloadKeys = selectedIndexes.map(chunkKey);
+      const storedChunks = await this.ctx.storage.get<Uint8Array>(payloadKeys);
+      for (let offset = 0; offset < payloadKeys.length; offset++) {
+        const chunk = storedChunks.get(payloadKeys[offset]);
+        if (!(chunk instanceof Uint8Array) || chunk.byteLength !== selectedSizes[offset]) {
+          throw new Error(`Invalid persisted stream chunk at index ${selectedIndexes[offset]}`);
+        }
         chunks.push(chunk);
-        bytes += chunk.byteLength;
       }
     }
 
@@ -206,6 +242,7 @@ export class StreamDO extends DurableObject {
   /** Append one bounded binary batch with contiguous indexes. */
   async writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult> {
     validateStreamWriteChunks(chunks);
+    const storedChunks = chunks.map(compactChunk);
     return await this.runMutation(async () => {
       const committed = await this.ctx.storage.transaction(async (txn) => {
         const stored = await txn.get<StreamMeta>(META_KEY);
@@ -220,9 +257,11 @@ export class StreamDO extends DurableObject {
           state: 'open',
           ownerRunId: runId,
         };
-        const entries: Record<string, StreamMeta | Uint8Array> = { [META_KEY]: nextMeta };
-        for (let offset = 0; offset < chunks.length; offset++) {
-          entries[chunkKey(startIndex + offset)] = chunks[offset];
+        const entries: Record<string, StreamMeta | Uint8Array | number> = { [META_KEY]: nextMeta };
+        for (let offset = 0; offset < storedChunks.length; offset++) {
+          const index = startIndex + offset;
+          entries[chunkKey(index)] = storedChunks[offset];
+          entries[chunkSizeKey(index)] = storedChunks[offset].byteLength;
         }
         await txn.put(entries);
         return {
@@ -393,10 +432,13 @@ export class StreamDO extends DurableObject {
       this.wakeReaders();
 
       if (!fenced.alreadyDeleted) {
-        for (let offset = 0; offset < fenced.chunkCount; offset += RETENTION_DELETE_BATCH) {
+        const deleteIndexesPerBatch = Math.floor(RETENTION_DELETE_BATCH / 2);
+        for (let offset = 0; offset < fenced.chunkCount; offset += deleteIndexesPerBatch) {
           const keys: string[] = [];
-          const end = Math.min(fenced.chunkCount, offset + RETENTION_DELETE_BATCH);
-          for (let index = offset; index < end; index++) keys.push(chunkKey(index));
+          const end = Math.min(fenced.chunkCount, offset + deleteIndexesPerBatch);
+          for (let index = offset; index < end; index++) {
+            keys.push(chunkKey(index), chunkSizeKey(index));
+          }
           await this.ctx.storage.delete(keys);
         }
         const tombstone: StreamMeta = {

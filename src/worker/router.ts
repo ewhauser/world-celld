@@ -14,6 +14,7 @@ import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { rpcParse, rpcStringify } from '../codec.js';
 import {
   MAX_STREAM_BATCH_BYTES,
+  MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_LONG_POLL_MS,
   MAX_STREAM_READ_BYTES,
   MAX_STREAM_READ_CHUNKS,
@@ -212,7 +213,7 @@ export function createRouter(env: WorkerEnv) {
       if (!runId) return errorResponse(400, 'BadRequest', 'runId is required');
       const stub = namespace.get(namespace.idFromName(name)) as {
         writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult>;
-        readChunks(request: StreamReadRequest): Promise<StreamReadResult>;
+        readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult>;
       };
 
       try {
@@ -241,13 +242,21 @@ export function createRouter(env: WorkerEnv) {
         }
 
         if (request.method === 'GET') {
-          const result = await stub.readChunks({
-            runId,
-            startIndex: parseBoundedInteger(url, 'startIndex', 0, 0x7fffffff),
-            maxChunks: parseBoundedInteger(url, 'maxChunks', 0, MAX_STREAM_READ_CHUNKS),
-            maxBytes: parseBoundedInteger(url, 'maxBytes', 1, MAX_STREAM_READ_BYTES),
-            waitMs: parseBoundedInteger(url, 'waitMs', 0, MAX_STREAM_LONG_POLL_MS),
-          });
+          const result = await stub.readChunks(
+            {
+              runId,
+              startIndex: parseBoundedInteger(url, 'startIndex', 0, 0x7fffffff),
+              maxChunks: parseBoundedInteger(url, 'maxChunks', 0, MAX_STREAM_READ_CHUNKS),
+              maxBytes: parseBoundedInteger(
+                url,
+                'maxBytes',
+                MAX_STREAM_CHUNK_BYTES,
+                MAX_STREAM_READ_BYTES,
+              ),
+              waitMs: parseBoundedInteger(url, 'waitMs', 0, MAX_STREAM_LONG_POLL_MS),
+            },
+            request.signal,
+          );
           return streamResponse(encodeStreamReadResult(result));
         }
 

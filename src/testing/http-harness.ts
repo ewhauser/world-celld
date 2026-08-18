@@ -62,6 +62,17 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const router = createRouter(env);
 
   const server = http.createServer(async (req, res) => {
+    const requestAbort = new AbortController();
+    const abortRequest = () => {
+      if (!requestAbort.signal.aborted) {
+        requestAbort.abort(new DOMException('HTTP client disconnected', 'AbortError'));
+      }
+    };
+    const abortOnPrematureClose = () => {
+      if (!res.writableEnded) abortRequest();
+    };
+    req.once('aborted', abortRequest);
+    res.once('close', abortOnPrematureClose);
     try {
       const chunks: Buffer[] = [];
       for await (const chunk of req) {
@@ -72,13 +83,19 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
         method: req.method,
         headers: req.headers as Record<string, string>,
         body: req.method === 'GET' || req.method === 'HEAD' || body.length === 0 ? null : body,
+        signal: requestAbort.signal,
       });
       const response = await router(request);
+      if (requestAbort.signal.aborted || res.destroyed) return;
       res.writeHead(response.status, Object.fromEntries(response.headers.entries()));
       res.end(Buffer.from(await response.arrayBuffer()));
     } catch (error) {
+      if (requestAbort.signal.aborted || res.destroyed) return;
       res.writeHead(500, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: { name: 'HarnessError', message: String(error) } }));
+    } finally {
+      req.off('aborted', abortRequest);
+      res.off('close', abortOnPrematureClose);
     }
   });
 

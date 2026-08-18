@@ -6,7 +6,7 @@
 
 export const STREAM_BATCH_CONTENT_TYPE = 'application/vnd.world-celld.stream-batch.v1';
 
-/** One storage.put(entries) call remains below the 128-key platform limit. */
+/** Metadata plus payload and size-index entries remain below the 128-key platform limit. */
 export const MAX_STREAM_WRITE_CHUNKS = 32;
 /** A chunk remains below the 2 MiB SQLite-backed DO key/value limit. */
 export const MAX_STREAM_CHUNK_BYTES = 1024 * 1024;
@@ -111,10 +111,12 @@ export function validateStreamReadRequest(request: StreamReadRequest): void {
   }
   if (
     !Number.isSafeInteger(request.maxBytes) ||
-    request.maxBytes < 1 ||
+    request.maxBytes < MAX_STREAM_CHUNK_BYTES ||
     request.maxBytes > MAX_STREAM_READ_BYTES
   ) {
-    throw protocolError(`maxBytes must be between 1 and ${MAX_STREAM_READ_BYTES}`);
+    throw protocolError(
+      `maxBytes must be between ${MAX_STREAM_CHUNK_BYTES} and ${MAX_STREAM_READ_BYTES}`,
+    );
   }
   if (
     !Number.isSafeInteger(request.waitMs) ||
@@ -156,7 +158,10 @@ export function decodeStreamWriteBatch(encoded: Uint8Array): Uint8Array[] {
     const length = view.getUint32(offset);
     offset += 4;
     if (offset + length > encoded.byteLength) throw protocolError('truncated chunk data');
-    chunks.push(encoded.subarray(offset, offset + length));
+    // Persisted DO values are structured-cloned. A view would retain the
+    // complete batch backing buffer and could exceed the per-value storage
+    // limit even when this individual chunk is valid.
+    chunks.push(new Uint8Array(encoded.subarray(offset, offset + length)));
     offset += length;
   }
   if (offset !== encoded.byteLength) throw protocolError('trailing write data');

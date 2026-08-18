@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   MAX_STREAM_BATCH_BYTES,
+  MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_READ_BYTES,
   MAX_STREAM_WRITE_CHUNKS,
   type StreamReadRequest,
@@ -86,6 +87,63 @@ describe('StreamDO binary batch and long-poll protocol', () => {
         Array.from({ length: 9 }, () => oneMiB),
       ),
     ).rejects.toThrow(/batch exceeds/);
+  });
+
+  it('compacts direct-RPC subarrays before structured-clone storage', async () => {
+    const { fleet, get, name } = setup();
+    const backing = new Uint8Array(MAX_STREAM_CHUNK_BYTES + 64);
+    const chunk = backing.subarray(32, 32 + MAX_STREAM_CHUNK_BYTES);
+
+    await get().writeChunks(RUN_ID, [chunk]);
+
+    const stored = fleet.cell('streams', name).storage.data.get('chunk:000000000000') as Uint8Array;
+    expect(stored.byteLength).toBe(MAX_STREAM_CHUNK_BYTES);
+    expect(stored.byteOffset).toBe(0);
+    expect(stored.buffer.byteLength).toBe(MAX_STREAM_CHUNK_BYTES);
+  });
+
+  it('batch-fetches 32 small chunks without over-reading the byte budget', async () => {
+    const { fleet, get, name } = setup();
+    const chunks = Array.from({ length: MAX_STREAM_WRITE_CHUNKS }, (_, index) =>
+      new Uint8Array(MAX_STREAM_READ_BYTES / MAX_STREAM_WRITE_CHUNKS).fill(index),
+    );
+    await get().writeChunks(RUN_ID, chunks);
+    const storage = fleet.cell('streams', name).storage;
+    storage.resetOperationCounts();
+
+    const result = await get().readChunks(readRequest());
+
+    expect(result.chunks).toHaveLength(MAX_STREAM_WRITE_CHUNKS);
+    expect(result.chunks.map((chunk) => chunk[0])).toEqual(
+      Array.from({ length: MAX_STREAM_WRITE_CHUNKS }, (_, index) => index),
+    );
+    expect(storage.operationCounts).toMatchObject({
+      get: 0,
+      getMany: 2,
+      list: 0,
+    });
+  });
+
+  it('fetches only the payload prefix selected by the byte budget', async () => {
+    const { fleet, get, name } = setup();
+    const chunkBytes = MAX_STREAM_CHUNK_BYTES / 8;
+    await get().writeChunks(
+      RUN_ID,
+      Array.from({ length: 16 }, (_, index) => new Uint8Array(chunkBytes).fill(index)),
+    );
+    const storage = fleet.cell('streams', name).storage;
+    storage.resetOperationCounts();
+
+    const result = await get().readChunks(
+      readRequest({ maxBytes: MAX_STREAM_CHUNK_BYTES, maxChunks: 16 }),
+    );
+
+    expect(result.chunks).toHaveLength(8);
+    expect(storage.getManyCalls).toHaveLength(2);
+    expect(storage.getManyCalls[0]).toHaveLength(16);
+    expect(storage.getManyCalls[0].every((key) => key.startsWith('chunk-size:'))).toBe(true);
+    expect(storage.getManyCalls[1]).toHaveLength(8);
+    expect(storage.getManyCalls[1].every((key) => key.startsWith('chunk:'))).toBe(true);
   });
 
   it('times out one bounded idle read without polling storage', async () => {

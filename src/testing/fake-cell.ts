@@ -66,6 +66,7 @@ function applyListOptions(keys: string[], options: FakeListOptions): string[] {
 export class FakeStorage {
   data = new Map<string, unknown>();
   alarmAt: number | null = null;
+  readonly getManyCalls: string[][] = [];
   readonly operationCounts: FakeStorageOperationCounts = {
     get: 0,
     getMany: 0,
@@ -89,6 +90,7 @@ export class FakeStorage {
   async get<T>(keyOrKeys: string | string[]): Promise<T | undefined | Map<string, T>> {
     if (Array.isArray(keyOrKeys)) {
       this.operationCounts.getMany += 1;
+      this.getManyCalls.push([...keyOrKeys]);
       return new Map(
         keyOrKeys.filter((key) => this.data.has(key)).map((key) => [key, this.data.get(key) as T]),
       );
@@ -178,6 +180,7 @@ export class FakeStorage {
     for (const key of Object.keys(this.operationCounts) as (keyof FakeStorageOperationCounts)[]) {
       this.operationCounts[key] = 0;
     }
+    this.getManyCalls.length = 0;
   }
 
   /** @internal Used by FakeTransaction to count the same platform operations. */

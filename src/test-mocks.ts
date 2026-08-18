@@ -12,6 +12,8 @@ import type { HookTokenOwner } from './config.js';
 import type { EnqueueOutcome, EnqueueRequest, QueueCellStub } from './queue.js';
 import {
   normalizeStreamError,
+  validateStreamReadRequest,
+  validateStreamWriteChunks,
   type StreamErrorData,
   type StreamReadRequest,
   type StreamReadResult,
@@ -405,15 +407,15 @@ class MockStreamDOStub {
   }
 
   async writeChunks(runId: string, data: Uint8Array[]): Promise<StreamWriteResult> {
+    validateStreamWriteChunks(data);
     if (this.expired) throw new Error('Stream has expired');
     if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
     this.ownerRunId = runId;
     if (this.state !== 'open') {
       throw new Error('Cannot write to a closed stream');
     }
-    if (data.length === 0) throw new Error('Stream batch must not be empty');
     const startIndex = this.chunks.length;
-    this.chunks.push(...data.map((chunk) => structuredClone(chunk)));
+    this.chunks.push(...data.map((chunk) => new Uint8Array(chunk)));
     this.wake();
     return { startIndex, count: data.length, tailIndex: this.chunks.length - 1 };
   }
@@ -438,6 +440,7 @@ class MockStreamDOStub {
   }
 
   async readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult> {
+    validateStreamReadRequest(request);
     const snapshot = (timedOut: boolean): StreamReadResult => {
       let bytes = 0;
       const chunks: Uint8Array[] = [];
