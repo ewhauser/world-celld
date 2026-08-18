@@ -377,63 +377,12 @@ describe('QueueDO', () => {
     for (const key of Array.from(data.keys())) {
       if (key.startsWith('due:')) data.delete(key);
     }
-    data.set('inflight:msg_k', fleet.now - 1);
+    data.set(`${INFLIGHT_DEADLINE_PREFIX}${padded(fleet.now - 1)}:msg_k`, 'msg_k');
     fleet.cell('queue', 'q:0').storage.alarmAt = fleet.now;
 
     await tick(); // sweep moves it back to due
     await tick(); // next alarm delivers it
     expect(fetchStub).toHaveBeenCalledOnce();
-  });
-
-  it('migrates legacy inflight state without changing its deadline', async () => {
-    await queue.enqueue(enqueueReq({ messageId: 'msg_legacy', delaySeconds: 60 }));
-    const data = storage();
-    for (const key of Array.from(data.keys())) {
-      if (key.startsWith('due:')) data.delete(key);
-    }
-    const deadline = fleet.now + 30_000;
-    data.set('inflight:msg_legacy', deadline);
-    fleet.cell('queue', 'q:0').storage.alarmAt = null;
-
-    expect(await queue.rearmAlarm()).toEqual({ alarmAt: deadline });
-    expect(data.has('inflight:msg_legacy')).toBe(false);
-    expect(data.get(`${INFLIGHT_DEADLINE_PREFIX}${padded(deadline)}:msg_legacy`)).toBe(
-      'msg_legacy',
-    );
-
-    await tick(30_001);
-    expect(fetchStub).toHaveBeenCalledOnce();
-    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0 });
-  });
-
-  it('migrates large legacy inflight state across bounded alarm batches', async () => {
-    const data = storage();
-    const deadline = fleet.now + 60_000;
-    for (let index = 0; index < 130; index++) {
-      const messageId = `msg_legacy_${String(index).padStart(3, '0')}`;
-      data.set(`msg:${messageId}`, storedMessage(messageId, fleet.now));
-      data.set(`inflight:${messageId}`, deadline);
-    }
-    fleet.cell('queue', 'q:0').storage.alarmAt = fleet.now;
-
-    await tick();
-    expect(
-      Array.from(data.keys()).filter(
-        (key) => key.startsWith('inflight:') && !key.startsWith(INFLIGHT_DEADLINE_PREFIX),
-      ),
-    ).toHaveLength(2);
-    expect(
-      Array.from(data.keys()).filter((key) => key.startsWith(INFLIGHT_DEADLINE_PREFIX)),
-    ).toHaveLength(128);
-    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(fleet.now + 1);
-
-    await tick();
-    expect(Array.from(data.keys()).filter((key) => key.startsWith('inflight:'))).toHaveLength(0);
-    expect(
-      Array.from(data.keys()).filter((key) => key.startsWith(INFLIGHT_DEADLINE_PREFIX)),
-    ).toHaveLength(130);
-    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(deadline);
-    expect(fetchStub).not.toHaveBeenCalled();
   });
 
   it('uses the exact inflight key as a lease token against late callback completion', async () => {
@@ -674,7 +623,13 @@ describe('QueueDO', () => {
       if (key.startsWith('due:') && key.endsWith(':msg_inflight')) data.delete(key);
       if (key.startsWith('due:') && key.endsWith(':msg_dead')) data.delete(key);
     }
-    data.set('inflight:msg_inflight', fleet.now + 30_000);
+    const inflightKey = `${INFLIGHT_DEADLINE_PREFIX}${padded(fleet.now + 30_000)}:msg_inflight`;
+    data.set(inflightKey, 'msg_inflight');
+    data.set(`run:${runId}:msg_inflight`, {
+      messageId: 'msg_inflight',
+      inflightKey,
+      idempotencyKey: 'inflight-key',
+    });
     const dead = data.get('msg:msg_dead') as MessageRow;
     data.delete('msg:msg_dead');
     const deadKey = `dlq:${String(fleet.now).padStart(13, '0')}:msg_dead`;

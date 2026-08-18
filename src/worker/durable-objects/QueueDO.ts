@@ -16,7 +16,6 @@ import type { ExpireQueueRunResult } from '../../retention.js';
  *   due:<paddedMs>:<messageId>   schedule index -> messageId
  *   inflight-deadline:<paddedMs>:<messageId>
  *                                ordered crash-recovery index -> messageId
- *   inflight:<messageId>         legacy crash-recovery deadline (migrated in batches)
  *   key:<idempotencyKey>         active dedup claim -> messageId
  *   dlq:<paddedMs>:<messageId>   DeadLetterRow
  *   run:<runId>:<messageId>      QueueRunReference for retention cleanup
@@ -93,16 +92,12 @@ const DEFAULT_DELIVERY_TIMEOUT_MS = 300_000;
 const INFLIGHT_GRACE_MS = 30_000;
 /** Move overdue alarms to a new timestamp so celld observes a fresh edge. */
 const MIN_ALARM_DELAY_MS = 1;
-/** Bound deploy-time conversion of the legacy message-id-keyed inflight index. */
-const LEGACY_INFLIGHT_MIGRATION_BATCH = 128;
 /** Bound expiry recovery so one alarm cannot monopolize the cell. */
 const EXPIRED_INFLIGHT_BATCH = 128;
 
-const LEGACY_INFLIGHT_PREFIX = 'inflight:';
 const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
 
 type AlarmStorage = Pick<DurableObjectStorage, 'list' | 'getAlarm' | 'setAlarm' | 'deleteAlarm'>;
-type InflightMigrationStorage = Pick<DurableObjectStorage, 'list' | 'get' | 'put' | 'delete'>;
 
 function pad(ms: number): string {
   return String(Math.max(0, Math.floor(ms))).padStart(13, '0');
@@ -283,14 +278,6 @@ export class QueueDO extends DurableObject {
     const now = this.#now();
     const maxInflight = this.#intVar('QUEUE_MAX_INFLIGHT', DEFAULT_MAX_INFLIGHT);
     const claimed = await storage.transaction<InflightClaim[]>(async (txn) => {
-      // A rollout can inherit message-id-keyed inflight records. Convert a
-      // bounded page before doing normal work; if more remain, yield through a
-      // fresh alarm edge instead of scanning or migrating the whole set.
-      if (await this.#migrateLegacyInflight(txn)) {
-        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
-        return [];
-      }
-
       // 1. Recover: an inflight entry past its deadline is a lost delivery
       // (node crash, deploy restart) — back to due for redelivery.
       const expiredPage = await txn.list<string>({
@@ -521,52 +508,12 @@ export class QueueDO extends DurableObject {
     });
   }
 
-  /**
-   * Convert one bounded page of the legacy `inflight:<messageId>` layout.
-   * Returns true when another page remains, so callers can yield to a fresh
-   * alarm rather than monopolizing the cell during a deployment transition.
-   */
-  async #migrateLegacyInflight(storage: InflightMigrationStorage): Promise<boolean> {
-    const page = await storage.list<number>({
-      prefix: LEGACY_INFLIGHT_PREFIX,
-      limit: LEGACY_INFLIGHT_MIGRATION_BATCH + 1,
-    });
-    const entries = Array.from(page.entries()).slice(0, LEGACY_INFLIGHT_MIGRATION_BATCH);
-    for (const [legacyKey, deadline] of entries) {
-      const messageId = legacyKey.slice(LEGACY_INFLIGHT_PREFIX.length);
-      await storage.delete(legacyKey);
-      const row = await storage.get<MessageRow>(`msg:${messageId}`);
-      if (!row) continue;
-
-      const migratedKey = inflightKey(deadline, messageId);
-      await storage.put(migratedKey, messageId);
-      if (row.runId) {
-        await storage.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
-          messageId: row.messageId,
-          inflightKey: migratedKey,
-          idempotencyKey: row.idempotencyKey,
-        });
-      }
-    }
-    return page.size > LEGACY_INFLIGHT_MIGRATION_BATCH;
-  }
-
   /** Arm the alarm no later than `atMs` (durable backoff never throws). */
   async #armAlarmAtMost(storage: AlarmStorage, atMs: number, now: number): Promise<void> {
     const current = await storage.getAlarm();
     if (current !== null && current <= now) {
       await storage.setAlarm(now + MIN_ALARM_DELAY_MS);
       return;
-    }
-
-    // A normally armed legacy claim already has an alarm. If celld abandoned
-    // it, any fresh enqueue/redrive must wake the bounded migration promptly.
-    if (current === null) {
-      const legacy = await storage.list({ prefix: LEGACY_INFLIGHT_PREFIX, limit: 1 });
-      if (legacy.size > 0) {
-        await storage.setAlarm(now + MIN_ALARM_DELAY_MS);
-        return;
-      }
     }
 
     const target = atMs <= now ? now + MIN_ALARM_DELAY_MS : atMs;
@@ -577,14 +524,7 @@ export class QueueDO extends DurableObject {
 
   /** Recompute the alarm from the earliest due entry / inflight deadline. */
   async #rearm(): Promise<void> {
-    const now = this.#now();
-    await this.ctx.storage.transaction(async (txn) => {
-      if (await this.#migrateLegacyInflight(txn)) {
-        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
-        return;
-      }
-      await this.#scheduleNextAlarm(txn, now);
-    });
+    await this.#scheduleNextAlarm(this.ctx.storage, this.#now());
   }
 
   /** Keep the alarm index consistent with message state in the same transaction. */
@@ -613,16 +553,15 @@ export class QueueDO extends DurableObject {
 
   async stats(): Promise<QueueStats> {
     const storage = this.ctx.storage;
-    const [due, inflight, legacyInflight, dlq, alarmAt] = await Promise.all([
+    const [due, inflight, dlq, alarmAt] = await Promise.all([
       storage.list({ prefix: 'due:' }),
       storage.list({ prefix: INFLIGHT_DEADLINE_PREFIX }),
-      storage.list({ prefix: LEGACY_INFLIGHT_PREFIX }),
       storage.list({ prefix: 'dlq:' }),
       storage.getAlarm(),
     ]);
     return {
       pending: due.size,
-      inflight: inflight.size + legacyInflight.size,
+      inflight: inflight.size,
       deadLetters: dlq.size,
       alarmAt,
     };
@@ -724,9 +663,7 @@ export class QueueDO extends DurableObject {
       let count = existing?.deleted ?? 0;
       for (const [key, reference] of references) {
         await txn.delete(`msg:${reference.messageId}`);
-        await txn.delete(
-          reference.inflightKey ?? `${LEGACY_INFLIGHT_PREFIX}${reference.messageId}`,
-        );
+        if (reference.inflightKey) await txn.delete(reference.inflightKey);
         if (reference.dueKey) await txn.delete(reference.dueKey);
         if (reference.dlqKey) await txn.delete(reference.dlqKey);
         if (reference.idempotencyKey) {
