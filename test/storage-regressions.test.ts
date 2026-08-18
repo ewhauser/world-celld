@@ -226,6 +226,29 @@ describe('Storage regressions', () => {
     expect(result.cursor).toBeNull();
   });
 
+  it('does not let earlier non-terminal index metadata hide a later run status', async () => {
+    const completed = await createRun('stale-status-index');
+    await storage.events.create(completed.runId, {
+      eventType: 'run_completed',
+      eventData: { output: [] },
+    });
+
+    const entries = await mockEnv.WORKFLOW_INDEX.list({ prefix: 'run:stale-status-index:' });
+    const entry = entries.keys[0];
+    const metadata = JSON.parse(entry.value);
+    await mockEnv.WORKFLOW_INDEX.put(
+      entry.name,
+      JSON.stringify({ ...metadata, status: 'pending' }),
+    );
+
+    const result = await storage.runs.list({
+      workflowName: 'stale-status-index',
+      status: 'completed',
+    });
+
+    expect(result.data.map((run) => run.runId)).toEqual([completed.runId]);
+  });
+
   it('orders steps by creation time instead of step id', async () => {
     const run = await createRun('step-sort-order');
     await storage.events.create(run.runId, {

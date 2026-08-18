@@ -26,10 +26,10 @@ function ownerFromHook(raw: string): HookTokenOwner {
  * reservation, publication, and release use storage transactions so
  * concurrent runs cannot both acquire the same token.
  *
- * The RPC surface matches the storage-layer KVNamespace interface bit-for-bit
- * (including MockKVNamespace's pagination contract: cursor = last returned
- * key, `list_complete` reflects whether further keys exist), so the vendored
- * storage.ts works against it unchanged.
+ * The pagination contract matches KVNamespace (cursor = last returned key and
+ * `list_complete` reflects whether further keys exist). Unlike KVNamespace,
+ * list() also returns each stored value so callers do not need an additional
+ * RPC for every listed key.
  */
 export class IndexDO extends DurableObject {
   async get(key: string): Promise<string | null> {
@@ -62,7 +62,7 @@ export class IndexDO extends DurableObject {
     limit?: number;
     reverse?: boolean;
   }): Promise<{
-    keys: Array<{ name: string }>;
+    keys: Array<{ name: string; value: string }>;
     list_complete: boolean;
     cursor?: string;
   }> {
@@ -72,7 +72,7 @@ export class IndexDO extends DurableObject {
     // Fetch one extra key to learn whether the listing is complete without
     // advancing past the page (the "exact limit + list_complete" contract
     // storage.ts relies on).
-    const entries = await this.ctx.storage.list({
+    const entries = await this.ctx.storage.list<string>({
       prefix,
       ...(options?.reverse
         ? { reverse: true, end: options.cursor }
@@ -80,14 +80,13 @@ export class IndexDO extends DurableObject {
       limit: limit + 1,
     });
 
-    const names = Array.from(entries.keys());
-    const page = names.slice(0, limit);
-    const listComplete = names.length <= limit;
+    const page = Array.from(entries).slice(0, limit);
+    const listComplete = entries.size <= limit;
 
     return {
-      keys: page.map((name) => ({ name })),
+      keys: page.map(([name, value]) => ({ name, value })),
       list_complete: listComplete,
-      cursor: listComplete ? undefined : page.at(-1),
+      cursor: listComplete ? undefined : page.at(-1)?.[0],
     };
   }
 
