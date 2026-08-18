@@ -133,13 +133,22 @@ describe('Storage regressions', () => {
     });
   });
 
-  it('returns events that match listByCorrelationId', async () => {
+  it('returns run-scoped correlated events in event order across pages', async () => {
     const run = await createRun('correlation-index');
     const otherRun = await createRun('correlation-index');
-    await storage.events.create(run.runId, {
+    const created = await storage.events.create(run.runId, {
       eventType: 'step_created',
       correlationId: 'correlation-123',
       eventData: { stepName: 'correlated-step', input: [] },
+    });
+    const started = await storage.events.create(run.runId, {
+      eventType: 'step_started',
+      correlationId: 'correlation-123',
+    });
+    const completed = await storage.events.create(run.runId, {
+      eventType: 'step_completed',
+      correlationId: 'correlation-123',
+      eventData: { result: ['done'] },
     });
     await storage.events.create(otherRun.runId, {
       eventType: 'step_created',
@@ -147,18 +156,35 @@ describe('Storage regressions', () => {
       eventData: { stepName: 'other-run-step', input: [] },
     });
 
-    const result = await storage.events.listByCorrelationId({
+    const first = await storage.events.listByCorrelationId({
       runId: run.runId,
       correlationId: 'correlation-123',
-      pagination: { sortOrder: 'asc' },
+      pagination: { limit: 2, sortOrder: 'asc' },
     });
+    expect(first.data.map((event) => event.eventId)).toEqual([
+      created.event?.eventId,
+      started.event?.eventId,
+    ]);
+    expect(first).toMatchObject({ hasMore: true, cursor: started.event?.eventId });
 
-    expect(result.data).toHaveLength(1);
-    expect(result.data[0]).toMatchObject({
+    const second = await storage.events.listByCorrelationId({
       runId: run.runId,
       correlationId: 'correlation-123',
-      eventType: 'step_created',
+      pagination: { cursor: first.cursor ?? undefined, limit: 2, sortOrder: 'asc' },
     });
+    expect(second.data.map((event) => event.eventId)).toEqual([completed.event?.eventId]);
+    expect(second).toMatchObject({ hasMore: false, cursor: null });
+
+    const descending = await storage.events.listByCorrelationId({
+      runId: run.runId,
+      correlationId: 'correlation-123',
+      pagination: { limit: 3, sortOrder: 'desc' },
+    });
+    expect(descending.data.map((event) => event.eventId)).toEqual([
+      completed.event?.eventId,
+      started.event?.eventId,
+      created.event?.eventId,
+    ]);
   });
 
   it('uses dense Workflow 5 event slots and reports writes skipped by a stale replay', async () => {
