@@ -23,6 +23,23 @@ const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
 });
 
 const MIN_TEST_ALARM_DELAY_MS = 1;
+const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
+
+function padded(ms: number): string {
+  return String(Math.max(0, Math.floor(ms))).padStart(13, '0');
+}
+
+function storedMessage(messageId: string, now: number): MessageRow {
+  return {
+    messageId,
+    queueName: '__wkf_workflow_test',
+    pathname: 'flow',
+    body: '{"data":"payload"}',
+    targetBaseUrl: 'http://app.test:3000',
+    attempt: 0,
+    enqueuedAt: now,
+  };
+}
 
 describe('QueueDO', () => {
   let fleet: FakeFleet;
@@ -85,6 +102,86 @@ describe('QueueDO', () => {
     expect(fetchStub).toHaveBeenCalledTimes(2);
   });
 
+  it('orders inflight claims by deadline and keeps same-deadline message keys distinct', async () => {
+    const releases: Array<(response: Response) => void> = [];
+    fetchStub.mockImplementation(() => new Promise<Response>((resolve) => releases.push(resolve)));
+    await queue.enqueue(enqueueReq({ messageId: 'msg_same_a' }));
+    await queue.enqueue(enqueueReq({ messageId: 'msg_same_b' }));
+
+    const delivery = tick();
+    await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(2));
+
+    const claimKeys = Array.from(storage().keys()).filter((key) =>
+      key.startsWith(INFLIGHT_DEADLINE_PREFIX),
+    );
+    expect(claimKeys).toHaveLength(2);
+    expect(claimKeys.map((key) => key.slice(INFLIGHT_DEADLINE_PREFIX.length, -11))).toEqual([
+      padded(fleet.now + 330_000),
+      padded(fleet.now + 330_000),
+    ]);
+    expect(claimKeys).toEqual([
+      `${INFLIGHT_DEADLINE_PREFIX}${padded(fleet.now + 330_000)}:msg_same_a`,
+      `${INFLIGHT_DEADLINE_PREFIX}${padded(fleet.now + 330_000)}:msg_same_b`,
+    ]);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(fleet.now + 330_000);
+
+    for (const release of releases) release(new Response(null, { status: 204 }));
+    await delivery;
+  });
+
+  it('reschedules the alarm to the next due message after ack', async () => {
+    let finishDelivery!: (response: Response) => void;
+    fetchStub.mockImplementation(
+      () => new Promise<Response>((resolve) => (finishDelivery = resolve)),
+    );
+    await queue.enqueue(enqueueReq({ messageId: 'msg_ack_first' }));
+
+    const delivery = tick();
+    await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
+    const nextDueAt = fleet.now + 600_000;
+    await queue.enqueue(enqueueReq({ messageId: 'msg_ack_next', delaySeconds: 600 }));
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(fleet.now + 330_000);
+
+    finishDelivery(new Response(null, { status: 204 }));
+    await delivery;
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(nextDueAt);
+  });
+
+  it('reschedules the alarm to retry backoff after a transient callback', async () => {
+    fetchStub.mockResolvedValue(new Response('retry', { status: 500 }));
+    await queue.enqueue(enqueueReq({ messageId: 'msg_retry_alarm' }));
+
+    await tick();
+
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(fleet.now + 2_000);
+    expect(
+      Array.from(storage().keys()).some(
+        (key) => key === `due:${padded(fleet.now + 2_000)}:msg_retry_alarm`,
+      ),
+    ).toBe(true);
+  });
+
+  it.each([
+    ['successful', 200],
+    ['permanent-error', 410],
+    ['transient-error', 500],
+  ])('cancels an unused %s callback response body', async (_label, status) => {
+    const cancel = vi.fn<(reason?: unknown) => void>();
+    fetchStub.mockResolvedValue(
+      new Response(
+        new ReadableStream({
+          cancel,
+        }),
+        { status },
+      ),
+    );
+    await queue.enqueue(enqueueReq({ messageId: `msg_cancel_${status}` }));
+
+    await tick();
+
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
   it('recovers when enqueue persistence is interrupted before the due index is written', async () => {
     const request = enqueueReq({
       messageId: 'msg_atomic_enqueue',
@@ -109,7 +206,10 @@ describe('QueueDO', () => {
     await queue.enqueue(enqueueReq({ messageId: 'msg_atomic_ack', idempotencyKey: 'atomic-ack' }));
     const cellStorage = fleet.cell('queue', 'q:0').storage;
     cellStorage.failNextMutation(
-      (mutation) => mutation.operation === 'delete' && mutation.key === 'inflight:msg_atomic_ack',
+      (mutation) =>
+        mutation.operation === 'delete' &&
+        mutation.key.startsWith('inflight-deadline:') &&
+        mutation.key.endsWith(':msg_atomic_ack'),
       new Error('injected crash during ack'),
     );
 
@@ -118,7 +218,9 @@ describe('QueueDO', () => {
     const data = storage();
     const messageIsRecoverable = data.has('msg:msg_atomic_ack');
     const acknowledgementFullyCommitted =
-      !data.has('inflight:msg_atomic_ack') && !data.has('key:atomic-ack');
+      !Array.from(data.keys()).some(
+        (key) => key.startsWith('inflight-deadline:') && key.endsWith(':msg_atomic_ack'),
+      ) && !data.has('key:atomic-ack');
     expect(messageIsRecoverable || acknowledgementFullyCommitted).toBe(true);
   });
 
@@ -281,6 +383,154 @@ describe('QueueDO', () => {
     await tick(); // sweep moves it back to due
     await tick(); // next alarm delivers it
     expect(fetchStub).toHaveBeenCalledOnce();
+  });
+
+  it('migrates legacy inflight state without changing its deadline', async () => {
+    await queue.enqueue(enqueueReq({ messageId: 'msg_legacy', delaySeconds: 60 }));
+    const data = storage();
+    for (const key of Array.from(data.keys())) {
+      if (key.startsWith('due:')) data.delete(key);
+    }
+    const deadline = fleet.now + 30_000;
+    data.set('inflight:msg_legacy', deadline);
+    fleet.cell('queue', 'q:0').storage.alarmAt = null;
+
+    expect(await queue.rearmAlarm()).toEqual({ alarmAt: deadline });
+    expect(data.has('inflight:msg_legacy')).toBe(false);
+    expect(data.get(`${INFLIGHT_DEADLINE_PREFIX}${padded(deadline)}:msg_legacy`)).toBe(
+      'msg_legacy',
+    );
+
+    await tick(30_001);
+    expect(fetchStub).toHaveBeenCalledOnce();
+    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0 });
+  });
+
+  it('migrates large legacy inflight state across bounded alarm batches', async () => {
+    const data = storage();
+    const deadline = fleet.now + 60_000;
+    for (let index = 0; index < 130; index++) {
+      const messageId = `msg_legacy_${String(index).padStart(3, '0')}`;
+      data.set(`msg:${messageId}`, storedMessage(messageId, fleet.now));
+      data.set(`inflight:${messageId}`, deadline);
+    }
+    fleet.cell('queue', 'q:0').storage.alarmAt = fleet.now;
+
+    await tick();
+    expect(
+      Array.from(data.keys()).filter(
+        (key) => key.startsWith('inflight:') && !key.startsWith(INFLIGHT_DEADLINE_PREFIX),
+      ),
+    ).toHaveLength(2);
+    expect(
+      Array.from(data.keys()).filter((key) => key.startsWith(INFLIGHT_DEADLINE_PREFIX)),
+    ).toHaveLength(128);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(fleet.now + 1);
+
+    await tick();
+    expect(Array.from(data.keys()).filter((key) => key.startsWith('inflight:'))).toHaveLength(0);
+    expect(
+      Array.from(data.keys()).filter((key) => key.startsWith(INFLIGHT_DEADLINE_PREFIX)),
+    ).toHaveLength(130);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(deadline);
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('uses the exact inflight key as a lease token against late callback completion', async () => {
+    const finishes: Array<(response: Response) => void> = [];
+    fetchStub.mockImplementation(() => new Promise<Response>((resolve) => finishes.push(resolve)));
+    fleet = new FakeFleet(
+      { queue: QueueDO },
+      {
+        clock: () => fleet.now,
+        fetch: fetchStub,
+        QUEUE_DELIVERY_TIMEOUT_MS: '10',
+      },
+    );
+    queue = fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
+    storage = () => fleet.cell('queue', 'q:0').storage.data;
+    await queue.enqueue(enqueueReq({ messageId: 'msg_lease' }));
+
+    await queue.alarm();
+    await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
+    const firstClaim = Array.from(storage().keys()).find((key) =>
+      key.startsWith(INFLIGHT_DEADLINE_PREFIX),
+    )!;
+
+    fleet.advance(30_011);
+    await queue.alarm();
+    await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledTimes(2));
+    const pendingDeliveries = fleet.cell('queue', 'q:0').pendingWaits;
+    const secondClaim = Array.from(storage().keys()).find((key) =>
+      key.startsWith(INFLIGHT_DEADLINE_PREFIX),
+    )!;
+    expect(secondClaim).not.toBe(firstClaim);
+
+    finishes[0](new Response(null, { status: 204 }));
+    await pendingDeliveries[0];
+    expect(storage().has('msg:msg_lease')).toBe(true);
+    expect(storage().has(secondClaim)).toBe(true);
+
+    finishes[1](new Response(null, { status: 204 }));
+    await pendingDeliveries[1];
+    expect(storage().has('msg:msg_lease')).toBe(false);
+    expect(storage().has(secondClaim)).toBe(false);
+  });
+
+  it('processes expired inflight records in bounded alarm batches', async () => {
+    const data = storage();
+    const expiredDeadline = fleet.now - 1;
+    for (let index = 0; index < 130; index++) {
+      const messageId = `msg_expired_${String(index).padStart(3, '0')}`;
+      data.set(`msg:${messageId}`, storedMessage(messageId, fleet.now));
+      data.set(`${INFLIGHT_DEADLINE_PREFIX}${padded(expiredDeadline)}:${messageId}`, messageId);
+    }
+    fleet.cell('queue', 'q:0').storage.alarmAt = fleet.now;
+
+    await tick();
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(Array.from(data.keys()).filter((key) => key.startsWith('due:'))).toHaveLength(128);
+    expect(
+      Array.from(data.keys()).filter((key) => key.startsWith(INFLIGHT_DEADLINE_PREFIX)),
+    ).toHaveLength(2);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBe(fleet.now + 1);
+
+    await tick();
+    expect(fetchStub).toHaveBeenCalledTimes(5);
+    expect(
+      Array.from(data.keys()).filter(
+        (key) => key.startsWith(INFLIGHT_DEADLINE_PREFIX) && key.includes(padded(expiredDeadline)),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('bounds inflight alarm work by expired records, concurrency, and the earliest key', async () => {
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    const data = cellStorage.data;
+    const expiredDeadline = fleet.now - 1;
+    for (const messageId of ['msg_expired_a', 'msg_expired_b']) {
+      data.set(`msg:${messageId}`, storedMessage(messageId, fleet.now));
+      data.set(`${INFLIGHT_DEADLINE_PREFIX}${padded(expiredDeadline)}:${messageId}`, messageId);
+    }
+    for (let index = 0; index < 1_000; index++) {
+      const messageId = `msg_active_${String(index).padStart(4, '0')}`;
+      data.set(
+        `${INFLIGHT_DEADLINE_PREFIX}${padded(fleet.now + 60_000 + index)}:${messageId}`,
+        messageId,
+      );
+    }
+    cellStorage.alarmAt = fleet.now;
+    cellStorage.listCalls.length = 0;
+
+    await tick();
+
+    const inflightCalls = cellStorage.listCalls.filter(
+      (call) => call.options.prefix === INFLIGHT_DEADLINE_PREFIX,
+    );
+    expect(inflightCalls.map((call) => call.options.limit)).toEqual([129, 5, 1]);
+    expect(inflightCalls.map((call) => call.resultSize)).toEqual([2, 5, 1]);
+    expect(inflightCalls.every((call) => call.transactional)).toBe(true);
+    expect(fetchStub).not.toHaveBeenCalled();
   });
 
   it('rejects shard-count drift with CONFIG_MISMATCH', async () => {
@@ -480,6 +730,16 @@ describe('QueueDO', () => {
 
     const { alarmAt } = await queue.rearmAlarm();
     expect(alarmAt).toBe(fleet.now + 60_000);
+  });
+
+  it('rearmAlarm selects the earliest lexicographic inflight deadline', async () => {
+    const data = storage();
+    const early = fleet.now + 10_000;
+    const late = fleet.now + 90_000;
+    data.set(`${INFLIGHT_DEADLINE_PREFIX}${padded(late)}:msg_late`, 'msg_late');
+    data.set(`${INFLIGHT_DEADLINE_PREFIX}${padded(early)}:msg_early`, 'msg_early');
+
+    expect(await queue.rearmAlarm()).toEqual({ alarmAt: early });
   });
 
   it('moves an overdue alarm to a fresh timestamp so celld observes a new edge', async () => {

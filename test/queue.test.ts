@@ -43,6 +43,7 @@ describe('Queue (celld QueueDO integration)', () => {
   afterEach(() => {
     process.env.VITEST = originalVitest;
     process.env.NODE_ENV = originalNodeEnv;
+    vi.unstubAllGlobals();
     vi.clearAllMocks();
   });
 
@@ -201,6 +202,24 @@ describe('Queue (celld QueueDO integration)', () => {
       );
       expect(third.messageId).not.toBe(first.messageId);
     });
+
+    it('should cancel an unused successful callback response body', async () => {
+      const cancel = vi.fn<(reason?: unknown) => void>();
+      const fetchStub = vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(
+          new ReadableStream({
+            cancel,
+          }),
+          { status: 200 },
+        ),
+      );
+      vi.stubGlobal('fetch', fetchStub);
+
+      await queue.start();
+      await queue.queue('__wkf_workflow_q', { data: 'test' });
+
+      await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    });
   });
 
   describe('createQueueHandler() (single x-vqs dialect)', () => {
@@ -217,7 +236,9 @@ describe('Queue (celld QueueDO integration)', () => {
 
       const response = await queueHandler(vqsRequest({ data: 'test-data' }));
 
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(204);
+      expect(response.body).toBeNull();
+      await expect(response.text()).resolves.toBe('');
       expect(handler).toHaveBeenCalledOnce();
       expect(handler).toHaveBeenCalledWith(
         { data: 'test-data' },
@@ -236,7 +257,7 @@ describe('Queue (celld QueueDO integration)', () => {
       const input = new Uint8Array([9, 8, 7]);
       const response = await queueHandler(vqsRequest({ runInput: { input } }));
 
-      expect(response.status).toBe(200);
+      expect(response.status).toBe(204);
       const [message] = handler.mock.calls[0];
       expect(message.runInput.input).toBeInstanceOf(Uint8Array);
       expect(Array.from(message.runInput.input)).toEqual([9, 8, 7]);
