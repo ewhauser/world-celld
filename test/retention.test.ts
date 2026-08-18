@@ -1,6 +1,7 @@
 import { HookNotFoundError, RunExpiredError } from '@workflow/errors';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../src/index.js';
+import { INDEX_MARKER_PREFIX } from '../src/retention.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import type { IndexDO } from '../src/worker/durable-objects/IndexDO.js';
 import type { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
@@ -78,6 +79,18 @@ describe('terminal workflow retention', () => {
       { runId },
       { delaySeconds: 3_600, idempotencyKey: `wake:${runId}` },
     );
+    // Simulate an index and marker written by an older deployment. New
+    // correlated events create neither, but retention must still clean old
+    // persisted state after an in-place upgrade.
+    const legacyCorrelationKey = `correlation:legacy:1:evnt_legacy:${runId}`;
+    const index = harness.fleet.namespace('index').get({ toString: () => 'index' }) as IndexDO;
+    await index.putOwned(runId, legacyCorrelationKey, JSON.stringify({ runId }));
+    await harness.fleet
+      .cell('runs', runId)
+      .storage.put(
+        `${INDEX_MARKER_PREFIX}${encodeURIComponent(legacyCorrelationKey)}`,
+        legacyCorrelationKey,
+      );
     await finishRun(world, runId);
 
     const retained = await world.runs.get(runId);
@@ -106,6 +119,7 @@ describe('terminal workflow retention', () => {
     await expect(world.hooks.getByToken('retention-token')).rejects.toSatisfy((error) =>
       HookNotFoundError.is(error),
     );
+    expect(await index.get(legacyCorrelationKey)).toBeNull();
 
     const listed = await world.runs.list({ workflowName: 'retention-complete' });
     expect(listed.data).toEqual([]);

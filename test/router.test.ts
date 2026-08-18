@@ -193,6 +193,89 @@ describe('full stack: vendored storage over the wire', () => {
     expect(listed.data.some((r) => r.runId === runId)).toBe(true);
   });
 
+  it('creates a correlated event with one public RPC and no unused index mutations', async () => {
+    let publicRpcs = 0;
+    const paths = new Map<string, number>();
+    const countedFetch: typeof fetch = async (input, init) => {
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      publicRpcs++;
+      paths.set(url.pathname, (paths.get(url.pathname) ?? 0) + 1);
+      return fetch(input, init);
+    };
+    const env = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: countedFetch,
+    });
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-test',
+    });
+    const created = await storage.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'wire-test',
+        workflowName: 'wire-correlation-fanout',
+        input: [],
+      },
+    });
+
+    publicRpcs = 0;
+    paths.clear();
+    const runStorage = harness.fleet.cell('runs', created.run.runId).storage;
+    const indexStorage = harness.fleet.cell('index', 'index').storage;
+    const runMutations: string[] = [];
+    const indexMutations: string[] = [];
+    const originalRunMutation = runStorage.maybeFailMutation.bind(runStorage);
+    const originalIndexMutation = indexStorage.maybeFailMutation.bind(indexStorage);
+    runStorage.maybeFailMutation = (mutation) => {
+      runMutations.push(`${mutation.operation}:${mutation.key}`);
+      originalRunMutation(mutation);
+    };
+    indexStorage.maybeFailMutation = (mutation) => {
+      indexMutations.push(`${mutation.operation}:${mutation.key}`);
+      originalIndexMutation(mutation);
+    };
+
+    try {
+      await storage.events.create(created.run.runId, {
+        eventType: 'step_created',
+        correlationId: 'wire-step',
+        eventData: { stepName: 'wire-step', input: [] },
+      });
+    } finally {
+      runStorage.maybeFailMutation = originalRunMutation;
+      indexStorage.maybeFailMutation = originalIndexMutation;
+    }
+
+    expect(publicRpcs).toBe(1);
+    expect(paths).toEqual(new Map([[`/v1/rpc/runs/${created.run.runId}/applyEvent`, 1]]));
+    expect(runMutations).toHaveLength(4);
+    expect(runMutations).not.toContainEqual(expect.stringContaining('retention:index:'));
+    expect(indexMutations).toEqual([]);
+    expect(
+      Array.from(indexStorage.data.keys()).filter(
+        (key) => key.startsWith('correlation:') && key.endsWith(`:${created.run.runId}`),
+      ),
+    ).toEqual([]);
+
+    publicRpcs = 0;
+    paths.clear();
+    const correlated = await storage.events.listByCorrelationId({
+      runId: created.run.runId,
+      correlationId: 'wire-step',
+      pagination: { sortOrder: 'asc' },
+    });
+    expect(correlated.data).toHaveLength(1);
+    expect(correlated.data[0]).toMatchObject({
+      runId: created.run.runId,
+      correlationId: 'wire-step',
+      eventType: 'step_created',
+    });
+    expect(publicRpcs).toBe(1);
+    expect(paths).toEqual(new Map([[`/v1/rpc/runs/${created.run.runId}/listEvents`, 1]]));
+  });
+
   it('lists runs with N+1 public RPCs, bounded run fanout, and value-bearing index pages', async () => {
     let publicRpcs = 0;
     let activeRunReads = 0;
