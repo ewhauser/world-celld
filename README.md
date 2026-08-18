@@ -158,7 +158,7 @@ The deployed worker also accepts these celld variables:
 | `WORLD_SECRET`              | none     | Required bearer secret for RPC routes                |
 | `WORKFLOW_CALLBACK_SECRET`  | none     | Sent with deliveries as `x-workflow-callback-secret` |
 | `QUEUE_MAX_ATTEMPTS`        | `5`      | Attempts before a message is dead-lettered           |
-| `QUEUE_MAX_INFLIGHT`        | `5`      | Concurrent deliveries per queue cell                 |
+| `QUEUE_MAX_INFLIGHT`        | `5`      | Concurrent deliveries per queue cell (maximum `128`) |
 | `QUEUE_DELIVERY_TIMEOUT_MS` | `300000` | Timeout for an application callback                  |
 
 `queueShards` is part of queue placement and is pinned when a queue cell is
@@ -173,8 +173,13 @@ pending runs are never eligible for automatic cleanup.
 
 At expiration, the run cell fences new writes and removes the run's derived
 indexes, stream chunks, pending and dead-letter queue messages, and durable run
-payloads. Cleanup is a persisted, idempotent state machine: an interrupted
-phase records its error and re-arms itself with capped backoff.
+payloads. Cleanup is a persisted, idempotent state machine. Each alarm processes
+one bounded page, persists its progress, and re-arms the next alarm; an
+interrupted phase records its error and retries with capped backoff.
+
+Terminal hook and wait disposal uses the same alarm mechanism even when run
+retention is disabled, so a terminal event never performs an unbounded storage
+transaction.
 
 The final state is a metadata-only tombstone, not an empty cell. It prevents a
 delayed queue delivery or stale RPC from recreating an expired run. Reads and
@@ -201,6 +206,8 @@ an existing terminal run that has no cleanup record.
   must be idempotent.
 - Queue cells expose `stats`, `listDeadLetters`, `redriveDeadLetter`,
   `purgeDeadLetters`, and `rearmAlarm` through the authenticated RPC endpoint.
+  `purgeDeadLetters` deletes at most 128 entries per call; repeat it while its
+  result reports `hasMore`.
 - Run cells expose retention status, scheduling, immediate cleanup, and alarm
   recovery through `world.retention`.
 - A new application URL applies to newly enqueued messages. Existing messages

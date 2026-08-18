@@ -409,10 +409,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         } else if (hookReservation && data.eventType === 'hook_created') {
           await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
         }
-        for (const released of outcome.releasedHooks) {
-          await env.WORKFLOW_INDEX.deleteHookIndexes(released.token, released.hookId, {
+        const terminal = Boolean(outcome.run && isTerminalWorkflowRunStatus(outcome.run.status));
+        if (terminal || outcome.releasedHooks.length > 0) {
+          await env.WORKFLOW_INDEX.releaseHookIndexes({
             runId: effectiveRunId,
-            hookId: released.hookId,
+            hooks: outcome.releasedHooks,
+            terminal,
           });
         }
 

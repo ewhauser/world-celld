@@ -2,11 +2,43 @@ import type { Hook } from '@workflow/world';
 import type { HookTokenOwner } from '../../config.js';
 import { parse } from '../../vendor/shared/index.js';
 import { DurableObject } from '../do-base.js';
-import type { ExpireRunIndexesRequest, ExpireRunIndexesResult } from '../../retention.js';
+import type {
+  ExpireRunIndexesRequest,
+  ExpireRunIndexesResult,
+  HookIndexReference,
+  ReleaseHookIndexesRequest,
+  ReleaseHookIndexesResult,
+} from '../../retention.js';
 
 interface HookClaim {
   owner: HookTokenOwner;
   reservedAt: number;
+}
+
+const STORAGE_BATCH_SIZE = 128;
+const MAX_INDEX_CLEANUP_KEYS = 66;
+const MAX_INDEX_CLEANUP_HOOKS = 64;
+const MAX_INDEX_LIST_SIZE = 1000;
+
+async function getMany<T>(
+  storage: DurableObjectTransaction,
+  keys: string[],
+): Promise<Map<string, T>> {
+  const result = new Map<string, T>();
+  for (let offset = 0; offset < keys.length; offset += STORAGE_BATCH_SIZE) {
+    const page = await storage.get<T>(keys.slice(offset, offset + STORAGE_BATCH_SIZE));
+    for (const [key, value] of page) result.set(key, value);
+  }
+  return result;
+}
+
+async function deleteMany(storage: DurableObjectTransaction, keys: string[]): Promise<number> {
+  let deleted = 0;
+  const unique = Array.from(new Set(keys));
+  for (let offset = 0; offset < unique.length; offset += STORAGE_BATCH_SIZE) {
+    deleted += await storage.delete(unique.slice(offset, offset + STORAGE_BATCH_SIZE));
+  }
+  return deleted;
 }
 
 function sameOwner(left: HookTokenOwner, right: HookTokenOwner): boolean {
@@ -16,6 +48,39 @@ function sameOwner(left: HookTokenOwner, right: HookTokenOwner): boolean {
 function ownerFromHook(raw: string): HookTokenOwner {
   const hook = parse<Hook>(raw);
   return { runId: hook.runId, hookId: hook.hookId };
+}
+
+async function ownedHookIndexDeletes(
+  txn: DurableObjectTransaction,
+  runId: string,
+  hooks: HookIndexReference[],
+): Promise<string[]> {
+  const hookKeys = hooks.flatMap((hook) => [
+    `hook:${hook.token}`,
+    `hookid:${hook.hookId}`,
+    `hookclaim:${hook.token}`,
+  ]);
+  const values = await getMany<string | HookClaim>(txn, hookKeys);
+  const deletes: string[] = [];
+  for (const hook of hooks) {
+    const owner = { runId, hookId: hook.hookId };
+    const tokenKey = `hook:${hook.token}`;
+    const idKey = `hookid:${hook.hookId}`;
+    const claimKey = `hookclaim:${hook.token}`;
+    const byToken = values.get(tokenKey) as string | undefined;
+    const byId = values.get(idKey) as string | undefined;
+    const claim = values.get(claimKey) as HookClaim | undefined;
+    if (byToken !== undefined && sameOwner(ownerFromHook(byToken), owner)) {
+      deletes.push(tokenKey);
+    }
+    if (byId !== undefined && sameOwner(ownerFromHook(byId), owner)) {
+      deletes.push(idKey);
+    }
+    if (claim !== undefined && sameOwner(claim.owner, owner)) {
+      deletes.push(claimKey);
+    }
+  }
+  return deletes;
 }
 
 /**
@@ -34,6 +99,14 @@ function ownerFromHook(raw: string): HookTokenOwner {
 export class IndexDO extends DurableObject {
   async get(key: string): Promise<string | null> {
     const value = await this.ctx.storage.get<string>(key);
+    if (value && (key.startsWith('hook:') || key.startsWith('hookid:'))) {
+      const owner = ownerFromHook(value);
+      const fences = await this.ctx.storage.get([
+        `terminal:${owner.runId}`,
+        `expired:${owner.runId}`,
+      ]);
+      if (fences.size > 0) return null;
+    }
     return value ?? null;
   }
 
@@ -67,7 +140,12 @@ export class IndexDO extends DurableObject {
     cursor?: string;
   }> {
     const prefix = options?.prefix ?? '';
-    const limit = options?.limit ?? 1000;
+    const suppliedLimit = options?.limit;
+    const requestedLimit =
+      typeof suppliedLimit === 'number' && Number.isFinite(suppliedLimit)
+        ? Math.floor(suppliedLimit)
+        : MAX_INDEX_LIST_SIZE;
+    const limit = Math.min(MAX_INDEX_LIST_SIZE, Math.max(1, requestedLimit));
 
     // Fetch one extra key to learn whether the listing is complete without
     // advancing past the page (the "exact limit + list_complete" contract
@@ -95,14 +173,15 @@ export class IndexDO extends DurableObject {
     owner: HookTokenOwner,
   ): Promise<{ claimed: boolean; holder?: HookTokenOwner }> {
     return this.ctx.storage.transaction(async (txn) => {
-      const indexedHook = await txn.get<string>(`hook:${token}`);
+      const claimKey = `hookclaim:${token}`;
+      const values = await txn.get<string | HookClaim>([`hook:${token}`, claimKey]);
+      const indexedHook = values.get(`hook:${token}`) as string | undefined;
       if (indexedHook !== undefined) {
         const holder = ownerFromHook(indexedHook);
         return { claimed: false, holder };
       }
 
-      const claimKey = `hookclaim:${token}`;
-      const claim = await txn.get<HookClaim>(claimKey);
+      const claim = values.get(claimKey) as HookClaim | undefined;
       if (claim !== undefined && !sameOwner(claim.owner, owner)) {
         return { claimed: false, holder: claim.owner };
       }
@@ -119,24 +198,32 @@ export class IndexDO extends DurableObject {
     owner: HookTokenOwner,
   ): Promise<void> {
     await this.ctx.storage.transaction(async (txn) => {
-      if ((await txn.get(`expired:${owner.runId}`)) !== undefined) {
-        const claim = await txn.get<HookClaim>(`hookclaim:${token}`);
+      const expiredKey = `expired:${owner.runId}`;
+      const terminalKey = `terminal:${owner.runId}`;
+      const tokenKey = `hook:${token}`;
+      const claimKey = `hookclaim:${token}`;
+      const values = await txn.get<number | string | HookClaim>([
+        expiredKey,
+        terminalKey,
+        tokenKey,
+        claimKey,
+      ]);
+      const claim = values.get(claimKey) as HookClaim | undefined;
+      if (values.get(expiredKey) !== undefined || values.get(terminalKey) !== undefined) {
         if (claim !== undefined && sameOwner(claim.owner, owner)) {
-          await txn.delete(`hookclaim:${token}`);
+          await txn.delete(claimKey);
         }
         return;
       }
-      const indexedHook = await txn.get<string>(`hook:${token}`);
+      const indexedHook = values.get(tokenKey) as string | undefined;
       if (indexedHook !== undefined && !sameOwner(ownerFromHook(indexedHook), owner)) {
         throw new Error(`Hook token ${token} is owned by another hook`);
       }
-      const claim = await txn.get<HookClaim>(`hookclaim:${token}`);
       if (claim !== undefined && !sameOwner(claim.owner, owner)) {
         throw new Error(`Hook token ${token} is reserved by another hook`);
       }
 
-      await txn.put(`hook:${token}`, serializedHook);
-      await txn.put(`hookid:${hookId}`, serializedHook);
+      await txn.put({ [tokenKey]: serializedHook, [`hookid:${hookId}`]: serializedHook });
       if (claim !== undefined) {
         await txn.delete(`hookclaim:${token}`);
       }
@@ -153,25 +240,14 @@ export class IndexDO extends DurableObject {
     });
   }
 
-  async deleteHookIndexes(token: string, hookId: string, owner: HookTokenOwner): Promise<void> {
-    await this.ctx.storage.transaction(async (txn) => {
-      const tokenKey = `hook:${token}`;
-      const idKey = `hookid:${hookId}`;
-      const claimKey = `hookclaim:${token}`;
-      const [byToken, byId, claim] = await Promise.all([
-        txn.get<string>(tokenKey),
-        txn.get<string>(idKey),
-        txn.get<HookClaim>(claimKey),
-      ]);
-      if (byToken !== undefined && sameOwner(ownerFromHook(byToken), owner)) {
-        await txn.delete(tokenKey);
-      }
-      if (byId !== undefined && sameOwner(ownerFromHook(byId), owner)) {
-        await txn.delete(idKey);
-      }
-      if (claim !== undefined && sameOwner(claim.owner, owner)) {
-        await txn.delete(claimKey);
-      }
+  async releaseHookIndexes(request: ReleaseHookIndexesRequest): Promise<ReleaseHookIndexesResult> {
+    if (request.hooks.length > MAX_INDEX_CLEANUP_HOOKS) {
+      throw new Error('Hook index release page exceeds its bounded request limit');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      if (request.terminal) await txn.put(`terminal:${request.runId}`, Date.now());
+      const deletes = await ownedHookIndexDeletes(txn, request.runId, request.hooks);
+      return { deleted: await deleteMany(txn, deletes) };
     });
   }
 
@@ -181,36 +257,21 @@ export class IndexDO extends DurableObject {
    * entries from a delayed request.
    */
   async expireRun(request: ExpireRunIndexesRequest): Promise<ExpireRunIndexesResult> {
+    if (
+      request.keys.length > MAX_INDEX_CLEANUP_KEYS ||
+      request.hooks.length > MAX_INDEX_CLEANUP_HOOKS
+    ) {
+      throw new Error('Index cleanup page exceeds its bounded request limit');
+    }
     return await this.ctx.storage.transaction(async (txn) => {
       await txn.put(`expired:${request.runId}`, request.expiredAt);
-      let deleted = 0;
+      const deletes = [
+        ...request.keys,
+        `terminal:${request.runId}`,
+        ...(await ownedHookIndexDeletes(txn, request.runId, request.hooks)),
+      ];
 
-      for (const key of new Set(request.keys)) {
-        if (await txn.delete(key)) deleted++;
-      }
-
-      for (const hook of request.hooks) {
-        const owner = { runId: request.runId, hookId: hook.hookId };
-        const tokenKey = `hook:${hook.token}`;
-        const idKey = `hookid:${hook.hookId}`;
-        const claimKey = `hookclaim:${hook.token}`;
-        const [byToken, byId, claim] = await Promise.all([
-          txn.get<string>(tokenKey),
-          txn.get<string>(idKey),
-          txn.get<HookClaim>(claimKey),
-        ]);
-        if (byToken !== undefined && sameOwner(ownerFromHook(byToken), owner)) {
-          if (await txn.delete(tokenKey)) deleted++;
-        }
-        if (byId !== undefined && sameOwner(ownerFromHook(byId), owner)) {
-          if (await txn.delete(idKey)) deleted++;
-        }
-        if (claim !== undefined && sameOwner(claim.owner, owner)) {
-          if (await txn.delete(claimKey)) deleted++;
-        }
-      }
-
-      return { deleted };
+      return { deleted: await deleteMany(txn, deletes) };
     });
   }
 }

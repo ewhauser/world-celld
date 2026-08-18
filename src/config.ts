@@ -32,7 +32,9 @@ export interface IndexNamespace {
     owner: HookTokenOwner,
   ): Promise<void>;
   releaseHookToken(token: string, owner: HookTokenOwner): Promise<void>;
-  deleteHookIndexes(token: string, hookId: string, owner: HookTokenOwner): Promise<void>;
+  releaseHookIndexes(
+    request: import('./retention.js').ReleaseHookIndexesRequest,
+  ): Promise<import('./retention.js').ReleaseHookIndexesResult>;
 }
 
 export interface HookTokenOwner {

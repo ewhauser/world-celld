@@ -325,10 +325,15 @@ describe('Streamer (StreamDO RPC integration)', () => {
         registerStream: vi.fn<StreamDOStub['registerStream']>(),
         listStreams: vi.fn<StreamDOStub['listStreams']>(async () => []),
         expireRegistry: vi.fn<StreamDOStub['expireRegistry']>(async () => ({ streams: [] })),
-        finalizeRegistry: vi.fn<StreamDOStub['finalizeRegistry']>(),
+        finalizeRegistry: vi.fn<StreamDOStub['finalizeRegistry']>(async () => ({
+          deleted: 0,
+          done: true,
+        })),
         expireStream: vi.fn<StreamDOStub['expireStream']>(async () => ({
           deleted: true,
           chunks: 0,
+          bytes: 0,
+          done: true,
         })),
       };
       const boundedStreamer = createStreamer({

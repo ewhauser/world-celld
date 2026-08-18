@@ -2,9 +2,8 @@ import type { TerminalWorkflowRunStatus, WorkflowRun } from '@workflow/world';
 
 export const CLEANUP_RECORD_KEY = 'retention:cleanup';
 export const TOMBSTONE_KEY = 'retention:tombstone';
-/** Legacy correlation-index markers retained for upgrade cleanup compatibility. */
-export const INDEX_MARKER_PREFIX = 'retention:index:';
 export const HOOK_MARKER_PREFIX = 'retention:hook:';
+export const TERMINAL_CLEANUP_KEY = 'terminal:cleanup';
 
 export type CleanupPhase = 'retained' | 'index' | 'streams' | 'queues' | 'payload' | 'tombstoned';
 
@@ -18,6 +17,8 @@ export interface CleanupRecord {
   dueAt: Date;
   queueShards: number;
   phase: CleanupPhase;
+  /** Optimistic-concurrency token for alarm/RPC work that awaits another cell. */
+  generation: number;
   attempts: number;
   lastError?: string;
   lastAttemptAt?: Date;
@@ -45,6 +46,27 @@ export interface HookIndexReference {
   token: string;
 }
 
+export interface TerminalCleanupRecord {
+  version: 1;
+  runId: string;
+  phase: 'hooks' | 'waits';
+  generation: number;
+  attempts: number;
+  lastError?: string;
+  lastAttemptAt?: Date;
+}
+
+export interface ReleaseHookIndexesRequest {
+  runId: string;
+  hooks: HookIndexReference[];
+  /** Install a fence that prevents delayed hook finalization after terminal state. */
+  terminal: boolean;
+}
+
+export interface ReleaseHookIndexesResult {
+  deleted: number;
+}
+
 export interface ExpireRunIndexesRequest {
   runId: string;
   keys: string[];
@@ -60,13 +82,26 @@ export interface ExpireRunStreamsResult {
   streams: string[];
 }
 
+export interface FinalizeRunStreamsResult {
+  /** Cumulative registry entries removed for this run. */
+  deleted: number;
+  done: boolean;
+}
+
 export interface ExpireStreamResult {
+  /** True only when this call installed the stream's expiration fence. */
   deleted: boolean;
+  /** Chunk rows removed by this bounded call. */
   chunks: number;
+  /** Payload bytes represented by the removed chunk rows. */
+  bytes: number;
+  done: boolean;
 }
 
 export interface ExpireQueueRunResult {
+  /** Cumulative messages removed for this run in this queue shard. */
   deleted: number;
+  done: boolean;
 }
 
 export interface ScheduleCleanupRequest {

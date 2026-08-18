@@ -59,7 +59,7 @@ const RUN_KEY = 'run';
 export const EVENT_KEY_PREFIX = 'event:';
 export const STEP_KEY_PREFIX = 'step:';
 export const HOOK_KEY_PREFIX = 'hook:';
-const WAIT_KEY_PREFIX = 'wait:';
+export const WAIT_KEY_PREFIX = 'wait:';
 export const STEP_CREATED_KEY_PREFIX = 'stepcreated:';
 export const HOOK_CREATED_KEY_PREFIX = 'hookcreated:';
 /**
@@ -98,9 +98,50 @@ export interface EventStoreListOptions {
  */
 export interface EventStore {
   get<T>(key: string): Promise<T | undefined>;
+  /** Optional native multi-key read (128 keys per Durable Object call). */
+  getMany?<T>(keys: string[]): Promise<Map<string, T>>;
   put<T>(key: string, value: T): Promise<void>;
   delete(key: string): Promise<boolean>;
+  /** Optional native multi-key delete. */
+  deleteMany?(keys: string[]): Promise<number>;
   list<T>(options: EventStoreListOptions): Promise<Map<string, T>>;
+  /**
+   * Celld-only capability: terminal entity cleanup is persisted and paged by
+   * WorkflowRunDO alarms instead of running inside the event transaction.
+   */
+  deferTerminalCleanup?: boolean;
+}
+
+const STORAGE_BATCH_SIZE = 128;
+const MAX_ENTITY_PAGE_SIZE = 1000;
+
+async function getMany<T>(store: EventStore, keys: string[]): Promise<Map<string, T>> {
+  if (store.getMany) {
+    const result = new Map<string, T>();
+    for (let offset = 0; offset < keys.length; offset += STORAGE_BATCH_SIZE) {
+      const page = await store.getMany<T>(keys.slice(offset, offset + STORAGE_BATCH_SIZE));
+      for (const entry of page) result.set(...entry);
+    }
+    return result;
+  }
+  const values = await Promise.all(keys.map((key) => store.get<T>(key)));
+  return new Map(
+    keys.flatMap((key, index) =>
+      values[index] === undefined ? [] : ([[key, values[index] as T]] as Array<[string, T]>),
+    ),
+  );
+}
+
+async function deleteMany(store: EventStore, keys: string[]): Promise<number> {
+  if (store.deleteMany) {
+    let deleted = 0;
+    for (let offset = 0; offset < keys.length; offset += STORAGE_BATCH_SIZE) {
+      deleted += await store.deleteMany(keys.slice(offset, offset + STORAGE_BATCH_SIZE));
+    }
+    return deleted;
+  }
+  const results = await Promise.all(keys.map((key) => store.delete(key)));
+  return results.filter(Boolean).length;
 }
 
 export interface ApplyEventRequest {
@@ -247,7 +288,9 @@ export async function listByCreationTime<T>(
   entityPrefix: string,
   params: { limit: number; cursor?: string; sortOrder?: 'asc' | 'desc' },
 ): Promise<{ data: T[]; cursor: string | null; hasMore: boolean }> {
-  const { limit, cursor, sortOrder = 'asc' } = params;
+  const requestedLimit = Number.isFinite(params.limit) ? Math.floor(params.limit) : 1;
+  const limit = Math.min(MAX_ENTITY_PAGE_SIZE, Math.max(1, requestedLimit));
+  const { cursor, sortOrder = 'asc' } = params;
   const entries = await store.list<string>(
     sortOrder === 'desc'
       ? {
@@ -263,11 +306,12 @@ export async function listByCreationTime<T>(
         },
   );
   const page = Array.from(entries.entries()).slice(0, limit);
-  const data: T[] = [];
-  for (const [, id] of page) {
-    const item = await store.get<T>(`${entityPrefix}${id}`);
-    if (item !== undefined) data.push(item);
-  }
+  const entityKeys = page.map(([, id]) => `${entityPrefix}${id}`);
+  const entities = await getMany<T>(store, entityKeys);
+  const data = entityKeys.flatMap((key) => {
+    const item = entities.get(key);
+    return item === undefined ? [] : [item];
+  });
   const hasMore = entries.size > limit;
   const lastKey = page.at(-1)?.[0];
   return {
@@ -281,22 +325,24 @@ export async function listByCreationTime<T>(
 async function releaseAllHooks(
   store: EventStore,
 ): Promise<Array<{ hookId: string; token: string }>> {
+  if (store.deferTerminalCleanup) return [];
   const hooks = await store.list<Hook>({ prefix: HOOK_KEY_PREFIX });
   const released: Array<{ hookId: string; token: string }> = [];
+  const keys: string[] = [];
   for (const hook of hooks.values()) {
-    await store.delete(`${HOOK_KEY_PREFIX}${hook.hookId}`);
-    await store.delete(creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId));
+    keys.push(`${HOOK_KEY_PREFIX}${hook.hookId}`);
+    keys.push(creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId));
     released.push({ hookId: hook.hookId, token: hook.token });
   }
+  await deleteMany(store, keys);
   return released;
 }
 
 /** Delete all persisted waits once their owning run becomes terminal. */
 async function releaseAllWaits(store: EventStore): Promise<void> {
+  if (store.deferTerminalCleanup) return;
   const waits = await store.list<Wait>({ prefix: WAIT_KEY_PREFIX });
-  for (const key of waits.keys()) {
-    await store.delete(key);
-  }
+  await deleteMany(store, Array.from(waits.keys()));
 }
 
 export async function applyEvent(
