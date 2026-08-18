@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { createStreamer, type StreamDOStub } from '../src/streamer.js';
+import { MAX_STREAM_READ_BYTES } from '../src/stream-protocol.js';
 import { createMockEnv } from '../src/test-mocks.js';
 
 async function readAll(stream: ReadableStream<Uint8Array>): Promise<Uint8Array[]> {
@@ -31,6 +32,12 @@ describe('Streamer (StreamDO RPC integration)', () => {
   });
 
   describe('writeToStream()', () => {
+    it('exposes writeMulti and treats an empty runtime batch as a no-op', async () => {
+      expect(typeof streamer.streams.writeMulti).toBe('function');
+      await streamer.streams.writeMulti!('wrun_empty', 'empty-stream', []);
+      expect(await streamer.listStreamsByRunId('wrun_empty')).toEqual([]);
+    });
+
     it('should write string chunks with monotonic indexes', async () => {
       await streamer.writeToStream('test-stream', 'wrun_123', 'Hello');
       await streamer.writeToStream('test-stream', 'wrun_123', ' world');
@@ -38,7 +45,13 @@ describe('Streamer (StreamDO RPC integration)', () => {
       const stub = mockEnv.WORKFLOW_STREAMS.get(
         mockEnv.WORKFLOW_STREAMS.idFromName('stream:test-stream'),
       );
-      const { chunks, tailIndex } = await stub.getChunks({ startIndex: 0, limit: 10 });
+      const { chunks, tailIndex } = await stub.readChunks({
+        runId: 'wrun_123',
+        startIndex: 0,
+        maxChunks: 10,
+        maxBytes: MAX_STREAM_READ_BYTES,
+        waitMs: 0,
+      });
       expect(chunks).toHaveLength(2);
       expect(tailIndex).toBe(1);
       expect(new TextDecoder().decode(chunks[0])).toBe('Hello');
@@ -52,7 +65,13 @@ describe('Streamer (StreamDO RPC integration)', () => {
       const stub = mockEnv.WORKFLOW_STREAMS.get(
         mockEnv.WORKFLOW_STREAMS.idFromName('stream:binary-stream'),
       );
-      const { chunks } = await stub.getChunks({ startIndex: 0, limit: 10 });
+      const { chunks } = await stub.readChunks({
+        runId: 'wrun_456',
+        startIndex: 0,
+        maxChunks: 10,
+        maxBytes: MAX_STREAM_READ_BYTES,
+        waitMs: 0,
+      });
       expect(Array.from(chunks[0])).toEqual([0, 1, 2, 253, 254, 255]);
     });
 
@@ -120,7 +139,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
       await streamer.writeToStream('test-stream', 'wrun_123', 'Chunk 3\n');
       await streamer.closeStream('test-stream', 'wrun_123');
 
-      const stream = await streamer.readFromStream('test-stream');
+      const stream = await streamer.readFromStream('test-stream', 'wrun_123');
       const chunks = await readAll(stream);
 
       expect(chunks).toHaveLength(3);
@@ -132,7 +151,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
       await streamer.writeToStream('binary-stream', 'wrun_123', new Uint8Array([5, 6, 7, 8, 9]));
       await streamer.closeStream('binary-stream', 'wrun_123');
 
-      const stream = await streamer.readFromStream('binary-stream');
+      const stream = await streamer.readFromStream('binary-stream', 'wrun_123');
       const chunks = await readAll(stream);
 
       expect(chunks).toHaveLength(2);
@@ -143,13 +162,13 @@ describe('Streamer (StreamDO RPC integration)', () => {
     it('should read a live stream that closes later', async () => {
       await streamer.writeToStream('live-stream', 'wrun_123', 'early');
 
-      const stream = await streamer.readFromStream('live-stream');
+      const stream = await streamer.readFromStream('live-stream', 'wrun_123');
       const reader = stream.getReader();
 
       const first = await reader.read();
       expect(new TextDecoder().decode(first.value)).toBe('early');
 
-      // Write + close while the reader is polling for more.
+      // Write + close while one bounded read is waiting for more.
       setTimeout(() => {
         void streamer
           .writeToStream('live-stream', 'wrun_123', 'late')
@@ -169,7 +188,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
       await streamer.writeToStream('test-stream', 'wrun_123', 'two');
       await streamer.closeStream('test-stream', 'wrun_123');
 
-      const stream = await streamer.readFromStream('test-stream', 1);
+      const stream = await streamer.readFromStream('test-stream', 'wrun_123', 1);
       const chunks = await readAll(stream);
 
       expect(text(chunks)).toBe('onetwo');
@@ -181,7 +200,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
       await streamer.writeToStream('test-stream', 'wrun_123', 'two');
       await streamer.closeStream('test-stream', 'wrun_123');
 
-      const stream = await streamer.readFromStream('test-stream', -2);
+      const stream = await streamer.readFromStream('test-stream', 'wrun_123', -2);
       const chunks = await readAll(stream);
 
       expect(text(chunks)).toBe('onetwo');
@@ -190,7 +209,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
     it('should handle stream cancellation', async () => {
       await streamer.writeToStream('test-stream', 'wrun_123', 'data');
 
-      const stream = await streamer.readFromStream('test-stream');
+      const stream = await streamer.readFromStream('test-stream', 'wrun_123');
       const reader = stream.getReader();
 
       await reader.read();
@@ -202,10 +221,10 @@ describe('Streamer (StreamDO RPC integration)', () => {
 
     it('should propagate DO errors instead of silently closing', async () => {
       const failingStub: StreamDOStub = {
-        writeChunk: vi.fn<StreamDOStub['writeChunk']>(fail),
+        writeChunks: vi.fn<StreamDOStub['writeChunks']>(fail),
         closeStream: vi.fn<StreamDOStub['closeStream']>(fail),
-        getChunks: vi.fn<StreamDOStub['getChunks']>(fail),
-        getInfo: vi.fn<StreamDOStub['getInfo']>(fail),
+        failStream: vi.fn<StreamDOStub['failStream']>(fail),
+        readChunks: vi.fn<StreamDOStub['readChunks']>(fail),
         registerStream: vi.fn<StreamDOStub['registerStream']>(fail),
         listStreams: vi.fn<StreamDOStub['listStreams']>(fail),
         expireRegistry: vi.fn<StreamDOStub['expireRegistry']>(fail),
@@ -220,10 +239,25 @@ describe('Streamer (StreamDO RPC integration)', () => {
       };
 
       const failingStreamer = createStreamer({ env: failingEnv });
-      const stream = await failingStreamer.readFromStream('error-stream');
+      const stream = await failingStreamer.readFromStream('error-stream', 'wrun_error');
       const reader = stream.getReader();
 
       await expect(reader.read()).rejects.toThrow('DO unavailable');
+    });
+
+    it('surfaces a persisted producer error to a waiting reader', async () => {
+      const stream = await streamer.readFromStream('failed-stream', 'wrun_failed');
+      const reader = stream.getReader();
+      const pending = reader.read();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      await streamer.errorStream('failed-stream', 'wrun_failed', {
+        name: 'ProducerError',
+        message: 'producer failed',
+      });
+
+      const error = await pending.catch((caught) => caught);
+      expect(error).toMatchObject({ name: 'ProducerError', message: 'producer failed' });
     });
   });
 
@@ -274,19 +308,20 @@ describe('Streamer (StreamDO RPC integration)', () => {
       ).rejects.toThrow(/Invalid stream cursor/);
     });
 
-    it('keeps a default page below the Worker memory limit after base64 encoding', async () => {
+    it('bounds a page by raw binary bytes without base64 expansion', async () => {
       const oneMiB = new Uint8Array(1024 * 1024);
+      const readChunks = vi.fn<StreamDOStub['readChunks']>(async ({ startIndex, maxBytes }) => ({
+        startIndex,
+        chunks: Array.from({ length: maxBytes / oneMiB.byteLength }, () => oneMiB),
+        state: 'open',
+        timedOut: false,
+        tailIndex: 31,
+      }));
       const largeChunkStub: StreamDOStub = {
-        writeChunk: vi.fn<StreamDOStub['writeChunk']>(),
+        writeChunks: vi.fn<StreamDOStub['writeChunks']>(),
         closeStream: vi.fn<StreamDOStub['closeStream']>(),
-        getChunks: vi.fn<StreamDOStub['getChunks']>(async ({ limit }) => ({
-          // Reuse one allocation: the regression is the logical response size,
-          // not Node heap pressure inside the test process.
-          chunks: Array.from({ length: limit }, () => oneMiB),
-          done: false,
-          tailIndex: limit - 1,
-        })),
-        getInfo: vi.fn<StreamDOStub['getInfo']>(async () => ({ tailIndex: -1, done: false })),
+        failStream: vi.fn<StreamDOStub['failStream']>(),
+        readChunks,
         registerStream: vi.fn<StreamDOStub['registerStream']>(),
         listStreams: vi.fn<StreamDOStub['listStreams']>(async () => []),
         expireRegistry: vi.fn<StreamDOStub['expireRegistry']>(async () => ({ streams: [] })),
@@ -306,13 +341,11 @@ describe('Streamer (StreamDO RPC integration)', () => {
       });
 
       const page = await boundedStreamer.getStreamChunks('large-stream', 'wrun_large');
-      const base64Bytes = page.data.reduce(
-        (total, chunk) => total + 4 * Math.ceil(chunk.data.byteLength / 3),
-        0,
+      const rawBytes = page.data.reduce((total, chunk) => total + chunk.data.byteLength, 0);
+      expect(rawBytes).toBe(MAX_STREAM_READ_BYTES);
+      expect(readChunks).toHaveBeenCalledWith(
+        expect.objectContaining({ maxBytes: MAX_STREAM_READ_BYTES, waitMs: 0 }),
       );
-
-      // This is a lower bound: tagged JSON and response buffering add overhead.
-      expect(base64Bytes).toBeLessThan(128 * 1024 * 1024);
     });
   });
 

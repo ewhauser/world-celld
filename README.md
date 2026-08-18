@@ -115,7 +115,7 @@ More deployment detail is in [`celld-worker/README.md`](./celld-worker/README.md
 ```text
 Workflow application
   |
-  | authenticated HTTP RPC
+  | authenticated HTTP RPC + binary stream batches
   v
 celld worker router
   |-- WorkflowRunDO  one cell per workflow run
@@ -129,25 +129,27 @@ Workflow application /.well-known/workflow/v1/flow
 ```
 
 The application-side package implements the Workflow `World` interface and
-translates its storage, stream, and queue operations into RPC calls. The celld
-worker accepts only a fixed set of methods and routes each request to the named
-cell that owns the data.
+translates its storage and queue operations into JSON RPC calls. Stream chunk
+writes and bounded long-poll reads use a binary batch route; stream control and
+retention operations remain fixed, authenticated RPC methods. The worker routes
+each request to the named cell that owns the data.
 
 ## Configuration
 
 Application options can be passed to `createCelldWorld()` unless an environment
 variable is shown below.
 
-| Option           | Environment variable     | Default                  |
-| ---------------- | ------------------------ | ------------------------ |
-| `fleetUrl`       | `CELLD_FLEET_URL`        | required                 |
-| `secret`         | `CELLD_WORLD_SECRET`     | required with `fleetUrl` |
-| `baseUrl`        | `WORKFLOW_BASE_URL`      | `http://localhost:$PORT` |
-| `deploymentId`   | `CELLD_DEPLOYMENT_ID`    | `celld-default`          |
-| `queueShards`    | —                        | `1`                      |
-| `runRetentionMs` | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
-| `readPollMs`     | —                        | `250`                    |
-| `rpcTimeoutMs`   | —                        | `30000`                  |
+| Option                  | Environment variable     | Default                  |
+| ----------------------- | ------------------------ | ------------------------ |
+| `fleetUrl`              | `CELLD_FLEET_URL`        | required                 |
+| `secret`                | `CELLD_WORLD_SECRET`     | required with `fleetUrl` |
+| `baseUrl`               | `WORKFLOW_BASE_URL`      | `http://localhost:$PORT` |
+| `deploymentId`          | `CELLD_DEPLOYMENT_ID`    | `celld-default`          |
+| `queueShards`           | —                        | `1`                      |
+| `runRetentionMs`        | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
+| `streamLongPollMs`      | —                        | `20000`                  |
+| `streamFlushIntervalMs` | —                        | `0`                      |
+| `rpcTimeoutMs`          | —                        | `30000`                  |
 
 The deployed worker also accepts these celld variables:
 

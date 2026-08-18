@@ -9,6 +9,7 @@ import type { QueueCellStub } from '../queue.js';
 import type { WorkflowRunDOStub } from '../storage.js';
 import type { StreamDOStub } from '../streamer.js';
 import { callDO, type RpcTransport } from './rpc-client.js';
+import { readStreamChunks, writeStreamChunks } from './stream-client.js';
 
 interface MethodSpec {
   methods: readonly string[];
@@ -34,10 +35,8 @@ const RUNS: MethodSpec = {
 
 const STREAMS: MethodSpec = {
   methods: [
-    'writeChunk',
     'closeStream',
-    'getChunks',
-    'getInfo',
+    'failStream',
     'registerStream',
     'listStreams',
     'expireRegistry',
@@ -45,14 +44,29 @@ const STREAMS: MethodSpec = {
     'expireStream',
   ],
   mutating: new Set([
-    'writeChunk',
     'closeStream',
+    'failStream',
     'registerStream',
     'expireRegistry',
     'finalizeRegistry',
     'expireStream',
   ]),
 };
+
+function makeStreamNamespace(transport: RpcTransport) {
+  return {
+    idFromName(name: string) {
+      return { toString: () => name };
+    },
+    get(id: { toString(): string }): StreamDOStub {
+      const name = id.toString();
+      const control = makeStub<StreamDOStub>(transport, 'streams', name, STREAMS);
+      control.writeChunks = (runId, chunks) => writeStreamChunks(transport, name, runId, chunks);
+      control.readChunks = (request, signal) => readStreamChunks(transport, name, request, signal);
+      return control;
+    },
+  };
+}
 
 const QUEUE: MethodSpec = {
   methods: [
@@ -122,7 +136,7 @@ function makeIndexNamespace(transport: RpcTransport): IndexNamespace {
 export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
   return {
     WORKFLOW_DB: makeNamespace<WorkflowRunDOStub>(transport, 'runs', RUNS),
-    WORKFLOW_STREAMS: makeNamespace<StreamDOStub>(transport, 'streams', STREAMS),
+    WORKFLOW_STREAMS: makeStreamNamespace(transport),
     WORKFLOW_INDEX: makeIndexNamespace(transport),
     WORKFLOW_QUEUE: makeNamespace<QueueCellStub>(transport, 'queue', QUEUE),
   };

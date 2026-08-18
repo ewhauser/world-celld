@@ -7,6 +7,11 @@ import { createConnection } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { rpcStringify } from '../src/codec.js';
 import { createRemoteEnv } from '../src/remote/namespaces.js';
+import {
+  MAX_STREAM_WRITE_CHUNKS,
+  STREAM_BATCH_CONTENT_TYPE,
+  decodeStreamWriteBatch,
+} from '../src/stream-protocol.js';
 import { createStorage } from '../src/storage.js';
 import { createStreamer } from '../src/streamer.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
@@ -105,6 +110,21 @@ describe('router auth and shape', () => {
     expect((await rpc('/v1/rpc/runs/wrun_x/fetch', [], SECRET)).status).toBe(404);
     expect((await rpc('/v1/rpc/runs/wrun_x/alarm', [], SECRET)).status).toBe(404);
     expect((await rpc('/v1/rpc/runs/wrun_x/constructor', [], SECRET)).status).toBe(404);
+    expect((await rpc('/v1/rpc/streams/stream%3Ax/writeChunk', [], SECRET)).status).toBe(404);
+  });
+
+  it('authenticates and validates the hard-cutover binary stream route', async () => {
+    const path = '/v1/streams/stream%3Ax/chunks?runId=wrun_x';
+    expect((await fetch(`${harness.url}${path}`)).status).toBe(401);
+    const malformed = await fetch(`${harness.url}${path}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${SECRET}`,
+        'content-type': STREAM_BATCH_CONTENT_TYPE,
+      },
+      body: new Uint8Array(),
+    });
+    expect(malformed.status).toBe(400);
   });
 
   it('400s malformed bodies', async () => {
@@ -379,5 +399,95 @@ describe('full stack: vendored storage over the wire', () => {
     await expect(streamer.writeToStream('wire-stream', 'wrun_s1', 'nope')).rejects.toThrow(
       /closed stream/,
     );
+  });
+
+  it('uses two public calls for a cold maximum batch and binary payloads end-to-end', async () => {
+    const calls: Array<{ url: string; contentType: string | null; body?: Uint8Array }> = [];
+    const countingFetch: typeof fetch = async (input, init) => {
+      calls.push({
+        url: input instanceof Request ? input.url : input instanceof URL ? input.href : input,
+        contentType: new Headers(init?.headers).get('content-type'),
+        body: init?.body instanceof Uint8Array ? new Uint8Array(init.body) : undefined,
+      });
+      return await fetch(input, init);
+    };
+    const env = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: countingFetch,
+    });
+    const streamer = createStreamer({ env: { WORKFLOW_STREAMS: env.WORKFLOW_STREAMS } });
+    const name = `wire-batch-${Date.now()}`;
+    const runId = `wrun_batch_${Date.now()}`;
+    const chunks = Array.from({ length: MAX_STREAM_WRITE_CHUNKS }, (_, index) =>
+      Uint8Array.of(0, index, 255),
+    );
+
+    await streamer.streams.writeMulti!(runId, name, chunks);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0].url).toContain('/v1/rpc/streams/');
+    expect(calls[1].url).toContain('/v1/streams/');
+    expect(calls[1].contentType).toBe(STREAM_BATCH_CONTENT_TYPE);
+    expect(calls[1].body).toBeInstanceOf(Uint8Array);
+    expect(decodeStreamWriteBatch(calls[1].body!)).toEqual(chunks);
+
+    calls.length = 0;
+    const streamStorage = harness.fleet.cell('streams', `stream:${name}`).storage;
+    streamStorage.resetOperationCounts();
+    await streamer.streams.writeMulti!(runId, name, chunks);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/v1/streams/');
+    expect(streamStorage.operationCounts).toMatchObject({
+      transaction: 1,
+      get: 1,
+      putMany: 1,
+      put: 0,
+    });
+
+    calls.length = 0;
+    const page = await streamer.getStreamChunks(name, runId, { limit: 32 });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain('/v1/streams/');
+    expect(page.data).toHaveLength(32);
+    expect(page.data.map((chunk) => Array.from(chunk.data))).toEqual(
+      chunks.map((chunk) => Array.from(chunk)),
+    );
+  });
+
+  it('holds one idle public read and wakes it on close without storage polling', async () => {
+    const calls: string[] = [];
+    const countingFetch: typeof fetch = async (input, init) => {
+      calls.push(input instanceof Request ? input.url : input instanceof URL ? input.href : input);
+      return await fetch(input, init);
+    };
+    const env = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: countingFetch,
+    });
+    const streamer = createStreamer({
+      env: { WORKFLOW_STREAMS: env.WORKFLOW_STREAMS },
+      streamLongPollMs: 200,
+    });
+    const name = `wire-idle-${Date.now()}`;
+    const runId = `wrun_idle_${Date.now()}`;
+    const stream = await streamer.streams.get(runId, name);
+    const reader = stream.getReader();
+    const pending = reader.read();
+
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const readCalls = () => calls.filter((url) => url.includes('/v1/streams/')).length;
+    expect(readCalls()).toBe(1);
+    const streamStorage = harness.fleet.cell('streams', `stream:${name}`).storage;
+    streamStorage.resetOperationCounts();
+
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    expect(readCalls()).toBe(1);
+    expect(streamStorage.operationCounts).toMatchObject({ get: 0, list: 0 });
+
+    await streamer.closeStream(name, runId);
+    await expect(pending).resolves.toMatchObject({ done: true });
   });
 });

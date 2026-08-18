@@ -8,7 +8,7 @@ import { type CelldWorldConfig, type CelldWorldEnv, resolveConfig } from './conf
 import { createRemoteEnv } from './remote/namespaces.js';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
-import { createStreamer } from './streamer.js';
+import { createStreamer, type CelldStreamer } from './streamer.js';
 import type { CleanupRecord } from './retention.js';
 
 export type { CelldWorldConfig, CelldWorldEnv, IndexNamespace } from './config.js';
@@ -21,6 +21,22 @@ export type {
 } from './queue.js';
 export type { WorkflowRunDONamespace, WorkflowRunDOStub } from './storage.js';
 export type { StreamDONamespace, StreamDOStub } from './streamer.js';
+export {
+  MAX_STREAM_BATCH_BYTES,
+  MAX_STREAM_CHUNK_BYTES,
+  MAX_STREAM_ERROR_BYTES,
+  MAX_STREAM_LONG_POLL_MS,
+  MAX_STREAM_READ_BYTES,
+  MAX_STREAM_READ_CHUNKS,
+  MAX_STREAM_WRITE_CHUNKS,
+} from './stream-protocol.js';
+export type {
+  StreamErrorData,
+  StreamReadRequest,
+  StreamReadResult,
+  StreamTerminalState,
+  StreamWriteResult,
+} from './stream-protocol.js';
 export type { CleanupPhase, CleanupRecord, RunTombstone } from './retention.js';
 
 export interface CelldRetentionAdmin {
@@ -30,7 +46,7 @@ export interface CelldRetentionAdmin {
   rearm(runId: string): Promise<CleanupRecord | null>;
 }
 
-export type CelldWorld = World & { retention: CelldRetentionAdmin };
+export type CelldWorld = World & CelldStreamer & { retention: CelldRetentionAdmin };
 
 export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
   const resolved = resolveConfig(config);
@@ -90,7 +106,8 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     env: {
       WORKFLOW_STREAMS: env.WORKFLOW_STREAMS,
     },
-    readPollMs: resolved.readPollMs,
+    streamLongPollMs: resolved.streamLongPollMs,
+    streamFlushIntervalMs: resolved.streamFlushIntervalMs,
   });
 
   const runStub = (runId: string) => env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId));

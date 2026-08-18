@@ -20,6 +20,17 @@ export interface FakeStorageMutation {
   value?: unknown;
 }
 
+export interface FakeStorageOperationCounts {
+  get: number;
+  getMany: number;
+  list: number;
+  put: number;
+  putMany: number;
+  delete: number;
+  deleteMany: number;
+  transaction: number;
+}
+
 function applyListOptions(keys: string[], options: FakeListOptions): string[] {
   let result = keys.toSorted();
   if (options.prefix !== undefined) {
@@ -55,6 +66,17 @@ function applyListOptions(keys: string[], options: FakeListOptions): string[] {
 export class FakeStorage {
   data = new Map<string, unknown>();
   alarmAt: number | null = null;
+  readonly operationCounts: FakeStorageOperationCounts = {
+    get: 0,
+    getMany: 0,
+    list: 0,
+    put: 0,
+    putMany: 0,
+    delete: 0,
+    deleteMany: 0,
+    transaction: 0,
+  };
+  private transactionTail: Promise<void> = Promise.resolve();
   private mutationFailure?: {
     predicate: (mutation: FakeStorageMutation) => boolean;
     error: Error;
@@ -62,20 +84,50 @@ export class FakeStorage {
 
   constructor(private clock: () => number = () => Date.now()) {}
 
-  async get<T>(key: string): Promise<T | undefined> {
-    return this.data.get(key) as T | undefined;
+  async get<T>(key: string): Promise<T | undefined>;
+  async get<T>(keys: string[]): Promise<Map<string, T>>;
+  async get<T>(keyOrKeys: string | string[]): Promise<T | undefined | Map<string, T>> {
+    if (Array.isArray(keyOrKeys)) {
+      this.operationCounts.getMany += 1;
+      return new Map(
+        keyOrKeys.filter((key) => this.data.has(key)).map((key) => [key, this.data.get(key) as T]),
+      );
+    }
+    this.operationCounts.get += 1;
+    return this.data.get(keyOrKeys) as T | undefined;
   }
 
-  async put<T>(key: string, value: T): Promise<void> {
-    this.maybeFailMutation({ operation: 'put', key, value });
-    // Match structured-clone persistence: mutations to the caller's object
-    // after put() must not leak into storage.
-    this.data.set(key, structuredClone(value));
+  async put<T>(key: string, value: T): Promise<void>;
+  async put<T>(entries: Record<string, T>): Promise<void>;
+  async put<T>(keyOrEntries: string | Record<string, T>, value?: T): Promise<void> {
+    if (typeof keyOrEntries === 'string') {
+      this.operationCounts.put += 1;
+      this.maybeFailMutation({ operation: 'put', key: keyOrEntries, value });
+      this.data.set(keyOrEntries, structuredClone(value));
+      return;
+    }
+    this.operationCounts.putMany += 1;
+    for (const [key, entryValue] of Object.entries(keyOrEntries)) {
+      this.maybeFailMutation({ operation: 'put', key, value: entryValue });
+    }
+    for (const [key, entryValue] of Object.entries(keyOrEntries)) {
+      this.data.set(key, structuredClone(entryValue));
+    }
   }
 
-  async delete(key: string): Promise<boolean> {
-    this.maybeFailMutation({ operation: 'delete', key });
-    return this.data.delete(key);
+  async delete(key: string): Promise<boolean>;
+  async delete(keys: string[]): Promise<number>;
+  async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
+    if (typeof keyOrKeys === 'string') {
+      this.operationCounts.delete += 1;
+      this.maybeFailMutation({ operation: 'delete', key: keyOrKeys });
+      return this.data.delete(keyOrKeys);
+    }
+    this.operationCounts.deleteMany += 1;
+    for (const key of keyOrKeys) this.maybeFailMutation({ operation: 'delete', key });
+    let deleted = 0;
+    for (const key of keyOrKeys) if (this.data.delete(key)) deleted += 1;
+    return deleted;
   }
 
   async deleteAll(): Promise<void> {
@@ -83,15 +135,27 @@ export class FakeStorage {
   }
 
   async list<T>(options: FakeListOptions = {}): Promise<Map<string, T>> {
+    this.operationCounts.list += 1;
     const keys = applyListOptions(Array.from(this.data.keys()), options);
     return new Map(keys.map((k) => [k, this.data.get(k) as T]));
   }
 
   async transaction<T>(cb: (txn: FakeTransaction) => Promise<T>): Promise<T> {
-    const txn = new FakeTransaction(this);
-    const result = await cb(txn);
-    txn.commit();
-    return result;
+    this.operationCounts.transaction += 1;
+    let release!: () => void;
+    const previous = this.transactionTail;
+    this.transactionTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      const txn = new FakeTransaction(this);
+      const result = await cb(txn);
+      txn.commit();
+      return result;
+    } finally {
+      release();
+    }
   }
 
   async getAlarm(): Promise<number | null> {
@@ -108,6 +172,17 @@ export class FakeStorage {
 
   now(): number {
     return this.clock();
+  }
+
+  resetOperationCounts(): void {
+    for (const key of Object.keys(this.operationCounts) as (keyof FakeStorageOperationCounts)[]) {
+      this.operationCounts[key] = 0;
+    }
+  }
+
+  /** @internal Used by FakeTransaction to count the same platform operations. */
+  recordOperation(operation: keyof FakeStorageOperationCounts): void {
+    this.operationCounts[operation] += 1;
   }
 
   /** Inject one matching write failure, including writes inside transactions. */
@@ -134,19 +209,60 @@ class FakeTransaction {
 
   constructor(private storage: FakeStorage) {}
 
-  async get<T>(key: string): Promise<T | undefined> {
+  async get<T>(key: string): Promise<T | undefined>;
+  async get<T>(keys: string[]): Promise<Map<string, T>>;
+  async get<T>(keyOrKeys: string | string[]): Promise<T | undefined | Map<string, T>> {
+    if (Array.isArray(keyOrKeys)) {
+      this.storage.recordOperation('getMany');
+      const result = new Map<string, T>();
+      for (const key of keyOrKeys) {
+        if (this.deleted.has(key)) continue;
+        if (this.staged.has(key)) result.set(key, this.staged.get(key) as T);
+        else if (this.storage.data.has(key)) result.set(key, this.storage.data.get(key) as T);
+      }
+      return result;
+    }
+    this.storage.recordOperation('get');
+    const key = keyOrKeys;
     if (this.deleted.has(key)) return undefined;
     if (this.staged.has(key)) return this.staged.get(key) as T;
     return this.storage.data.get(key) as T | undefined;
   }
 
-  async put<T>(key: string, value: T): Promise<void> {
-    this.storage.maybeFailMutation({ operation: 'put', key, value });
-    this.deleted.delete(key);
-    this.staged.set(key, structuredClone(value));
+  async put<T>(key: string, value: T): Promise<void>;
+  async put<T>(entries: Record<string, T>): Promise<void>;
+  async put<T>(keyOrEntries: string | Record<string, T>, value?: T): Promise<void> {
+    if (typeof keyOrEntries === 'string') {
+      this.storage.recordOperation('put');
+      this.storage.maybeFailMutation({ operation: 'put', key: keyOrEntries, value });
+      this.deleted.delete(keyOrEntries);
+      this.staged.set(keyOrEntries, structuredClone(value));
+      return;
+    }
+    this.storage.recordOperation('putMany');
+    for (const [key, entryValue] of Object.entries(keyOrEntries)) {
+      this.storage.maybeFailMutation({ operation: 'put', key, value: entryValue });
+    }
+    for (const [key, entryValue] of Object.entries(keyOrEntries)) {
+      this.deleted.delete(key);
+      this.staged.set(key, structuredClone(entryValue));
+    }
   }
 
-  async delete(key: string): Promise<boolean> {
+  async delete(key: string): Promise<boolean>;
+  async delete(keys: string[]): Promise<number>;
+  async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
+    if (typeof keyOrKeys === 'string') {
+      this.storage.recordOperation('delete');
+      return this.deleteOne(keyOrKeys);
+    }
+    this.storage.recordOperation('deleteMany');
+    let deleted = 0;
+    for (const key of keyOrKeys) if (this.deleteOne(key)) deleted += 1;
+    return deleted;
+  }
+
+  private deleteOne(key: string): boolean {
     this.storage.maybeFailMutation({ operation: 'delete', key });
     const existed = (!this.deleted.has(key) && this.staged.has(key)) || this.storage.data.has(key);
     this.staged.delete(key);
@@ -155,6 +271,7 @@ class FakeTransaction {
   }
 
   async list<T>(options: FakeListOptions = {}): Promise<Map<string, T>> {
+    this.storage.recordOperation('list');
     const merged = new Map(this.storage.data);
     for (const key of this.deleted) merged.delete(key);
     for (const [key, value] of this.staged) merged.set(key, value);
@@ -226,26 +343,35 @@ export class FakeFleet {
     };
   }
 
+  private instantiate(
+    bindingKey: string,
+    name: string,
+    storage: FakeStorage,
+    pendingWaits: Promise<unknown>[],
+  ): InstanceType<CellClass> {
+    const CellCtor = this.classes[bindingKey];
+    if (!CellCtor) throw new Error(`no cell class registered for binding: ${bindingKey}`);
+    const ctx = {
+      storage,
+      id: { toString: () => name, name },
+      waitUntil(promise: Promise<unknown>) {
+        pendingWaits.push(promise);
+      },
+      async blockConcurrencyWhile<T>(cb: () => Promise<T>): Promise<T> {
+        return cb();
+      },
+    };
+    return new CellCtor(ctx, this.cellEnv);
+  }
+
   cell(bindingKey: string, name: string): CellSlot {
     const key = `${bindingKey}\0${name}`;
     let slot = this.cells.get(key);
     if (!slot) {
-      const CellCtor = this.classes[bindingKey];
-      if (!CellCtor) throw new Error(`no cell class registered for binding: ${bindingKey}`);
       const storage = new FakeStorage(() => this.now);
       const pendingWaits: Promise<unknown>[] = [];
-      const ctx = {
-        storage,
-        id: { toString: () => name, name },
-        waitUntil(promise: Promise<unknown>) {
-          pendingWaits.push(promise);
-        },
-        async blockConcurrencyWhile<T>(cb: () => Promise<T>): Promise<T> {
-          return cb();
-        },
-      };
       slot = {
-        instance: new CellCtor(ctx, this.cellEnv),
+        instance: this.instantiate(bindingKey, name, storage, pendingWaits),
         storage,
         pendingWaits,
         alarmRetryCount: 0,
@@ -254,6 +380,13 @@ export class FakeFleet {
       this.cells.set(key, slot);
     }
     return slot;
+  }
+
+  /** Recreate one in-memory DO instance while preserving its durable storage. */
+  restartCell(bindingKey: string, name: string): InstanceType<CellClass> {
+    const slot = this.cell(bindingKey, name);
+    slot.instance = this.instantiate(bindingKey, name, slot.storage, slot.pendingWaits);
+    return slot.instance;
   }
 
   advance(ms: number): void {
