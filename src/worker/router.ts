@@ -4,13 +4,28 @@
  * Routes:
  *   GET  /v1/health                              — liveness + spec version (unauthenticated)
  *   POST /v1/rpc/{binding}/{name}/{method}       — DO RPC (bearer auth)
+ *   GET  /v1/streams/{name}/chunks               — bounded binary long-poll read
+ *   POST /v1/streams/{name}/chunks               — bounded binary batch append
  *
- * The RPC body is an rpc-codec-encoded JSON array of arguments; the response
- * body is the rpc-codec-encoded return value. Only whitelisted methods
- * dispatch — everything else (including fetch/alarm) is unreachable.
+ * Generic RPC bodies use the tagged JSON codec. Stream chunk bodies use the
+ * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { rpcParse, rpcStringify } from '../codec.js';
+import {
+  MAX_STREAM_BATCH_BYTES,
+  MAX_STREAM_CHUNK_BYTES,
+  MAX_STREAM_LONG_POLL_MS,
+  MAX_STREAM_READ_BYTES,
+  MAX_STREAM_READ_CHUNKS,
+  STREAM_BATCH_CONTENT_TYPE,
+  decodeStreamWriteBatch,
+  encodeStreamReadResult,
+  encodeStreamWriteResult,
+  type StreamReadRequest,
+  type StreamReadResult,
+  type StreamWriteResult,
+} from '../stream-protocol.js';
 import { authenticate } from './auth.js';
 
 export const WORLD_NAME = 'world-celld';
@@ -50,10 +65,8 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
   streams: {
     env: 'WORKFLOW_STREAMS',
     methods: new Set([
-      'writeChunk',
       'closeStream',
-      'getChunks',
-      'getInfo',
+      'failStream',
       'registerStream',
       'listStreams',
       'expireRegistry',
@@ -92,6 +105,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
 
 /** Request body cap: oversize payloads get a clear 413 instead of an OOM. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_STREAM_WRITE_BODY_BYTES = MAX_STREAM_BATCH_BYTES + 1024;
 
 function errorResponse(status: number, name: string, message: string): Response {
   return Response.json({ error: { name, message } }, { status });
@@ -120,6 +134,52 @@ async function readBoundedBody(request: Request): Promise<string | null> {
   }
 }
 
+async function readBoundedBytes(request: Request, maxBytes: number): Promise<Uint8Array | null> {
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel('stream body exceeds configured limit').catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+
+function parseBoundedInteger(url: URL, name: string, minimum: number, maximum: number): number {
+  const raw = url.searchParams.get(name);
+  const value = raw === null ? Number.NaN : Number(raw);
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    const error = new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+    error.name = 'StreamProtocolError';
+    throw error;
+  }
+  return value;
+}
+
+function streamResponse(body: Uint8Array): Response {
+  return new Response(body, {
+    status: 200,
+    headers: { 'content-type': STREAM_BATCH_CONTENT_TYPE },
+  });
+}
+
 export function createRouter(env: WorkerEnv) {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -138,13 +198,86 @@ export function createRouter(env: WorkerEnv) {
       });
     }
 
-    if (parts[1] !== 'rpc') {
-      return errorResponse(404, 'NotFound', `unknown path: ${url.pathname}`);
-    }
-
     const auth = await authenticate(request, env.WORLD_SECRET);
     if (!auth.ok) {
       return auth.response;
+    }
+
+    if (parts[1] === 'streams' && parts.length === 4 && parts[3] === 'chunks') {
+      const namespace = env.WORKFLOW_STREAMS;
+      if (!namespace) {
+        return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_STREAMS');
+      }
+      const name = decodeURIComponent(parts[2]);
+      const runId = url.searchParams.get('runId');
+      if (!runId) return errorResponse(400, 'BadRequest', 'runId is required');
+      const stub = namespace.get(namespace.idFromName(name)) as {
+        writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult>;
+        readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult>;
+      };
+
+      try {
+        if (request.method === 'POST') {
+          if (!request.headers.get('content-type')?.startsWith(STREAM_BATCH_CONTENT_TYPE)) {
+            return errorResponse(415, 'UnsupportedMediaType', STREAM_BATCH_CONTENT_TYPE);
+          }
+          const contentLength = Number(request.headers.get('content-length') ?? '0');
+          if (contentLength > MAX_STREAM_WRITE_BODY_BYTES) {
+            return errorResponse(
+              413,
+              'PayloadTooLarge',
+              `body exceeds ${MAX_STREAM_WRITE_BODY_BYTES} bytes`,
+            );
+          }
+          const body = await readBoundedBytes(request, MAX_STREAM_WRITE_BODY_BYTES);
+          if (body === null) {
+            return errorResponse(
+              413,
+              'PayloadTooLarge',
+              `body exceeds ${MAX_STREAM_WRITE_BODY_BYTES} bytes`,
+            );
+          }
+          const result = await stub.writeChunks(runId, decodeStreamWriteBatch(body));
+          return streamResponse(encodeStreamWriteResult(result));
+        }
+
+        if (request.method === 'GET') {
+          const result = await stub.readChunks(
+            {
+              runId,
+              startIndex: parseBoundedInteger(url, 'startIndex', 0, 0x7fffffff),
+              maxChunks: parseBoundedInteger(url, 'maxChunks', 0, MAX_STREAM_READ_CHUNKS),
+              maxBytes: parseBoundedInteger(
+                url,
+                'maxBytes',
+                MAX_STREAM_CHUNK_BYTES,
+                MAX_STREAM_READ_BYTES,
+              ),
+              waitMs: parseBoundedInteger(url, 'waitMs', 0, MAX_STREAM_LONG_POLL_MS),
+            },
+            request.signal,
+          );
+          return streamResponse(encodeStreamReadResult(result));
+        }
+
+        return errorResponse(405, 'MethodNotAllowed', 'expected GET or POST');
+      } catch (error) {
+        const err = error as { name?: string; message?: string; status?: number };
+        return Response.json(
+          {
+            error: {
+              name: err?.name ?? 'Error',
+              message: err?.message ?? String(error),
+              status: typeof err?.status === 'number' ? err.status : undefined,
+            },
+          },
+          { status: err?.name === 'StreamProtocolError' ? 400 : 500 },
+        );
+      }
+    }
+
+    if (parts[1] !== 'rpc') {
+      return errorResponse(404, 'NotFound', `unknown path: ${url.pathname}`);
     }
 
     if (request.method !== 'POST' || parts.length !== 5) {

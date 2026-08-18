@@ -1,6 +1,7 @@
 import type { WorkflowRunDONamespace } from './storage.js';
 import type { StreamDONamespace } from './streamer.js';
 import type { QueueCellNamespace } from './queue.js';
+import { MAX_STREAM_LONG_POLL_MS } from './stream-protocol.js';
 
 /** Storage-layer index interface (satisfied by IndexDO over HTTP, or a mock). */
 export interface IndexNamespace {
@@ -80,8 +81,10 @@ export interface CelldWorldConfig {
    * Default: process.env.CELLD_RUN_RETENTION_MS || 0
    */
   runRetentionMs?: number;
-  /** Poll interval (ms) while waiting for new chunks on a live stream. Default: 250 */
-  readPollMs?: number;
+  /** Duration of one bounded idle stream read. Default: 20000 */
+  streamLongPollMs?: number;
+  /** Runtime stream batching delay. Default: 0 */
+  streamFlushIntervalMs?: number;
   /** Per-attempt fleet RPC deadline in milliseconds. Default: 30000 */
   rpcTimeoutMs?: number;
 }
@@ -94,7 +97,8 @@ export interface ResolvedCelldConfig {
   baseUrl?: string;
   queueShards: number;
   runRetentionMs: number;
-  readPollMs: number;
+  streamLongPollMs: number;
+  streamFlushIntervalMs: number;
   rpcTimeoutMs: number;
 }
 
@@ -106,6 +110,30 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
     throw new Error('world-celld: runRetentionMs must be a non-negative safe integer');
   }
 
+  const rpcTimeoutMs = config?.rpcTimeoutMs ?? 30_000;
+  if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs < 1) {
+    throw new Error('world-celld: rpcTimeoutMs must be a positive safe integer');
+  }
+  const streamLongPollMs =
+    config?.streamLongPollMs ??
+    Math.min(MAX_STREAM_LONG_POLL_MS, Math.max(1, rpcTimeoutMs - 1_000));
+  if (
+    !Number.isSafeInteger(streamLongPollMs) ||
+    streamLongPollMs < 1 ||
+    streamLongPollMs > MAX_STREAM_LONG_POLL_MS
+  ) {
+    throw new Error(
+      `world-celld: streamLongPollMs must be between 1 and ${MAX_STREAM_LONG_POLL_MS}`,
+    );
+  }
+  if (streamLongPollMs >= rpcTimeoutMs) {
+    throw new Error('world-celld: streamLongPollMs must be less than rpcTimeoutMs');
+  }
+  const streamFlushIntervalMs = config?.streamFlushIntervalMs ?? 0;
+  if (!Number.isSafeInteger(streamFlushIntervalMs) || streamFlushIntervalMs < 0) {
+    throw new Error('world-celld: streamFlushIntervalMs must be a non-negative safe integer');
+  }
+
   return {
     fleetUrl: config?.fleetUrl ?? process.env.CELLD_FLEET_URL,
     secret: config?.secret ?? process.env.CELLD_WORLD_SECRET,
@@ -114,7 +142,8 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
     baseUrl: config?.baseUrl,
     queueShards: config?.queueShards ?? 1,
     runRetentionMs,
-    readPollMs: config?.readPollMs ?? 250,
-    rpcTimeoutMs: config?.rpcTimeoutMs ?? 30_000,
+    streamLongPollMs,
+    streamFlushIntervalMs,
+    rpcTimeoutMs,
   };
 }

@@ -6,28 +6,55 @@ import type {
   Streamer,
 } from '@workflow/world';
 import type { ExpireRunStreamsResult, ExpireStreamResult } from './retention.js';
+import {
+  MAX_STREAM_BATCH_BYTES,
+  MAX_STREAM_CHUNK_BYTES,
+  MAX_STREAM_LONG_POLL_MS,
+  MAX_STREAM_READ_BYTES,
+  MAX_STREAM_READ_CHUNKS,
+  MAX_STREAM_WRITE_CHUNKS,
+  normalizeStreamError,
+  type StreamErrorData,
+  type StreamReadRequest,
+  type StreamReadResult,
+  type StreamWriteResult,
+} from './stream-protocol.js';
 
 export interface CelldStreamerConfig {
   env: {
     WORKFLOW_STREAMS: StreamDONamespace;
   };
-  /**
-   * Poll interval (ms) while waiting for new chunks on a live stream.
-   * Modified vs upstream: configurable because each poll is a fleet HTTP
-   * round-trip here, not an in-process DO call. Default: 100.
-   */
-  readPollMs?: number;
+  /** Duration of one bounded idle read. Default: 20000. */
+  streamLongPollMs?: number;
+  /** Runtime coalescing delay for streams.writeMulti(). Default: 0. */
+  streamFlushIntervalMs?: number;
 }
 
-/** Workflow 5 streamer plus the package's pre-5 convenience aliases. */
-export interface CelldStreamer extends Streamer {
+export interface CelldStreamer extends Omit<Streamer, 'streams'> {
+  streams: Streamer['streams'] & {
+    fail(runId: string, name: string, error: StreamErrorData | string): Promise<void>;
+  };
   writeToStream(
     name: string,
     runId: string | Promise<string>,
     chunk: string | Uint8Array,
   ): Promise<void>;
+  writeChunksToStream(
+    name: string,
+    runId: string | Promise<string>,
+    chunks: readonly (string | Uint8Array)[],
+  ): Promise<void>;
   closeStream(name: string, runId: string | Promise<string>): Promise<void>;
-  readFromStream(name: string, startIndex?: number): Promise<ReadableStream<Uint8Array>>;
+  errorStream(
+    name: string,
+    runId: string | Promise<string>,
+    error: StreamErrorData | string,
+  ): Promise<void>;
+  readFromStream(
+    name: string,
+    runId: string,
+    startIndex?: number,
+  ): Promise<ReadableStream<Uint8Array>>;
   listStreamsByRunId(runId: string): Promise<string[]>;
   getStreamChunks(
     name: string,
@@ -37,19 +64,12 @@ export interface CelldStreamer extends Streamer {
   getStreamInfo(name: string, runId: string): Promise<StreamInfoResponse>;
 }
 
-/**
- * RPC surface of StreamDO (see durable-objects/StreamDO.ts). The streamer
- * talks to the DO exclusively via these methods — there is no fetch()
- * protocol.
- */
+/** Direct StreamDO RPC surface. Remote stubs specialize read/write as binary HTTP. */
 export interface StreamDOStub {
-  writeChunk(runId: string, data: Uint8Array): Promise<number>;
+  writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult>;
+  readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult>;
   closeStream(runId: string): Promise<void>;
-  getChunks(params: {
-    startIndex: number;
-    limit: number;
-  }): Promise<{ chunks: Uint8Array[]; done: boolean; tailIndex: number }>;
-  getInfo(): Promise<{ tailIndex: number; done: boolean }>;
+  failStream(runId: string, error: StreamErrorData | string): Promise<void>;
   registerStream(runId: string, name: string): Promise<void>;
   listStreams(): Promise<string[]>;
   expireRegistry(runId: string, expiredAt: number): Promise<ExpireRunStreamsResult>;
@@ -66,21 +86,38 @@ export interface StreamDOId {
   toString(): string;
 }
 
-/** Default poll interval while waiting for new chunks on a live stream. */
-const READ_POLL_MS = 100;
-/** Chunks fetched per DO round-trip while reading. */
-const READ_BATCH_SIZE = 32;
-/** Default / maximum page sizes for getStreamChunks. */
-const DEFAULT_CHUNK_PAGE_SIZE = 32;
-const MAX_CHUNK_PAGE_SIZE = 32;
+const DEFAULT_LONG_POLL_MS = MAX_STREAM_LONG_POLL_MS;
+const DEFAULT_CHUNK_PAGE_SIZE = MAX_STREAM_READ_CHUNKS;
+const MAX_CHUNK_PAGE_SIZE = MAX_STREAM_READ_CHUNKS;
+const REGISTERED_STREAM_CACHE_SIZE = 4096;
 
 function toBytes(chunk: string | Uint8Array): Uint8Array {
   return typeof chunk === 'string' ? new TextEncoder().encode(chunk) : chunk;
 }
 
+function throwTerminal(result: StreamReadResult): void {
+  if (result.state === 'expired') throw new Error('Stream has expired');
+  if (result.state === 'errored') {
+    const error = new Error(result.error?.message ?? 'Stream failed');
+    error.name = result.error?.name ?? 'Error';
+    throw error;
+  }
+}
+
 export function createStreamer(config: CelldStreamerConfig): CelldStreamer {
   const { env } = config;
-  const readPollMs = config.readPollMs ?? READ_POLL_MS;
+  const streamLongPollMs = config.streamLongPollMs ?? DEFAULT_LONG_POLL_MS;
+  if (
+    !Number.isSafeInteger(streamLongPollMs) ||
+    streamLongPollMs < 1 ||
+    streamLongPollMs > MAX_STREAM_LONG_POLL_MS
+  ) {
+    throw new Error(`streamLongPollMs must be between 1 and ${MAX_STREAM_LONG_POLL_MS}`);
+  }
+  const streamFlushIntervalMs = config.streamFlushIntervalMs ?? 0;
+  if (!Number.isSafeInteger(streamFlushIntervalMs) || streamFlushIntervalMs < 0) {
+    throw new Error('streamFlushIntervalMs must be a non-negative safe integer');
+  }
 
   const getStreamDO = (streamName: string): StreamDOStub => {
     const id = env.WORKFLOW_STREAMS.idFromName(`stream:${streamName}`);
@@ -92,25 +129,58 @@ export function createStreamer(config: CelldStreamerConfig): CelldStreamer {
     return env.WORKFLOW_STREAMS.get(id);
   };
 
-  /** Per-isolate cache so each (runId, stream) pair registers only once. */
+  /** Bounded per-isolate cache; eviction only repeats idempotent registration. */
   const registeredStreams = new Set<string>();
 
   async function registerStreamForRun(name: string, runId: string): Promise<void> {
     const cacheKey = `${runId}\0${name}`;
     if (registeredStreams.has(cacheKey)) return;
     await getRunRegistryDO(runId).registerStream(runId, name);
+    if (registeredStreams.size >= REGISTERED_STREAM_CACHE_SIZE) {
+      const oldest = registeredStreams.values().next().value;
+      if (oldest !== undefined) registeredStreams.delete(oldest);
+    }
     registeredStreams.add(cacheKey);
   }
 
-  const writeToStream = async (
+  const writeChunksToStream = async (
+    name: string,
+    runId: string | Promise<string>,
+    input: readonly (string | Uint8Array)[],
+  ): Promise<void> => {
+    if (input.length === 0) return;
+    const resolvedRunId = await runId;
+    const chunks = input.map(toBytes);
+    for (const chunk of chunks) {
+      if (chunk.byteLength > MAX_STREAM_CHUNK_BYTES) {
+        throw new Error(`Stream chunk exceeds ${MAX_STREAM_CHUNK_BYTES} bytes`);
+      }
+    }
+    await registerStreamForRun(name, resolvedRunId);
+
+    let batch: Uint8Array[] = [];
+    let batchBytes = 0;
+    for (const chunk of chunks) {
+      if (
+        batch.length > 0 &&
+        (batch.length === MAX_STREAM_WRITE_CHUNKS ||
+          batchBytes + chunk.byteLength > MAX_STREAM_BATCH_BYTES)
+      ) {
+        await getStreamDO(name).writeChunks(resolvedRunId, batch);
+        batch = [];
+        batchBytes = 0;
+      }
+      batch.push(chunk);
+      batchBytes += chunk.byteLength;
+    }
+    if (batch.length > 0) await getStreamDO(name).writeChunks(resolvedRunId, batch);
+  };
+
+  const writeToStream = (
     name: string,
     runId: string | Promise<string>,
     chunk: string | Uint8Array,
-  ): Promise<void> => {
-    const resolvedRunId = await runId;
-    await registerStreamForRun(name, resolvedRunId);
-    await getStreamDO(name).writeChunk(resolvedRunId, toBytes(chunk));
-  };
+  ): Promise<void> => writeChunksToStream(name, runId, [chunk]);
 
   const closeStream = async (name: string, runId: string | Promise<string>): Promise<void> => {
     const resolvedRunId = await runId;
@@ -118,51 +188,80 @@ export function createStreamer(config: CelldStreamerConfig): CelldStreamer {
     await getStreamDO(name).closeStream(resolvedRunId);
   };
 
+  const errorStream = async (
+    name: string,
+    runId: string | Promise<string>,
+    error: StreamErrorData | string,
+  ): Promise<void> => {
+    const resolvedRunId = await runId;
+    await registerStreamForRun(name, resolvedRunId);
+    await getStreamDO(name).failStream(resolvedRunId, normalizeStreamError(error));
+  };
+
   const readFromStream = async (
     name: string,
+    runId: string,
     startIndex = 0,
   ): Promise<ReadableStream<Uint8Array>> => {
     const stub = getStreamDO(name);
 
-    // Negative startIndex counts back from the current end, clamped to 0.
     let nextIndex: number;
     if (startIndex < 0) {
-      const info = await stub.getInfo();
+      const info = await stub.readChunks({
+        runId,
+        startIndex: 0,
+        maxChunks: 0,
+        maxBytes: MAX_STREAM_READ_BYTES,
+        waitMs: 0,
+      });
+      throwTerminal(info);
       nextIndex = Math.max(0, info.tailIndex + 1 + startIndex);
     } else {
       nextIndex = startIndex;
     }
 
     let cancelled = false;
+    const abortController = new AbortController();
 
     return new ReadableStream<Uint8Array>({
       async pull(controller) {
-        // Loop until we can enqueue data, close, or the reader cancels.
-        // Errors from the DO propagate and error the stream — readers must
-        // never see a silently-truncated stream.
-        while (true) {
+        for (;;) {
           if (cancelled) return;
-          const { chunks, done } = await stub.getChunks({
-            startIndex: nextIndex,
-            limit: READ_BATCH_SIZE,
-          });
-          if (chunks.length > 0) {
-            for (const chunk of chunks) {
-              controller.enqueue(chunk);
-            }
-            nextIndex += chunks.length;
+          let result: StreamReadResult;
+          try {
+            result = await stub.readChunks(
+              {
+                runId,
+                startIndex: nextIndex,
+                maxChunks: MAX_STREAM_READ_CHUNKS,
+                maxBytes: MAX_STREAM_READ_BYTES,
+                waitMs: streamLongPollMs,
+              },
+              abortController.signal,
+            );
+          } catch (error) {
+            if (cancelled || abortController.signal.aborted) return;
+            throw error;
+          }
+
+          if (result.chunks.length > 0) {
+            for (const chunk of result.chunks) controller.enqueue(chunk);
+            nextIndex += result.chunks.length;
             return;
           }
-          if (done) {
+          throwTerminal(result);
+          if (result.state === 'closed') {
             controller.close();
             return;
           }
-          await new Promise((resolve) => setTimeout(resolve, readPollMs));
+          // A normal long-poll timeout returns no data; keep the pending
+          // ReadableStream read attached through the next bounded request.
         }
       },
 
       cancel() {
         cancelled = true;
+        abortController.abort(new DOMException('Stream reader cancelled', 'AbortError'));
       },
     });
   };
@@ -172,47 +271,70 @@ export function createStreamer(config: CelldStreamerConfig): CelldStreamer {
 
   const getStreamChunks = async (
     name: string,
-    _runId: string,
+    runId: string,
     options?: GetChunksOptions,
   ): Promise<StreamChunksResponse> => {
-    const limit = Math.min(options?.limit ?? DEFAULT_CHUNK_PAGE_SIZE, MAX_CHUNK_PAGE_SIZE);
+    const requestedLimit = options?.limit ?? DEFAULT_CHUNK_PAGE_SIZE;
+    if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
+      throw new Error('Stream chunk limit must be a positive safe integer');
+    }
+    const limit = Math.min(requestedLimit, MAX_CHUNK_PAGE_SIZE);
     const startIndex = options?.cursor ? Number.parseInt(options.cursor, 10) : 0;
     if (Number.isNaN(startIndex) || startIndex < 0) {
       throw new Error(`Invalid stream cursor: ${options?.cursor}`);
     }
 
-    const stub = getStreamDO(name);
-    const result = await stub.getChunks({ startIndex, limit: limit + 1 });
-    const hasMore = result.chunks.length > limit;
-    const data: StreamChunk[] = result.chunks
-      .slice(0, limit)
-      .map((chunk, offset) => ({ index: startIndex + offset, data: chunk }));
+    const result = await getStreamDO(name).readChunks({
+      runId,
+      startIndex,
+      maxChunks: limit,
+      maxBytes: MAX_STREAM_READ_BYTES,
+      waitMs: 0,
+    });
+    throwTerminal(result);
+    const data: StreamChunk[] = result.chunks.map((chunk, offset) => ({
+      index: startIndex + offset,
+      data: chunk,
+    }));
+    const nextIndex = startIndex + data.length;
+    const hasMore = nextIndex <= result.tailIndex;
 
     return {
       data,
-      cursor: hasMore ? String(startIndex + limit) : null,
+      cursor: hasMore ? String(nextIndex) : null,
       hasMore,
-      done: result.done,
+      done: result.state === 'closed',
     };
   };
 
-  const getStreamInfo = (name: string, _runId: string): Promise<StreamInfoResponse> =>
-    getStreamDO(name).getInfo();
+  const getStreamInfo = async (name: string, runId: string): Promise<StreamInfoResponse> => {
+    const result = await getStreamDO(name).readChunks({
+      runId,
+      startIndex: 0,
+      maxChunks: 0,
+      maxBytes: MAX_STREAM_READ_BYTES,
+      waitMs: 0,
+    });
+    throwTerminal(result);
+    return { tailIndex: result.tailIndex, done: result.state === 'closed' };
+  };
 
   return {
+    streamFlushIntervalMs,
     streams: {
       write: (runId, name, chunk) => writeToStream(name, runId, chunk),
+      writeMulti: (runId, name, chunks) => writeChunksToStream(name, runId, chunks),
       close: (runId, name) => closeStream(name, runId),
-      get: (runId, name, startIndex) => {
-        void runId;
-        return readFromStream(name, startIndex);
-      },
+      fail: (runId, name, error) => errorStream(name, runId, error),
+      get: (runId, name, startIndex) => readFromStream(name, runId, startIndex),
       list: listStreamsByRunId,
       getChunks: (runId, name, options) => getStreamChunks(name, runId, options),
       getInfo: (runId, name) => getStreamInfo(name, runId),
     },
     writeToStream,
+    writeChunksToStream,
     closeStream,
+    errorStream,
     readFromStream,
     listStreamsByRunId,
     getStreamChunks,

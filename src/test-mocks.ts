@@ -11,6 +11,16 @@ import { slotToEventId, type Event, type Hook, type Step, type WorkflowRun } fro
 import type { HookTokenOwner } from './config.js';
 import type { EnqueueOutcome, EnqueueRequest, QueueCellStub } from './queue.js';
 import {
+  normalizeStreamError,
+  validateStreamReadRequest,
+  validateStreamWriteChunks,
+  type StreamErrorData,
+  type StreamReadRequest,
+  type StreamReadResult,
+  type StreamTerminalState,
+  type StreamWriteResult,
+} from './stream-protocol.js';
+import {
   applyEvent,
   finalizeEventPage,
   type ApplyEventOutcome,
@@ -385,44 +395,108 @@ class MockKVNamespace {
  */
 class MockStreamDOStub {
   private chunks: Uint8Array[] = [];
-  private closed = false;
+  private state: StreamTerminalState = 'open';
+  private error: StreamErrorData | undefined;
   private registry = new Set<string>();
   private ownerRunId: string | undefined;
   private expired = false;
+  private waiters = new Set<() => void>();
 
-  async writeChunk(runId: string, data: Uint8Array): Promise<number> {
+  private wake(): void {
+    for (const resolve of Array.from(this.waiters)) resolve();
+  }
+
+  async writeChunks(runId: string, data: Uint8Array[]): Promise<StreamWriteResult> {
+    validateStreamWriteChunks(data);
     if (this.expired) throw new Error('Stream has expired');
     if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
     this.ownerRunId = runId;
-    if (this.closed) {
+    if (this.state !== 'open') {
       throw new Error('Cannot write to a closed stream');
     }
-    this.chunks.push(data);
-    return this.chunks.length - 1;
+    const startIndex = this.chunks.length;
+    this.chunks.push(...data.map((chunk) => new Uint8Array(chunk)));
+    this.wake();
+    return { startIndex, count: data.length, tailIndex: this.chunks.length - 1 };
   }
 
   async closeStream(runId: string): Promise<void> {
     if (this.expired) throw new Error('Stream has expired');
     if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
     this.ownerRunId = runId;
-    this.closed = true;
+    if (this.state === 'open') this.state = 'closed';
+    this.wake();
   }
 
-  async getChunks(params: { startIndex: number; limit: number }): Promise<{
-    chunks: Uint8Array[];
-    done: boolean;
-    tailIndex: number;
-  }> {
-    const start = Math.max(0, params.startIndex);
-    return {
-      chunks: this.chunks.slice(start, start + params.limit),
-      done: this.closed,
-      tailIndex: this.chunks.length - 1,
+  async failStream(runId: string, error: StreamErrorData | string): Promise<void> {
+    if (this.expired) throw new Error('Stream has expired');
+    if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
+    this.ownerRunId = runId;
+    if (this.state === 'open') {
+      this.state = 'errored';
+      this.error = normalizeStreamError(error);
+    }
+    this.wake();
+  }
+
+  async readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult> {
+    validateStreamReadRequest(request);
+    const snapshot = (timedOut: boolean): StreamReadResult => {
+      let bytes = 0;
+      const chunks: Uint8Array[] = [];
+      if (this.state !== 'expired') {
+        for (const chunk of this.chunks.slice(
+          request.startIndex,
+          request.startIndex + request.maxChunks,
+        )) {
+          if (bytes + chunk.byteLength > request.maxBytes) break;
+          chunks.push(structuredClone(chunk));
+          bytes += chunk.byteLength;
+        }
+      }
+      return {
+        startIndex: request.startIndex,
+        tailIndex: this.chunks.length - 1,
+        chunks,
+        state: this.state,
+        timedOut,
+        error: this.error,
+      };
     };
-  }
+    const immediate = snapshot(false);
+    if (
+      immediate.chunks.length > 0 ||
+      immediate.state !== 'open' ||
+      request.waitMs === 0 ||
+      request.maxChunks === 0
+    ) {
+      return immediate;
+    }
+    if (signal?.aborted) throw signal.reason;
 
-  async getInfo(): Promise<{ tailIndex: number; done: boolean }> {
-    return { tailIndex: this.chunks.length - 1, done: this.closed };
+    const timedOut = await new Promise<boolean>((resolve, reject) => {
+      let settled = false;
+      const finish = (timeout: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.waiters.delete(onChange);
+        signal?.removeEventListener('abort', onAbort);
+        resolve(timeout);
+      };
+      const onChange = () => finish(false);
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.waiters.delete(onChange);
+        reject(signal?.reason);
+      };
+      const timer = setTimeout(() => finish(true), request.waitMs);
+      this.waiters.add(onChange);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+    return snapshot(timedOut);
   }
 
   async registerStream(runId: string, name: string): Promise<void> {
@@ -454,8 +528,9 @@ class MockStreamDOStub {
     const chunks = this.chunks.length;
     this.ownerRunId = runId;
     this.chunks = [];
-    this.closed = true;
+    this.state = 'expired';
     this.expired = true;
+    this.wake();
     return { deleted: true, chunks };
   }
 }
