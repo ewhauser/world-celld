@@ -33,6 +33,7 @@ import type {
 import {
   EventSchema,
   HookSchema,
+  isTerminalWorkflowRunStatus,
   SPEC_VERSION_CURRENT,
   StepSchema,
   WorkflowRunSchema,
@@ -42,12 +43,7 @@ import { monotonicFactory } from 'ulid';
 import type { ApplyEventFailure, ApplyEventOutcome, ApplyEventRequest } from './apply-event.js';
 import type { HookTokenOwner, IndexNamespace } from './config.js';
 import { compact } from './util.js';
-import {
-  correlationIndexKey,
-  globalRunIndexKey,
-  type RunReadOutcome,
-  workflowRunIndexKey,
-} from './retention.js';
+import { globalRunIndexKey, type RunReadOutcome, workflowRunIndexKey } from './retention.js';
 
 /**
  * RPC surface of WorkflowRunDO used by the storage layer. Declared
@@ -181,6 +177,30 @@ function unwrapRead<T>(outcome: RunReadOutcome<T>): T {
   return outcome.value;
 }
 
+/** Bound cross-run fanout so large list pages cannot create an RPC burst. */
+const RUN_LIST_CONCURRENCY = 8;
+
+interface RunIndexMetadata {
+  runId: string;
+  /** Optional so indexes written by older deployments remain readable. */
+  status?: WorkflowRun['status'];
+}
+
+/**
+ * Run statuses only move pending -> running -> terminal, and terminal statuses
+ * are immutable. An older index value may therefore safely exclude a filter
+ * only when it is already terminal, or when the caller asks for pending and
+ * the index has advanced beyond pending. Earlier non-terminal metadata cannot
+ * exclude a later status because a post-commit index write may need replay.
+ */
+function indexStatusExcludes(
+  indexed: WorkflowRun['status'] | undefined,
+  requested: WorkflowRun['status'] | undefined,
+): boolean {
+  if (indexed === undefined || requested === undefined || indexed === requested) return false;
+  return isTerminalWorkflowRunStatus(indexed) || requested === 'pending';
+}
+
 export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
   const cleanup = {
@@ -241,19 +261,55 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             break;
           }
 
-          for (const key of kvList.keys) {
-            const meta = await env.WORKFLOW_INDEX.get(key.name);
-            if (!meta) continue;
-            const { runId } = JSON.parse(meta) as { runId: string };
-            try {
-              const run = await runsGet(runId, { resolveData: params?.resolveData });
-              if (!params?.status || run.status === params.status) {
-                matches.push({ key: key.name, run });
-                if (matches.length > limit) break;
+          // IndexDO returns values with the page. Resolve missing values in
+          // bounded batches as a compatibility fallback for older/custom
+          // KV-like adapters instead of restoring serial per-key reads.
+          const candidates: Array<{ key: string; metadata: RunIndexMetadata }> = [];
+          for (let offset = 0; offset < kvList.keys.length; offset += RUN_LIST_CONCURRENCY) {
+            const batch = kvList.keys.slice(offset, offset + RUN_LIST_CONCURRENCY);
+            const values = await Promise.all(
+              batch.map(async (key) => ({
+                key: key.name,
+                value: key.value ?? (await env.WORKFLOW_INDEX.get(key.name)),
+              })),
+            );
+            for (const { key, value } of values) {
+              if (!value) continue;
+              const metadata = JSON.parse(value) as RunIndexMetadata;
+              // Use monotonic status metadata as a conservative prefilter,
+              // then still verify every candidate against the authoritative
+              // RunDO below. Earlier metadata cannot exclude a later status.
+              if (indexStatusExcludes(metadata.status, params?.status)) {
+                continue;
               }
-            } catch (error) {
-              if (!WorkflowRunNotFoundError.is(error) && !RunExpiredError.is(error)) throw error;
+              candidates.push({ key, metadata });
             }
+          }
+
+          // Fetch enough candidates to prove the requested page and hasMore,
+          // retaining index order while limiting concurrent cross-run RPCs.
+          for (let offset = 0; offset < candidates.length && matches.length <= limit;) {
+            const needed = limit + 1 - matches.length;
+            const batch = candidates.slice(offset, offset + Math.min(RUN_LIST_CONCURRENCY, needed));
+            const resolved = await Promise.all(
+              batch.map(async ({ key, metadata }) => {
+                try {
+                  const run = await runsGet(metadata.runId, {
+                    resolveData: params?.resolveData,
+                  });
+                  return !params?.status || run.status === params.status ? { key, run } : null;
+                } catch (error) {
+                  if (!WorkflowRunNotFoundError.is(error) && !RunExpiredError.is(error)) {
+                    throw error;
+                  }
+                  return null;
+                }
+              }),
+            );
+            for (const match of resolved) {
+              if (match) matches.push(match);
+            }
+            offset += batch.length;
           }
 
           exhausted = kvList.list_complete;
@@ -358,19 +414,6 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             runId: effectiveRunId,
             hookId: released.hookId,
           });
-        }
-        if (outcome.event?.correlationId) {
-          const correlationKey = correlationIndexKey(
-            outcome.event.correlationId,
-            outcome.event.createdAt,
-            outcome.event.eventId,
-            effectiveRunId,
-          );
-          await env.WORKFLOW_INDEX.putOwned(
-            effectiveRunId,
-            correlationKey,
-            JSON.stringify({ runId: effectiveRunId, eventId: outcome.event.eventId }),
-          );
         }
 
         const eventPage =

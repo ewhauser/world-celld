@@ -20,6 +20,12 @@ export interface FakeStorageMutation {
   value?: unknown;
 }
 
+export interface FakeStorageListCall {
+  options: FakeListOptions;
+  resultSize: number;
+  transactional: boolean;
+}
+
 function applyListOptions(keys: string[], options: FakeListOptions): string[] {
   let result = keys.toSorted();
   if (options.prefix !== undefined) {
@@ -55,6 +61,8 @@ function applyListOptions(keys: string[], options: FakeListOptions): string[] {
 export class FakeStorage {
   data = new Map<string, unknown>();
   alarmAt: number | null = null;
+  /** Deterministic query-shape instrumentation for storage scaling tests. */
+  listCalls: FakeStorageListCall[] = [];
   private mutationFailure?: {
     predicate: (mutation: FakeStorageMutation) => boolean;
     error: Error;
@@ -84,6 +92,7 @@ export class FakeStorage {
 
   async list<T>(options: FakeListOptions = {}): Promise<Map<string, T>> {
     const keys = applyListOptions(Array.from(this.data.keys()), options);
+    this.recordList(options, keys.length, false);
     return new Map(keys.map((k) => [k, this.data.get(k) as T]));
   }
 
@@ -125,6 +134,11 @@ export class FakeStorage {
     this.mutationFailure = undefined;
     throw error;
   }
+
+  /** @internal Shared with FakeTransaction for deterministic query tracing. */
+  recordList(options: FakeListOptions, resultSize: number, transactional: boolean): void {
+    this.listCalls.push({ options: { ...options }, resultSize, transactional });
+  }
 }
 
 class FakeTransaction {
@@ -159,6 +173,7 @@ class FakeTransaction {
     for (const key of this.deleted) merged.delete(key);
     for (const [key, value] of this.staged) merged.set(key, value);
     const keys = applyListOptions(Array.from(merged.keys()), options);
+    this.storage.recordList(options, keys.length, true);
     return new Map(keys.map((k) => [k, merged.get(k) as T]));
   }
 
