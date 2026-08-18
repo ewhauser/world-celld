@@ -103,6 +103,7 @@ export interface QueueCellStub {
   expireRun(
     runId: string,
     expiredAt: number,
+    options?: { limit?: number },
   ): Promise<import('./retention.js').ExpireQueueRunResult>;
 }
 

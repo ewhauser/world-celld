@@ -39,6 +39,8 @@ import { parse } from './vendor/shared/index.js';
 import type {
   CleanupRecord,
   ExpireRunIndexesRequest,
+  ReleaseHookIndexesRequest,
+  ReleaseHookIndexesResult,
   RunReadOutcome,
   ScheduleCleanupRequest,
 } from './retention.js';
@@ -244,7 +246,12 @@ class MockWorkflowRunDOStub {
  */
 class MockKVNamespace {
   async get(key: string): Promise<string | null> {
-    return kvData.get(key) ?? null;
+    const value = kvData.get(key);
+    if (value && (key.startsWith('hook:') || key.startsWith('hookid:'))) {
+      const hook = parse<Hook>(value);
+      if (kvData.has(`terminal:${hook.runId}`) || kvData.has(`expired:${hook.runId}`)) return null;
+    }
+    return value ?? null;
   }
 
   async put(key: string, value: string): Promise<void> {
@@ -260,6 +267,7 @@ class MockKVNamespace {
   async expireRun(request: ExpireRunIndexesRequest): Promise<{ deleted: number }> {
     kvData.set(`expired:${request.runId}`, String(request.expiredAt));
     let deleted = 0;
+    if (kvData.delete(`terminal:${request.runId}`)) deleted++;
     for (const key of request.keys) {
       if (kvData.delete(key)) deleted++;
     }
@@ -345,6 +353,10 @@ class MockKVNamespace {
     serializedHook: string,
     owner: HookTokenOwner,
   ): Promise<void> {
+    if (kvData.has(`terminal:${owner.runId}`) || kvData.has(`expired:${owner.runId}`)) {
+      await this.releaseHookToken(token, owner);
+      return;
+    }
     const raw = kvData.get(`hook:${token}`);
     if (raw !== undefined) {
       const hook = parse<Hook>(raw);
@@ -375,17 +387,30 @@ class MockKVNamespace {
     }
   }
 
-  async deleteHookIndexes(token: string, hookId: string, owner: HookTokenOwner): Promise<void> {
-    for (const key of [`hook:${token}`, `hookid:${hookId}`]) {
-      const raw = kvData.get(key);
-      if (raw !== undefined) {
-        const hook = parse<Hook>(raw);
-        if (hook.runId === owner.runId && hook.hookId === owner.hookId) {
-          kvData.delete(key);
+  async releaseHookIndexes(request: ReleaseHookIndexesRequest): Promise<ReleaseHookIndexesResult> {
+    if (request.terminal) kvData.set(`terminal:${request.runId}`, String(Date.now()));
+    let deleted = 0;
+    for (const { token, hookId } of request.hooks) {
+      const owner = { runId: request.runId, hookId };
+      for (const key of [`hook:${token}`, `hookid:${hookId}`]) {
+        const raw = kvData.get(key);
+        if (raw !== undefined) {
+          const hook = parse<Hook>(raw);
+          if (hook.runId === owner.runId && hook.hookId === owner.hookId) {
+            deleted += Number(kvData.delete(key));
+          }
+        }
+      }
+      const claimKey = `hookclaim:${token}`;
+      const claim = kvData.get(claimKey);
+      if (claim !== undefined) {
+        const holder = JSON.parse(claim) as HookTokenOwner;
+        if (holder.runId === owner.runId && holder.hookId === owner.hookId) {
+          deleted += Number(kvData.delete(claimKey));
         }
       }
     }
-    await this.releaseHookToken(token, owner);
+    return { deleted };
   }
 }
 
@@ -400,6 +425,7 @@ class MockStreamDOStub {
   private registry = new Set<string>();
   private ownerRunId: string | undefined;
   private expired = false;
+  private registryDeleted = 0;
   private waiters = new Set<() => void>();
 
   private wake(): void {
@@ -511,27 +537,49 @@ class MockStreamDOStub {
     return Array.from(this.registry).toSorted();
   }
 
-  async expireRegistry(runId: string): Promise<{ streams: string[] }> {
+  async expireRegistry(
+    runId: string,
+    _expiredAt: number,
+    options?: { limit?: number },
+  ): Promise<{ streams: string[] }> {
     if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Registry owner mismatch');
     this.ownerRunId = runId;
     this.expired = true;
-    return { streams: Array.from(this.registry) };
+    const streams = Array.from(this.registry);
+    return { streams: streams.slice(0, options?.limit ?? streams.length) };
   }
 
-  async finalizeRegistry(runId: string): Promise<void> {
+  async finalizeRegistry(
+    runId: string,
+    streams: string[],
+  ): Promise<{ deleted: number; done: boolean }> {
     if (this.ownerRunId !== runId || !this.expired) throw new Error('Registry is not expired');
-    this.registry.clear();
+    for (const stream of streams) this.registryDeleted += Number(this.registry.delete(stream));
+    return { deleted: this.registryDeleted, done: this.registry.size === 0 };
   }
 
-  async expireStream(runId: string): Promise<{ deleted: boolean; chunks: number }> {
+  async expireStream(
+    runId: string,
+    _expiredAt: number,
+    options?: { limit?: number; byteLimit?: number },
+  ): Promise<{ deleted: boolean; chunks: number; bytes: number; done: boolean }> {
     if (this.ownerRunId && this.ownerRunId !== runId) throw new Error('Stream owner mismatch');
-    const chunks = this.chunks.length;
+    const firstFence = !this.expired;
+    const limit = Math.min(this.chunks.length, options?.limit ?? this.chunks.length);
+    const byteLimit = options?.byteLimit ?? Number.POSITIVE_INFINITY;
+    let chunks = 0;
+    let bytes = 0;
+    for (const chunk of this.chunks.slice(0, limit)) {
+      if (chunks > 0 && bytes + chunk.byteLength > byteLimit) break;
+      chunks++;
+      bytes += chunk.byteLength;
+    }
     this.ownerRunId = runId;
-    this.chunks = [];
+    this.chunks.splice(0, chunks);
     this.state = 'expired';
     this.expired = true;
     this.wake();
-    return { deleted: true, chunks };
+    return { deleted: firstFence, chunks, bytes, done: this.chunks.length === 0 };
   }
 }
 
@@ -559,8 +607,8 @@ class MockQueueCellStub implements QueueCellStub {
     return { ok: true, messageId: request.messageId, deduped: false };
   }
 
-  async expireRun(): Promise<{ deleted: number }> {
-    return { deleted: 0 };
+  async expireRun(): Promise<{ deleted: number; done: boolean }> {
+    return { deleted: 0, done: true };
   }
 }
 

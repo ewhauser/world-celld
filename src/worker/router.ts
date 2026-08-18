@@ -86,7 +86,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'reserveHookToken',
       'finalizeHookIndexes',
       'releaseHookToken',
-      'deleteHookIndexes',
+      'releaseHookIndexes',
     ]),
   },
   queue: {

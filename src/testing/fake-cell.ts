@@ -37,6 +37,13 @@ export interface FakeStorageListCall {
   transactional: boolean;
 }
 
+export interface FakeStorageOperationCall {
+  operation: 'get' | 'put' | 'delete';
+  keys: string[];
+  transactional: boolean;
+  synchronous: boolean;
+}
+
 function applyListOptions(keys: string[], options: FakeListOptions): string[] {
   let result = keys.toSorted();
   if (options.prefix !== undefined) {
@@ -86,6 +93,7 @@ export class FakeStorage {
   private transactionTail: Promise<void> = Promise.resolve();
   /** Deterministic query-shape instrumentation for storage scaling tests. */
   listCalls: FakeStorageListCall[] = [];
+  operationCalls: FakeStorageOperationCall[] = [];
   private mutationFailure?: {
     predicate: (mutation: FakeStorageMutation) => boolean;
     error: Error;
@@ -99,11 +107,13 @@ export class FakeStorage {
     if (Array.isArray(keyOrKeys)) {
       this.operationCounts.getMany += 1;
       this.getManyCalls.push([...keyOrKeys]);
+      this.recordStorageCall('get', keyOrKeys, false);
       return new Map(
         keyOrKeys.filter((key) => this.data.has(key)).map((key) => [key, this.data.get(key) as T]),
       );
     }
     this.operationCounts.get += 1;
+    this.recordStorageCall('get', [keyOrKeys], false);
     return this.data.get(keyOrKeys) as T | undefined;
   }
 
@@ -113,6 +123,7 @@ export class FakeStorage {
     if (typeof keyOrEntries === 'string') {
       this.operationCounts.put += 1;
       this.maybeFailMutation({ operation: 'put', key: keyOrEntries, value });
+      this.recordStorageCall('put', [keyOrEntries], false);
       this.data.set(keyOrEntries, structuredClone(value));
       return;
     }
@@ -120,6 +131,7 @@ export class FakeStorage {
     for (const [key, entryValue] of Object.entries(keyOrEntries)) {
       this.maybeFailMutation({ operation: 'put', key, value: entryValue });
     }
+    this.recordStorageCall('put', Object.keys(keyOrEntries), false);
     for (const [key, entryValue] of Object.entries(keyOrEntries)) {
       this.data.set(key, structuredClone(entryValue));
     }
@@ -131,10 +143,12 @@ export class FakeStorage {
     if (typeof keyOrKeys === 'string') {
       this.operationCounts.delete += 1;
       this.maybeFailMutation({ operation: 'delete', key: keyOrKeys });
+      this.recordStorageCall('delete', [keyOrKeys], false);
       return this.data.delete(keyOrKeys);
     }
     this.operationCounts.deleteMany += 1;
     for (const key of keyOrKeys) this.maybeFailMutation({ operation: 'delete', key });
+    this.recordStorageCall('delete', keyOrKeys, false);
     let deleted = 0;
     for (const key of keyOrKeys) if (this.data.delete(key)) deleted += 1;
     return deleted;
@@ -190,11 +204,21 @@ export class FakeStorage {
       this.operationCounts[key] = 0;
     }
     this.getManyCalls.length = 0;
+    this.operationCalls.length = 0;
   }
 
   /** @internal Used by FakeTransaction to count the same platform operations. */
   recordOperation(operation: keyof FakeStorageOperationCounts): void {
     this.operationCounts[operation] += 1;
+  }
+
+  /** @internal Shared with FakeTransaction for deterministic key tracing. */
+  recordStorageCall(
+    operation: FakeStorageOperationCall['operation'],
+    keys: string[],
+    transactional: boolean,
+  ): void {
+    this.operationCalls.push({ operation, keys: [...keys], transactional, synchronous: false });
   }
 
   /** Inject one matching write failure, including writes inside transactions. */
@@ -231,6 +255,8 @@ class FakeTransaction {
   async get<T>(keyOrKeys: string | string[]): Promise<T | undefined | Map<string, T>> {
     if (Array.isArray(keyOrKeys)) {
       this.storage.recordOperation('getMany');
+      this.storage.getManyCalls.push([...keyOrKeys]);
+      this.storage.recordStorageCall('get', keyOrKeys, true);
       const result = new Map<string, T>();
       for (const key of keyOrKeys) {
         if (this.deleted.has(key)) continue;
@@ -241,6 +267,7 @@ class FakeTransaction {
     }
     this.storage.recordOperation('get');
     const key = keyOrKeys;
+    this.storage.recordStorageCall('get', [key], true);
     if (this.deleted.has(key)) return undefined;
     if (this.staged.has(key)) return this.staged.get(key) as T;
     return this.storage.data.get(key) as T | undefined;
@@ -252,6 +279,7 @@ class FakeTransaction {
     if (typeof keyOrEntries === 'string') {
       this.storage.recordOperation('put');
       this.storage.maybeFailMutation({ operation: 'put', key: keyOrEntries, value });
+      this.storage.recordStorageCall('put', [keyOrEntries], true);
       this.deleted.delete(keyOrEntries);
       this.staged.set(keyOrEntries, structuredClone(value));
       return;
@@ -260,6 +288,7 @@ class FakeTransaction {
     for (const [key, entryValue] of Object.entries(keyOrEntries)) {
       this.storage.maybeFailMutation({ operation: 'put', key, value: entryValue });
     }
+    this.storage.recordStorageCall('put', Object.keys(keyOrEntries), true);
     for (const [key, entryValue] of Object.entries(keyOrEntries)) {
       this.deleted.delete(key);
       this.staged.set(key, structuredClone(entryValue));
@@ -271,9 +300,11 @@ class FakeTransaction {
   async delete(keyOrKeys: string | string[]): Promise<boolean | number> {
     if (typeof keyOrKeys === 'string') {
       this.storage.recordOperation('delete');
+      this.storage.recordStorageCall('delete', [keyOrKeys], true);
       return this.deleteOne(keyOrKeys);
     }
     this.storage.recordOperation('deleteMany');
+    this.storage.recordStorageCall('delete', keyOrKeys, true);
     let deleted = 0;
     for (const key of keyOrKeys) if (this.deleteOne(key)) deleted += 1;
     return deleted;

@@ -258,12 +258,16 @@ describe('StreamDO binary batch and long-poll protocol', () => {
     await expect(get().expireStream(RUN_ID, Date.now())).resolves.toEqual({
       deleted: true,
       chunks: 2,
+      bytes: 2,
+      done: true,
     });
     await expect(pending).resolves.toMatchObject({ state: 'expired', chunks: [] });
     expect(Array.from(fleet.cell('streams', name).storage.data.keys())).toEqual(['meta']);
     await expect(get().expireStream(RUN_ID, Date.now())).resolves.toEqual({
-      deleted: true,
-      chunks: 2,
+      deleted: false,
+      chunks: 0,
+      bytes: 0,
+      done: true,
     });
   });
 

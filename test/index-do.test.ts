@@ -6,6 +6,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import { IndexDO } from '../src/worker/durable-objects/IndexDO.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
+import { stringify } from '../src/vendor/shared/index.js';
 
 describe('IndexDO', () => {
   let fleet: FakeFleet;
@@ -76,6 +77,18 @@ describe('IndexDO', () => {
     expect(page.cursor).toBeUndefined();
   });
 
+  it('caps direct index listings at the public pagination limit', async () => {
+    const storage = fleet.cell('index', 'index').storage;
+    for (let item = 0; item < 1_001; item++) {
+      storage.data.set(`run:bounded:${String(item).padStart(4, '0')}`, String(item));
+    }
+
+    const page = await index.list({ prefix: 'run:bounded:', limit: 10_000 });
+    expect(page.keys).toHaveLength(1_000);
+    expect(page.list_complete).toBe(false);
+    expect(page.cursor).toBe('run:bounded:0999');
+  });
+
   it('atomically deletes owned indexes and fences delayed publication', async () => {
     await index.putOwned('wrun_expired', 'run:wf:1:wrun_expired', 'run');
     await index.putOwned('wrun_expired', 'correlation:c:1:e:wrun_expired', 'event');
@@ -94,5 +107,78 @@ describe('IndexDO', () => {
       stored: false,
     });
     expect(await index.get('run:wf:2:wrun_expired')).toBeNull();
+  });
+
+  it('hides a hook immediately behind an expiration fence before its cleanup page', async () => {
+    const runId = 'wrun_expired_hook';
+    const owner = { runId, hookId: 'hook-expired' };
+    const serialized = stringify({ ...owner, token: 'token-expired' });
+    await index.finalizeHookIndexes('token-expired', owner.hookId, serialized, owner);
+
+    await index.expireRun({ runId, keys: [], hooks: [], expiredAt: 123 });
+
+    expect(fleet.cell('index', 'index').storage.data.has('hook:token-expired')).toBe(true);
+    expect(await index.get('hook:token-expired')).toBeNull();
+    expect(await index.get(`hookid:${owner.hookId}`)).toBeNull();
+  });
+
+  it('bounds hook cleanup reads and deletes to native 128-key batches', async () => {
+    const runId = 'wrun_many_hooks';
+    const keys = [`run:wf:1:${runId}`, `runall:1:${runId}`];
+    for (const key of keys) await index.putOwned(runId, key, runId);
+    const hooks = Array.from({ length: 64 }, (_, hookIndex) => ({
+      hookId: `hook-${hookIndex}`,
+      token: `token-${hookIndex}`,
+    }));
+    for (const hook of hooks) {
+      const owner = { runId, hookId: hook.hookId };
+      await index.finalizeHookIndexes(
+        hook.token,
+        hook.hookId,
+        stringify({ ...owner, token: hook.token }),
+        owner,
+      );
+    }
+    const storage = fleet.cell('index', 'index').storage;
+    storage.operationCalls.length = 0;
+
+    expect(await index.expireRun({ runId, keys, hooks, expiredAt: 123 })).toEqual({
+      deleted: 130,
+    });
+    expect(
+      storage.operationCalls
+        .filter((call) => call.operation === 'get')
+        .map((call) => call.keys.length),
+    ).toEqual([128, 64]);
+    expect(
+      storage.operationCalls
+        .filter((call) => call.operation === 'delete')
+        .map((call) => call.keys.length),
+    ).toEqual([128, 3]);
+  });
+
+  it('batches terminal hook release and fences delayed finalization', async () => {
+    const runId = 'wrun_terminal_hooks';
+    const owner = { runId, hookId: 'hook-terminal' };
+    await index.reserveHookToken('token-terminal', owner);
+
+    expect(
+      await index.releaseHookIndexes({
+        runId,
+        hooks: [{ hookId: owner.hookId, token: 'token-terminal' }],
+        terminal: true,
+      }),
+    ).toEqual({ deleted: 1 });
+    await index.finalizeHookIndexes(
+      'token-terminal',
+      owner.hookId,
+      stringify({ ...owner, token: 'token-terminal' }),
+      owner,
+    );
+
+    expect(await index.get(`terminal:${runId}`)).not.toBeNull();
+    expect(await index.get('hook:token-terminal')).toBeNull();
+    expect(await index.get(`hookid:${owner.hookId}`)).toBeNull();
+    expect(await index.get('hookclaim:token-terminal')).toBeNull();
   });
 });

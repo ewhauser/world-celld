@@ -94,6 +94,9 @@ const INFLIGHT_GRACE_MS = 30_000;
 const MIN_ALARM_DELAY_MS = 1;
 /** Bound expiry recovery so one alarm cannot monopolize the cell. */
 const EXPIRED_INFLIGHT_BATCH = 128;
+const STORAGE_BATCH_SIZE = 128;
+const EXPIRE_RUN_REFERENCE_BATCH = 64;
+const PURGE_DEAD_LETTER_BATCH = 128;
 
 const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
 
@@ -126,6 +129,42 @@ function expiredRunKey(runId: string): string {
   return `expired-run:${runId}`;
 }
 
+function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(maximum, Math.floor(value)));
+}
+
+async function getMany<T>(
+  storage: DurableObjectTransaction,
+  keys: string[],
+): Promise<Map<string, T>> {
+  const result = new Map<string, T>();
+  for (let offset = 0; offset < keys.length; offset += STORAGE_BATCH_SIZE) {
+    const page = await storage.get<T>(keys.slice(offset, offset + STORAGE_BATCH_SIZE));
+    for (const [key, value] of page) result.set(key, value);
+  }
+  return result;
+}
+
+async function putMany(
+  storage: DurableObjectTransaction,
+  entries: Iterable<readonly [string, unknown]>,
+): Promise<void> {
+  const all = Array.from(entries);
+  for (let offset = 0; offset < all.length; offset += STORAGE_BATCH_SIZE) {
+    await storage.put(Object.fromEntries(all.slice(offset, offset + STORAGE_BATCH_SIZE)));
+  }
+}
+
+async function deleteMany(storage: DurableObjectTransaction, keys: string[]): Promise<number> {
+  let deleted = 0;
+  const unique = Array.from(new Set(keys));
+  for (let offset = 0; offset < unique.length; offset += STORAGE_BATCH_SIZE) {
+    deleted += await storage.delete(unique.slice(offset, offset + STORAGE_BATCH_SIZE));
+  }
+  return deleted;
+}
+
 function backoffSeconds(attempt: number): number {
   return Math.min(60, 2 ** attempt);
 }
@@ -149,6 +188,8 @@ interface QueueCellEnv {
   fetch?: typeof fetch;
 }
 
+const MAX_QUEUE_INFLIGHT = 128;
+
 export class QueueDO extends DurableObject {
   #now(): number {
     const clock = (this.env as QueueCellEnv)?.clock;
@@ -169,7 +210,16 @@ export class QueueDO extends DurableObject {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
   }
 
+  #maxInflight(): number {
+    const configured = this.#intVar('QUEUE_MAX_INFLIGHT', DEFAULT_MAX_INFLIGHT);
+    if (configured > MAX_QUEUE_INFLIGHT) {
+      throw new Error(`QUEUE_MAX_INFLIGHT must be at most ${MAX_QUEUE_INFLIGHT}`);
+    }
+    return configured;
+  }
+
   async enqueue(request: EnqueueRequest): Promise<EnqueueOutcome> {
+    this.#maxInflight();
     const storage = this.ctx.storage;
     const now = this.#now();
 
@@ -276,7 +326,7 @@ export class QueueDO extends DurableObject {
   async #claimPhase(): Promise<InflightClaim[]> {
     const storage = this.ctx.storage;
     const now = this.#now();
-    const maxInflight = this.#intVar('QUEUE_MAX_INFLIGHT', DEFAULT_MAX_INFLIGHT);
+    const maxInflight = this.#maxInflight();
     const claimed = await storage.transaction<InflightClaim[]>(async (txn) => {
       // 1. Recover: an inflight entry past its deadline is a lost delivery
       // (node crash, deploy restart) — back to due for redelivery.
@@ -286,21 +336,33 @@ export class QueueDO extends DurableObject {
         limit: EXPIRED_INFLIGHT_BATCH + 1,
       });
       const expired = Array.from(expiredPage.entries()).slice(0, EXPIRED_INFLIGHT_BATCH);
-      for (const [key, messageId] of expired) {
-        await txn.delete(key);
-        const row = await txn.get<MessageRow>(`msg:${messageId}`);
+      const expiredRows = await getMany<MessageRow>(
+        txn,
+        expired.map(([, messageId]) => `msg:${messageId}`),
+      );
+      await deleteMany(
+        txn,
+        expired.map(([key]) => key),
+      );
+      const recoveryWrites: Array<readonly [string, unknown]> = [];
+      for (const [, messageId] of expired) {
+        const row = expiredRows.get(`msg:${messageId}`);
         if (row) {
           const scheduleKey = dueKey(now, messageId);
-          await txn.put(scheduleKey, messageId);
+          recoveryWrites.push([scheduleKey, messageId]);
           if (row.runId) {
-            await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
-              messageId: row.messageId,
-              dueKey: scheduleKey,
-              idempotencyKey: row.idempotencyKey,
-            });
+            recoveryWrites.push([
+              runReferenceKey(row.runId, row.messageId),
+              {
+                messageId: row.messageId,
+                dueKey: scheduleKey,
+                idempotencyKey: row.idempotencyKey,
+              } satisfies QueueRunReference,
+            ]);
           }
         }
       }
+      await putMany(txn, recoveryWrites);
       if (expiredPage.size > EXPIRED_INFLIGHT_BATCH) {
         await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
         return [];
@@ -323,21 +385,30 @@ export class QueueDO extends DurableObject {
           limit: maxInflight - inflightCount,
         });
         const timeoutMs = this.#intVar('QUEUE_DELIVERY_TIMEOUT_MS', DEFAULT_DELIVERY_TIMEOUT_MS);
-        for (const [key, messageId] of due) {
-          await txn.delete(key);
-          const row = await txn.get<MessageRow>(`msg:${messageId}`);
+        const dueRows = await getMany<MessageRow>(
+          txn,
+          Array.from(due.values(), (messageId) => `msg:${messageId}`),
+        );
+        await deleteMany(txn, Array.from(due.keys()));
+        const claimWrites: Array<readonly [string, unknown]> = [];
+        for (const [, messageId] of due) {
+          const row = dueRows.get(`msg:${messageId}`);
           if (!row) continue; // orphaned schedule entry
           const claimKey = inflightKey(now + timeoutMs + INFLIGHT_GRACE_MS, messageId);
-          await txn.put(claimKey, messageId);
+          claimWrites.push([claimKey, messageId]);
           if (row.runId) {
-            await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
-              messageId: row.messageId,
-              inflightKey: claimKey,
-              idempotencyKey: row.idempotencyKey,
-            });
+            claimWrites.push([
+              runReferenceKey(row.runId, row.messageId),
+              {
+                messageId: row.messageId,
+                inflightKey: claimKey,
+                idempotencyKey: row.idempotencyKey,
+              } satisfies QueueRunReference,
+            ]);
           }
           rows.push({ row, inflightKey: claimKey });
         }
+        await putMany(txn, claimWrites);
       }
       await this.#scheduleNextAlarm(txn, now);
       return rows;
@@ -630,18 +701,20 @@ export class QueueDO extends DurableObject {
     return outcome;
   }
 
-  async purgeDeadLetters(): Promise<{ purged: number }> {
+  async purgeDeadLetters(): Promise<{ purged: number; hasMore: boolean }> {
     const storage = this.ctx.storage;
     return await storage.transaction(async (txn) => {
-      const dlq = await txn.list({ prefix: 'dlq:' });
-      for (const [key, value] of dlq) {
-        await txn.delete(key);
-        const dead = value as DeadLetterRow;
-        if (dead.runId) {
-          await txn.delete(runReferenceKey(dead.runId, dead.messageId));
-        }
-      }
-      return { purged: dlq.size };
+      const entries = await txn.list<DeadLetterRow>({
+        prefix: 'dlq:',
+        limit: PURGE_DEAD_LETTER_BATCH + 1,
+      });
+      const page = Array.from(entries).slice(0, PURGE_DEAD_LETTER_BATCH);
+      const keys = page.flatMap(([key, dead]) => [
+        key,
+        ...(dead.runId ? [runReferenceKey(dead.runId, dead.messageId)] : []),
+      ]);
+      await deleteMany(txn, keys);
+      return { purged: page.length, hasMore: entries.size > PURGE_DEAD_LETTER_BATCH };
     });
   }
 
@@ -655,30 +728,45 @@ export class QueueDO extends DurableObject {
   }
 
   /** Fence a run and purge every live, inflight, and dead-letter message it owns. */
-  async expireRun(runId: string, expiredAt: number): Promise<ExpireQueueRunResult> {
+  async expireRun(
+    runId: string,
+    expiredAt: number,
+    options?: { limit?: number },
+  ): Promise<ExpireQueueRunResult> {
     const storage = this.ctx.storage;
-    const deleted = await storage.transaction(async (txn) => {
+    const limit = boundedLimit(
+      options?.limit,
+      EXPIRE_RUN_REFERENCE_BATCH,
+      EXPIRE_RUN_REFERENCE_BATCH,
+    );
+    return await storage.transaction(async (txn) => {
       const existing = await txn.get<ExpiredRunFence>(expiredRunKey(runId));
-      const references = await txn.list<QueueRunReference>({ prefix: `run:${runId}:` });
+      const references = await txn.list<QueueRunReference>({
+        prefix: `run:${runId}:`,
+        limit: limit + 1,
+      });
+      const page = Array.from(references).slice(0, limit);
+      const dedupKeys = page.flatMap(([, reference]) =>
+        reference.idempotencyKey ? [`key:${reference.idempotencyKey}`] : [],
+      );
+      const dedupHolders = await getMany<string>(txn, dedupKeys);
+      const keys: string[] = [];
       let count = existing?.deleted ?? 0;
-      for (const [key, reference] of references) {
-        await txn.delete(`msg:${reference.messageId}`);
-        if (reference.inflightKey) await txn.delete(reference.inflightKey);
-        if (reference.dueKey) await txn.delete(reference.dueKey);
-        if (reference.dlqKey) await txn.delete(reference.dlqKey);
+      for (const [key, reference] of page) {
+        keys.push(`msg:${reference.messageId}`, key);
+        if (reference.inflightKey) keys.push(reference.inflightKey);
+        if (reference.dueKey) keys.push(reference.dueKey);
+        if (reference.dlqKey) keys.push(reference.dlqKey);
         if (reference.idempotencyKey) {
           const dedupKey = `key:${reference.idempotencyKey}`;
-          if ((await txn.get<string>(dedupKey)) === reference.messageId) {
-            await txn.delete(dedupKey);
-          }
+          if (dedupHolders.get(dedupKey) === reference.messageId) keys.push(dedupKey);
         }
-        await txn.delete(key);
         count++;
       }
+      await deleteMany(txn, keys);
       await txn.put<ExpiredRunFence>(expiredRunKey(runId), { expiredAt, deleted: count });
       await this.#scheduleNextAlarm(txn, this.#now());
-      return count;
+      return { deleted: count, done: references.size <= limit };
     });
-    return { deleted };
   }
 }

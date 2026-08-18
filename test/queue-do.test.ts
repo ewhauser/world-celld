@@ -87,6 +87,22 @@ describe('QueueDO', () => {
     expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
   });
 
+  it('rejects an inflight configuration above the bounded transaction limit', async () => {
+    const invalidFleet = new FakeFleet(
+      { queue: QueueDO },
+      {
+        QUEUE_MAX_INFLIGHT: '129',
+        clock: () => invalidFleet.now,
+        fetch: fetchStub,
+      },
+    );
+    const invalidQueue = invalidFleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
+
+    await expect(invalidQueue.enqueue(enqueueReq())).rejects.toThrow(
+      'QUEUE_MAX_INFLIGHT must be at most 128',
+    );
+  });
+
   it('dedups on idempotencyKey while active and releases after ack', async () => {
     await queue.enqueue(enqueueReq({ messageId: 'msg_a', idempotencyKey: 'k1' }));
     const dup = await queue.enqueue(enqueueReq({ messageId: 'msg_b', idempotencyKey: 'k1' }));
@@ -640,7 +656,7 @@ describe('QueueDO', () => {
       idempotencyKey: 'dead-key',
     });
 
-    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 3 });
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 3, done: true });
     expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
     expect(Array.from(data.keys()).filter((key) => key.startsWith(`run:${runId}:`))).toEqual([]);
     expect(data.has(`expired-run:${runId}`)).toBe(true);
@@ -650,6 +666,53 @@ describe('QueueDO', () => {
 
     const late = await queue.enqueue(enqueueReq({ messageId: 'msg_late', runId }));
     expect(late).toMatchObject({ ok: false, code: 'RUN_EXPIRED' });
+  });
+
+  it('pages large run expiration with batch reads/deletes and retries atomically', async () => {
+    const runId = 'wrun_large_queue_cleanup';
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    const data = cellStorage.data;
+    for (let index = 0; index < 150; index++) {
+      const messageId = `msg_large_${String(index).padStart(3, '0')}`;
+      const idempotencyKey = `large-key-${index}`;
+      const scheduleKey = `due:${padded(fleet.now + 60_000)}:${messageId}`;
+      data.set(`msg:${messageId}`, {
+        ...storedMessage(messageId, fleet.now),
+        runId,
+        idempotencyKey,
+      });
+      data.set(scheduleKey, messageId);
+      data.set(`key:${idempotencyKey}`, messageId);
+      data.set(`run:${runId}:${messageId}`, { messageId, dueKey: scheduleKey, idempotencyKey });
+    }
+
+    cellStorage.failNextMutation(
+      (mutation) => mutation.operation === 'put' && mutation.key === `expired-run:${runId}`,
+      new Error('injected queue cleanup crash'),
+    );
+    await expect(queue.expireRun(runId, fleet.now)).rejects.toThrow('injected queue cleanup crash');
+    expect(Array.from(data.keys()).filter((key) => key.startsWith(`run:${runId}:`))).toHaveLength(
+      150,
+    );
+
+    cellStorage.operationCalls.length = 0;
+    cellStorage.listCalls.length = 0;
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 64, done: false });
+    expect(cellStorage.listCalls[0]).toMatchObject({ options: { limit: 65 }, resultSize: 65 });
+    expect(
+      cellStorage.operationCalls.filter(
+        (call) => call.operation === 'get' && call.keys[0]?.startsWith('key:large-key-'),
+      ),
+    ).toEqual([expect.objectContaining({ keys: expect.any(Array) })]);
+    expect(
+      cellStorage.operationCalls.find(
+        (call) => call.operation === 'get' && call.keys[0]?.startsWith('key:large-key-'),
+      )?.keys,
+    ).toHaveLength(64);
+
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 128, done: false });
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 150, done: true });
+    expect(Array.from(data.keys()).filter((key) => key.startsWith(`run:${runId}:`))).toEqual([]);
   });
 
   it('does not let an in-flight retry resurrect an expired run', async () => {
@@ -668,7 +731,7 @@ describe('QueueDO', () => {
 
     const delivery = tick();
     await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
-    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 1 });
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 1, done: true });
     finishDelivery(jsonResponse(500, { error: 'late failure' }));
     await delivery;
 

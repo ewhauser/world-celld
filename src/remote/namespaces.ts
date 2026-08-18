@@ -128,8 +128,7 @@ function makeIndexNamespace(transport: RpcTransport): IndexNamespace {
     finalizeHookIndexes: (token, hookId, serializedHook, owner) =>
       call<void>('finalizeHookIndexes', [token, hookId, serializedHook, owner], false),
     releaseHookToken: (token, owner) => call<void>('releaseHookToken', [token, owner], false),
-    deleteHookIndexes: (token, hookId, owner) =>
-      call<void>('deleteHookIndexes', [token, hookId, owner], false),
+    releaseHookIndexes: (request) => call('releaseHookIndexes', [request], false),
   };
 }
 

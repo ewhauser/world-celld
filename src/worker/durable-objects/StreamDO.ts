@@ -1,4 +1,8 @@
-import type { ExpireRunStreamsResult, ExpireStreamResult } from '../../retention.js';
+import type {
+  ExpireRunStreamsResult,
+  ExpireStreamResult,
+  FinalizeRunStreamsResult,
+} from '../../retention.js';
 import {
   MAX_STREAM_CHUNK_BYTES,
   normalizeStreamError,
@@ -30,6 +34,11 @@ interface StreamWaiter {
   onAbort?: () => void;
 }
 
+interface RegistryExpiry {
+  expiredAt: number;
+  deleted: number;
+}
+
 const META_KEY = 'meta';
 const CHUNK_KEY_PREFIX = 'chunk:';
 const CHUNK_SIZE_KEY_PREFIX = 'chunk-size:';
@@ -37,7 +46,17 @@ const CHUNK_SIZE_KEY_PREFIX = 'chunk-size:';
 const STREAM_REGISTRY_PREFIX = 'stream:';
 const REGISTRY_OWNER_KEY = 'registry:owner';
 const REGISTRY_EXPIRED_KEY = 'registry:expired';
-const RETENTION_DELETE_BATCH = 128;
+/** Each chunk occupies a payload key and a size key; one delete accepts at most 128 keys. */
+const DEFAULT_EXPIRE_CHUNK_LIMIT = 64;
+const MAX_EXPIRE_CHUNK_LIMIT = 64;
+/** Bound storage deletion work as well as item count; one oversized chunk still makes progress. */
+const DEFAULT_EXPIRE_BYTE_LIMIT = 16 * 1024 * 1024;
+const MAX_EXPIRE_BYTE_LIMIT = DEFAULT_EXPIRE_BYTE_LIMIT;
+
+function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
+  if (value === undefined || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(maximum, Math.floor(value)));
+}
 
 function emptyMeta(): StreamMeta {
   return { count: 0, state: 'open' };
@@ -65,6 +84,15 @@ function chunkKey(index: number): string {
 
 function chunkSizeKey(index: number): string {
   return `${CHUNK_SIZE_KEY_PREFIX}${index.toString().padStart(12, '0')}`;
+}
+
+function indexFromChunkSizeKey(key: string): number {
+  const suffix = key.slice(CHUNK_SIZE_KEY_PREFIX.length);
+  const index = Number(suffix);
+  if (!/^\d{12}$/.test(suffix) || !Number.isSafeInteger(index) || index < 0) {
+    throw new Error(`Invalid persisted stream chunk size key "${key}"`);
+  }
+  return index;
 }
 
 function validateChunkSize(size: unknown, index: number): number {
@@ -369,89 +397,124 @@ export class StreamDO extends DurableObject {
   }
 
   /** Fence a run's registry before any stream cells are removed. */
-  async expireRegistry(runId: string, expiredAt: number): Promise<ExpireRunStreamsResult> {
+  async expireRegistry(
+    runId: string,
+    expiredAt: number,
+    options?: { limit?: number },
+  ): Promise<ExpireRunStreamsResult> {
+    const limit = boundedLimit(options?.limit, 16, 128);
     return await this.ctx.storage.transaction(async (txn) => {
-      const owner = await txn.get<string>(REGISTRY_OWNER_KEY);
+      const state = await txn.get<string | RegistryExpiry>([
+        REGISTRY_OWNER_KEY,
+        REGISTRY_EXPIRED_KEY,
+      ]);
+      const owner = state.get(REGISTRY_OWNER_KEY) as string | undefined;
       if (owner !== undefined && owner !== runId) {
         throw new Error(`Stream registry is owned by workflow run "${owner}"`);
       }
-      await txn.put(REGISTRY_OWNER_KEY, runId);
-      await txn.put(REGISTRY_EXPIRED_KEY, expiredAt);
-      const entries = await txn.list<boolean>({ prefix: STREAM_REGISTRY_PREFIX });
+      const expiry = state.get(REGISTRY_EXPIRED_KEY) as RegistryExpiry | undefined;
+      await txn.put({
+        [REGISTRY_OWNER_KEY]: runId,
+        [REGISTRY_EXPIRED_KEY]: expiry ?? { expiredAt, deleted: 0 },
+      });
+      const entries = await txn.list<boolean>({ prefix: STREAM_REGISTRY_PREFIX, limit });
       return {
         streams: Array.from(entries.keys()).map((key) => key.slice(STREAM_REGISTRY_PREFIX.length)),
       };
     });
   }
 
-  /** Remove the registry payload after every referenced stream was fenced. */
-  async finalizeRegistry(runId: string): Promise<void> {
-    await this.ctx.storage.transaction(async (txn) => {
-      const owner = await txn.get<string>(REGISTRY_OWNER_KEY);
-      const expiredAt = await txn.get<number>(REGISTRY_EXPIRED_KEY);
-      if (owner !== runId || expiredAt === undefined) {
+  /** Remove completed registry entries in a bounded, retry-safe batch. */
+  async finalizeRegistry(runId: string, streams: string[]): Promise<FinalizeRunStreamsResult> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      const state = await txn.get<string | RegistryExpiry>([
+        REGISTRY_OWNER_KEY,
+        REGISTRY_EXPIRED_KEY,
+      ]);
+      const owner = state.get(REGISTRY_OWNER_KEY) as string | undefined;
+      const expiry = state.get(REGISTRY_EXPIRED_KEY) as RegistryExpiry | undefined;
+      if (owner !== runId || expiry === undefined) {
         throw new Error(`Stream registry for workflow run "${runId}" is not expired`);
       }
-      const entries = await txn.list({ prefix: STREAM_REGISTRY_PREFIX });
-      const keys = Array.from(entries.keys());
-      for (let offset = 0; offset < keys.length; offset += RETENTION_DELETE_BATCH) {
-        await txn.delete(keys.slice(offset, offset + RETENTION_DELETE_BATCH));
-      }
+      const keys = Array.from(new Set(streams.map((name) => `${STREAM_REGISTRY_PREFIX}${name}`)));
+      const removed = keys.length === 0 ? 0 : await txn.delete(keys);
+      const deleted = expiry.deleted + removed;
+      await txn.put<RegistryExpiry>(REGISTRY_EXPIRED_KEY, { ...expiry, deleted });
+      const remaining = await txn.list({ prefix: STREAM_REGISTRY_PREFIX, limit: 1 });
+      return { deleted, done: remaining.size === 0 };
     });
   }
 
   /**
-   * Fence first, wake readers, then delete known chunk keys in bounded groups.
-   * The tombstone records progress so restart/retry remains idempotent.
+   * Fence the stream and delete one bounded page. Listing size keys avoids
+   * loading payloads, and the transaction makes a crash retry resume safely.
    */
-  async expireStream(runId: string, expiredAt: number): Promise<ExpireStreamResult> {
+  async expireStream(
+    runId: string,
+    expiredAt: number,
+    options?: { limit?: number; byteLimit?: number },
+  ): Promise<ExpireStreamResult> {
+    const limit = boundedLimit(options?.limit, DEFAULT_EXPIRE_CHUNK_LIMIT, MAX_EXPIRE_CHUNK_LIMIT);
+    const byteLimit = boundedLimit(
+      options?.byteLimit,
+      DEFAULT_EXPIRE_BYTE_LIMIT,
+      MAX_EXPIRE_BYTE_LIMIT,
+    );
     return await this.runMutation(async () => {
-      const fenced = await this.ctx.storage.transaction(async (txn) => {
+      const result = await this.ctx.storage.transaction(async (txn) => {
         const stored = await txn.get<StreamMeta>(META_KEY);
         const meta = stored ? validateMeta(stored) : emptyMeta();
         this.assertOwner(meta, runId);
-        const chunkCount = meta.expiredChunkCount ?? meta.count;
+        const firstFence = meta.state !== 'expired';
         if (meta.state === 'expired' && meta.payloadDeleted) {
-          return { meta, chunkCount, alreadyDeleted: true };
+          return {
+            meta,
+            result: { deleted: false, chunks: 0, bytes: 0, done: true },
+          };
         }
+
+        const candidates = await txn.list<number>({
+          prefix: CHUNK_SIZE_KEY_PREFIX,
+          limit: limit + 1,
+        });
+        const page: Array<{ index: number; size: number }> = [];
+        let bytes = 0;
+        for (const [key, storedSize] of Array.from(candidates).slice(0, limit)) {
+          const index = indexFromChunkSizeKey(key);
+          const size = validateChunkSize(storedSize, index);
+          if (page.length > 0 && bytes + size > byteLimit) break;
+          page.push({ index, size });
+          bytes += size;
+        }
+        const keys = page.flatMap(({ index }) => [chunkKey(index), chunkSizeKey(index)]);
+        if (keys.length > 0) await txn.delete(keys);
+        const done = candidates.size === page.length;
         const nextMeta: StreamMeta = {
           ...meta,
+          count: done ? 0 : meta.count,
           ownerRunId: runId,
           state: 'expired',
           error: undefined,
-          expiredAt,
-          expiredChunkCount: chunkCount,
-          payloadDeleted: false,
+          expiredAt: meta.expiredAt ?? expiredAt,
+          expiredChunkCount: meta.expiredChunkCount ?? meta.count,
+          payloadDeleted: done,
         };
         await txn.put(META_KEY, nextMeta);
-        return { meta: nextMeta, chunkCount, alreadyDeleted: false };
+        return {
+          meta: nextMeta,
+          result: {
+            deleted: firstFence,
+            chunks: page.length,
+            bytes,
+            done,
+          } satisfies ExpireStreamResult,
+        };
       });
 
-      this.meta = fenced.meta;
-      this.metaLoad = Promise.resolve(fenced.meta);
+      this.meta = result.meta;
+      this.metaLoad = Promise.resolve(result.meta);
       this.wakeReaders();
-
-      if (!fenced.alreadyDeleted) {
-        const deleteIndexesPerBatch = Math.floor(RETENTION_DELETE_BATCH / 2);
-        for (let offset = 0; offset < fenced.chunkCount; offset += deleteIndexesPerBatch) {
-          const keys: string[] = [];
-          const end = Math.min(fenced.chunkCount, offset + deleteIndexesPerBatch);
-          for (let index = offset; index < end; index++) {
-            keys.push(chunkKey(index), chunkSizeKey(index));
-          }
-          await this.ctx.storage.delete(keys);
-        }
-        const tombstone: StreamMeta = {
-          ...fenced.meta,
-          count: 0,
-          payloadDeleted: true,
-        };
-        await this.ctx.storage.put(META_KEY, tombstone);
-        this.meta = tombstone;
-        this.metaLoad = Promise.resolve(tombstone);
-      }
-
-      return { deleted: true, chunks: fenced.chunkCount };
+      return result.result;
     });
   }
 }

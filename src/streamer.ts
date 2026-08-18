@@ -5,7 +5,11 @@ import type {
   StreamInfoResponse,
   Streamer,
 } from '@workflow/world';
-import type { ExpireRunStreamsResult, ExpireStreamResult } from './retention.js';
+import type {
+  ExpireRunStreamsResult,
+  ExpireStreamResult,
+  FinalizeRunStreamsResult,
+} from './retention.js';
 import {
   MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_CHUNK_BYTES,
@@ -72,9 +76,17 @@ export interface StreamDOStub {
   failStream(runId: string, error: StreamErrorData | string): Promise<void>;
   registerStream(runId: string, name: string): Promise<void>;
   listStreams(): Promise<string[]>;
-  expireRegistry(runId: string, expiredAt: number): Promise<ExpireRunStreamsResult>;
-  finalizeRegistry(runId: string): Promise<void>;
-  expireStream(runId: string, expiredAt: number): Promise<ExpireStreamResult>;
+  expireRegistry(
+    runId: string,
+    expiredAt: number,
+    options?: { limit?: number },
+  ): Promise<ExpireRunStreamsResult>;
+  finalizeRegistry(runId: string, streams: string[]): Promise<FinalizeRunStreamsResult>;
+  expireStream(
+    runId: string,
+    expiredAt: number,
+    options?: { limit?: number; byteLimit?: number },
+  ): Promise<ExpireStreamResult>;
 }
 
 export interface StreamDONamespace {
