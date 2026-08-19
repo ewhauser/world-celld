@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.1 (2026-08-19)
+
+## What's Changed
+* perf: reduce runs.list RPC fanout by @ewhauser in https://github.com/ewhauser/world-celld/pull/21
+* perf: remove unused correlation index by @ewhauser in https://github.com/ewhauser/world-celld/pull/23
+* perf: bound QueueDO inflight deadline work by @ewhauser in https://github.com/ewhauser/world-celld/pull/24
+* chore(deps-dev): bump @types/node from 22.20.1 to 26.1.2 by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/4
+* chore(deps-dev): bump the development-dependencies group across 1 directory with 2 updates by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/25
+* perf: batch and long-poll stream I/O by @ewhauser in https://github.com/ewhauser/world-celld/pull/26
+* perf: bound cleanup and batch Durable Object storage by @ewhauser in https://github.com/ewhauser/world-celld/pull/27
+* perf: shard workflow indexes by @ewhauser in https://github.com/ewhauser/world-celld/pull/28
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.3.0...v0.3.1
+
 ## 0.3.0 (2026-08-16)
 
 ## What's Changed
