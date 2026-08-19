@@ -46,6 +46,7 @@ import {
 } from './apply-event.js';
 import { parse } from './vendor/shared/index.js';
 import { globalRunIndexKey, workflowRunIndexKey } from './retention.js';
+import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from './lifecycle.js';
 import type {
   CleanupRecord,
   ExpireRunIndexesRequest,
@@ -148,6 +149,9 @@ class MockWorkflowRunDOStub {
     });
     if (outcome.ok) {
       await this.store.put('event_sequence', eventSequence);
+      if (outcome.run) {
+        outcome.indexPublicationExpiresAt = Date.now() + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS;
+      }
     }
     return finalizeEventPage(this.store, outcome, request.params);
   }
@@ -177,6 +181,12 @@ class MockWorkflowRunDOStub {
   async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {
     const run = await this.store.get<WorkflowRun>('run');
     return { ok: true, value: run ?? null };
+  }
+
+  async getLifecycleStatus(): Promise<import('./retention.js').RunLifecycleStatus> {
+    const run = await this.store.get<WorkflowRun>('run');
+    if (!run) return 'missing';
+    return isTerminalWorkflowRunStatus(run.status) ? 'terminal' : 'active';
   }
 
   async getStep(stepId: string): Promise<RunReadOutcome<Step | null>> {
@@ -282,7 +292,11 @@ class MockWorkflowRunDOStub {
  * `list_complete` reflects whether further keys exist.
  */
 class MockWorkflowIndex {
-  async commitRun(run: WorkflowRun, serializedMetadata: string): Promise<{ stored: boolean }> {
+  async commitRun(
+    run: WorkflowRun,
+    serializedMetadata: string,
+    _publicationExpiresAt: number,
+  ): Promise<{ stored: boolean }> {
     if (kvData.has(`expired:${run.runId}`)) return { stored: false };
     if (isTerminalWorkflowRunStatus(run.status)) {
       kvData.set(`terminal:${run.runId}`, String(Date.now()));
@@ -503,7 +517,6 @@ class MockWorkflowIndex {
   }
 
   async releaseHookIndexes(request: ReleaseHookIndexesRequest): Promise<ReleaseHookIndexesResult> {
-    if (request.terminal) kvData.set(`terminal:${request.runId}`, String(Date.now()));
     let deleted = 0;
     for (const { token, hookId } of request.hooks) {
       const owner = { runId: request.runId, hookId };
@@ -730,8 +743,12 @@ class MockQueueCellStub implements QueueCellStub {
     return { ok: true, messageId: request.messageId, deduped: false };
   }
 
-  async expireRun(): Promise<{ deleted: number; done: boolean }> {
-    return { deleted: 0, done: true };
+  async expireRun(): Promise<import('./retention.js').ExpireQueueRunResult> {
+    return { deleted: 0, done: true, receipt: { expiredAt: 0, deleted: 0 } };
+  }
+
+  async acknowledgeExpireRun(): Promise<import('./retention.js').AcknowledgeQueueExpiryResult> {
+    return { acknowledged: true };
   }
 }
 

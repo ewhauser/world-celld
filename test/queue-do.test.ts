@@ -6,6 +6,16 @@ import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { EnqueueRequest } from '../src/queue.js';
 import { QueueDO, type MessageRow } from '../src/worker/durable-objects/QueueDO.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
+import { LIFECYCLE_COMPACTION_RETRY_MS, QUEUE_FENCE_GRACE_MS } from '../src/lifecycle.js';
+import type { RunLifecycleStatus } from '../src/retention.js';
+
+class TestRunLifecycleDO {
+  constructor(private ctx: { storage: DurableObjectStorage }) {}
+
+  async getLifecycleStatus(): Promise<RunLifecycleStatus> {
+    return (await this.ctx.storage.get<RunLifecycleStatus>('status')) ?? 'active';
+  }
+}
 
 type FetchStub = Mock<typeof fetch>;
 
@@ -49,13 +59,12 @@ describe('QueueDO', () => {
 
   beforeEach(() => {
     fetchStub = vi.fn<typeof fetch>(async () => jsonResponse(200, { ok: true }));
-    fleet = new FakeFleet(
-      { queue: QueueDO },
-      {
-        clock: () => fleet.now,
-        fetch: fetchStub,
-      },
-    );
+    const cellEnv: Record<string, unknown> = {
+      clock: () => fleet.now,
+      fetch: fetchStub,
+    };
+    fleet = new FakeFleet({ queue: QueueDO, runs: TestRunLifecycleDO as never }, cellEnv);
+    cellEnv.WORKFLOW_DB = fleet.namespace('runs');
     queue = fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
     storage = () => fleet.cell('queue', 'q:0').storage.data;
   });
@@ -64,6 +73,19 @@ describe('QueueDO', () => {
     fleet.advance(Math.max(MIN_TEST_ALARM_DELAY_MS, advanceMs));
     await fleet.fireDueAlarms();
     await fleet.settle();
+  }
+
+  function setRunStatus(runId: string, status: RunLifecycleStatus) {
+    fleet.cell('runs', runId).storage.data.set('status', status);
+  }
+
+  async function expireAndAcknowledge(runId: string, expiredAt = fleet.now) {
+    const result = await queue.expireRun(runId, expiredAt);
+    if (!result.done) throw new Error(`expected final expiry receipt for ${runId}`);
+    expect(await queue.acknowledgeExpireRun(runId, result.receipt)).toEqual({
+      acknowledged: true,
+    });
+    return result;
   }
 
   it('delivers an enqueued message with x-vqs headers and acks on 2xx', async () => {
@@ -656,7 +678,11 @@ describe('QueueDO', () => {
       idempotencyKey: 'dead-key',
     });
 
-    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 3, done: true });
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({
+      deleted: 3,
+      done: true,
+      receipt: { expiredAt: fleet.now, deleted: 3 },
+    });
     expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
     expect(Array.from(data.keys()).filter((key) => key.startsWith(`run:${runId}:`))).toEqual([]);
     expect(data.has(`expired-run:${runId}`)).toBe(true);
@@ -666,6 +692,34 @@ describe('QueueDO', () => {
 
     const late = await queue.enqueue(enqueueReq({ messageId: 'msg_late', runId }));
     expect(late).toMatchObject({ ok: false, code: 'RUN_EXPIRED' });
+  });
+
+  it('rejects an authoritatively expired run before queue cleanup installs a fence', async () => {
+    const runId = 'wrun_expired_before_queue_cleanup';
+    setRunStatus(runId, 'expired');
+
+    await expect(queue.enqueue(enqueueReq({ messageId: 'msg_too_late', runId }))).resolves.toEqual({
+      ok: false,
+      code: 'RUN_EXPIRED',
+      message: `Workflow run "${runId}" has expired`,
+    });
+    expect(storage().has(`expired-run:${runId}`)).toBe(false);
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('drops a scheduled message which becomes expired before delivery', async () => {
+    const runId = 'wrun_expired_before_delivery';
+    await queue.enqueue(
+      enqueueReq({ messageId: 'msg_delayed_expiry', runId, idempotencyKey: 'delayed-expiry' }),
+    );
+    setRunStatus(runId, 'expired');
+
+    await tick();
+
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(storage().has('msg:msg_delayed_expiry')).toBe(false);
+    expect(storage().has('key:delayed-expiry')).toBe(false);
+    expect(storage().has(`run:${runId}:msg_delayed_expiry`)).toBe(false);
   });
 
   it('pages large run expiration with batch reads/deletes and retries atomically', async () => {
@@ -711,7 +765,11 @@ describe('QueueDO', () => {
     ).toHaveLength(64);
 
     expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 128, done: false });
-    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 150, done: true });
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({
+      deleted: 150,
+      done: true,
+      receipt: { expiredAt: fleet.now, deleted: 150 },
+    });
     expect(Array.from(data.keys()).filter((key) => key.startsWith(`run:${runId}:`))).toEqual([]);
   });
 
@@ -731,7 +789,11 @@ describe('QueueDO', () => {
 
     const delivery = tick();
     await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
-    expect(await queue.expireRun(runId, fleet.now)).toEqual({ deleted: 1, done: true });
+    expect(await queue.expireRun(runId, fleet.now)).toEqual({
+      deleted: 1,
+      done: true,
+      receipt: { expiredAt: fleet.now, deleted: 1 },
+    });
     finishDelivery(jsonResponse(500, { error: 'late failure' }));
     await delivery;
 
@@ -739,6 +801,143 @@ describe('QueueDO', () => {
     expect(storage().has('msg:msg_expiring')).toBe(false);
     expect(storage().has('key:expiring-key')).toBe(false);
     expect(Array.from(storage().keys()).some((key) => key.endsWith(':msg_expiring'))).toBe(false);
+  });
+
+  it('falls back to the authoritative tombstone after fence compaction', async () => {
+    let finishDelivery!: (response: Response) => void;
+    fetchStub.mockImplementation(
+      () => new Promise<Response>((resolve) => (finishDelivery = resolve)),
+    );
+    const runId = 'wrun_compacted_queue_fence';
+    await queue.enqueue(
+      enqueueReq({ messageId: 'msg_compacted_retry', runId, idempotencyKey: 'compacted-key' }),
+    );
+    await queue.alarm();
+    await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
+
+    await expireAndAcknowledge(runId);
+    setRunStatus(runId, 'expired');
+    fleet.advance(QUEUE_FENCE_GRACE_MS);
+    fleet.restartCell('queue', 'q:0');
+    queue = fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
+    await queue.alarm();
+
+    expect(storage().has(`expired-run:${runId}`)).toBe(false);
+    expect(storage().has('expired-run-filter:v1')).toBe(false);
+    await expect(
+      queue.enqueue(enqueueReq({ messageId: 'msg_after_compaction', runId })),
+    ).resolves.toMatchObject({ ok: false, code: 'RUN_EXPIRED' });
+
+    const deadKey = `dlq:${padded(fleet.now)}:msg_stale_dead`;
+    storage().set(deadKey, {
+      ...storedMessage('msg_stale_dead', fleet.now),
+      runId,
+      failedAt: fleet.now,
+    });
+    storage().set(`run:${runId}:msg_stale_dead`, {
+      messageId: 'msg_stale_dead',
+      dlqKey: deadKey,
+    });
+    await expect(queue.redriveDeadLetter('msg_stale_dead')).resolves.toEqual({ ok: false });
+    expect(storage().has(deadKey)).toBe(false);
+
+    finishDelivery(jsonResponse(500, { error: 'late after compaction' }));
+    await fleet.settle();
+    expect(storage().has('msg:msg_compacted_retry')).toBe(false);
+    expect(Array.from(storage().keys()).some((key) => key.endsWith(':msg_compacted_retry'))).toBe(
+      false,
+    );
+  });
+
+  it('retains the cumulative cleanup receipt until the coordinator acknowledges it', async () => {
+    const runId = 'wrun_unacknowledged_queue_receipt';
+    await queue.enqueue(enqueueReq({ messageId: 'msg_receipt', runId, delaySeconds: 60 }));
+    const result = await queue.expireRun(runId, fleet.now);
+    if (!result.done) throw new Error('expected final expiry receipt');
+
+    fleet.advance(QUEUE_FENCE_GRACE_MS * 2);
+    await fleet.fireDueAlarms();
+    expect(storage().get(`expired-run:${runId}`)).toMatchObject({ deleted: 1, compactAt: null });
+    expect(await queue.acknowledgeExpireRun(runId, { ...result.receipt, deleted: 0 })).toEqual({
+      acknowledged: false,
+    });
+
+    await queue.acknowledgeExpireRun(runId, result.receipt);
+    fleet.advance(QUEUE_FENCE_GRACE_MS);
+    await fleet.fireDueAlarms();
+    expect(storage().has(`expired-run:${runId}`)).toBe(false);
+  });
+
+  it('compacts many acknowledged exact fences to no derivative state in paged alarm work', async () => {
+    const runs = Array.from({ length: 300 }, (_, index) => `wrun_compact_${index}`);
+    for (const runId of runs) {
+      await expireAndAcknowledge(runId);
+    }
+    expect(
+      Array.from(storage().keys()).filter((key) => key.startsWith('expired-run:')),
+    ).toHaveLength(300);
+
+    fleet.advance(QUEUE_FENCE_GRACE_MS);
+    for (let page = 0; page < 3; page++) {
+      await fleet.fireDueAlarms();
+      fleet.advance(1);
+    }
+    expect(Array.from(storage().keys()).filter((key) => key.startsWith('expired-run:'))).toEqual(
+      [],
+    );
+    expect(Array.from(storage().keys()).filter((key) => key.startsWith('expired-run-gc:'))).toEqual(
+      [],
+    );
+    expect(storage().has('expired-run-filter:v1')).toBe(false);
+  });
+
+  it('re-arms compaction after an injected alarm failure', async () => {
+    const runId = 'wrun_compaction_alarm_retry';
+    await expireAndAcknowledge(runId);
+    fleet.advance(QUEUE_FENCE_GRACE_MS);
+    const cellStorage = fleet.cell('queue', 'q:0').storage;
+    cellStorage.failNextMutation(
+      (mutation) => mutation.operation === 'delete' && mutation.key === `expired-run:${runId}`,
+      new Error('injected compaction failure'),
+    );
+
+    await fleet.fireDueAlarms();
+    expect(storage().has(`expired-run:${runId}`)).toBe(true);
+    expect(cellStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
+    fleet.advance(LIFECYCLE_COMPACTION_RETRY_MS);
+    await fleet.fireDueAlarms();
+    expect(storage().has(`expired-run:${runId}`)).toBe(false);
+  });
+
+  it('keeps delayed cleanup replay and concurrent compaction fail closed', async () => {
+    const runId = 'wrun_cleanup_replay_after_compaction';
+    setRunStatus(runId, 'expired');
+    await expireAndAcknowledge(runId);
+    fleet.advance(QUEUE_FENCE_GRACE_MS);
+
+    const [, replay] = await Promise.all([queue.alarm(), queue.expireRun(runId, fleet.now)]);
+    if (!replay.done) throw new Error('expected replay receipt');
+    await queue.acknowledgeExpireRun(runId, replay.receipt);
+    await expect(
+      queue.enqueue(enqueueReq({ messageId: 'msg_after_cleanup_replay', runId })),
+    ).resolves.toMatchObject({ ok: false, code: 'RUN_EXPIRED' });
+
+    fleet.advance(QUEUE_FENCE_GRACE_MS);
+    await queue.alarm();
+    expect(
+      Array.from(storage().keys()).filter(
+        (key) => key === `expired-run:${runId}` || key.startsWith('expired-run-gc:'),
+      ),
+    ).toEqual([]);
+  });
+
+  it('uses authority to admit active runs without a derivative fence', async () => {
+    const runId = 'wrun_authority_active';
+    setRunStatus(runId, 'active');
+
+    await expect(
+      queue.enqueue(enqueueReq({ messageId: 'msg_authority_active', runId, delaySeconds: 60 })),
+    ).resolves.toMatchObject({ ok: true });
   });
 
   it('rearmAlarm derives the alarm from pending work (abandonment recovery)', async () => {

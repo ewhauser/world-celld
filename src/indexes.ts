@@ -1,4 +1,4 @@
-import { isTerminalWorkflowRunStatus, type WorkflowRun } from '@workflow/world';
+import type { WorkflowRun } from '@workflow/world';
 import type { HookTokenOwner } from './config.js';
 import type {
   ExpireRunIndexesRequest,
@@ -32,17 +32,10 @@ export interface RunCatalogShardStub {
     runId: string,
     keys: string[],
     serializedMetadata: string,
+    publicationExpiresAt: number,
   ): Promise<{ stored: boolean }>;
   list(options?: IndexListOptions): Promise<IndexListPage>;
   expireRun(runId: string, keys: string[], expiredAt: number): Promise<ExpireRunIndexesResult>;
-}
-
-export type RunFenceStatus = 'active' | 'terminal' | 'expired';
-
-export interface RunFenceStub {
-  getStatus(): Promise<RunFenceStatus>;
-  fenceTerminal(at: number): Promise<RunFenceStatus>;
-  fenceExpired(at: number): Promise<RunFenceStatus>;
 }
 
 export type HookClaimResult =
@@ -71,8 +64,6 @@ export interface HookTokenShardStub {
   releaseClaim(token: string, owner: HookTokenOwner, claimId: string): Promise<void>;
   releaseBatch(
     hooks: Array<{ token: string; owner: HookTokenOwner }>,
-    fencedAt: number,
-    runFenced: boolean,
   ): Promise<{ deleted: number }>;
 }
 
@@ -88,8 +79,6 @@ export interface HookIdShardStub {
   releaseClaim(hookId: string, owner: HookTokenOwner, claimId: string): Promise<void>;
   releaseBatch(
     hooks: Array<{ hookId: string; owner: HookTokenOwner }>,
-    fencedAt: number,
-    runFenced: boolean,
   ): Promise<{ deleted: number }>;
 }
 
@@ -104,14 +93,17 @@ export interface CellNamespaceLike<T> {
 
 export interface WorkflowIndexBindings {
   runCatalog: CellNamespaceLike<RunCatalogShardStub>;
-  runFences: CellNamespaceLike<RunFenceStub>;
   hookTokens: CellNamespaceLike<HookTokenShardStub>;
   hookIds: CellNamespaceLike<HookIdShardStub>;
 }
 
 /** High-level client used by the World storage layer and retention coordinator. */
 export interface WorkflowIndex {
-  commitRun(run: WorkflowRun, serializedMetadata: string): Promise<{ stored: boolean }>;
+  commitRun(
+    run: WorkflowRun,
+    serializedMetadata: string,
+    publicationExpiresAt: number,
+  ): Promise<{ stored: boolean }>;
   listRuns(options?: IndexListOptions): Promise<IndexListPage>;
   getHookByToken(token: string): Promise<string | null>;
   getHookById(hookId: string): Promise<string | null>;
@@ -158,10 +150,6 @@ export function hookTokenShardName(token: string): string {
 
 export function hookIdShardName(hookId: string): string {
   return shardName('hook-id', hookId, HOOK_ID_SHARDS);
-}
-
-export function runFenceCellName(runId: string): string {
-  return `run-fence:${INDEX_PROTOCOL_VERSION}:${runId}`;
 }
 
 export function allRunCatalogShardNames(): string[] {
@@ -216,12 +204,7 @@ async function inBatches<T>(
 }
 
 export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIndex {
-  const fence = (runId: string) => stub(bindings.runFences, runFenceCellName(runId));
-
-  const releaseHooks = async (
-    request: ReleaseHookIndexesRequest,
-    fencedAt: number,
-  ): Promise<number> => {
+  const releaseHooks = async (request: ReleaseHookIndexesRequest): Promise<number> => {
     const tokenGroups = groupByShard(request.hooks, (hook) => hookTokenShardName(hook.token));
     const idGroups = groupByShard(request.hooks, (hook) => hookIdShardName(hook.hookId));
     const releases: Array<Promise<number>> = [];
@@ -233,7 +216,7 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
             token: hook.token,
             owner: { runId: request.runId, hookId: hook.hookId },
           })),
-          (batch) => target.releaseBatch(batch, fencedAt, request.terminal),
+          (batch) => target.releaseBatch(batch),
         ),
       );
     }
@@ -245,7 +228,7 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
             hookId: hook.hookId,
             owner: { runId: request.runId, hookId: hook.hookId },
           })),
-          (batch) => target.releaseBatch(batch, fencedAt, request.terminal),
+          (batch) => target.releaseBatch(batch),
         ),
       );
     }
@@ -253,14 +236,12 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
   };
 
   return {
-    async commitRun(run, serializedMetadata) {
-      if (isTerminalWorkflowRunStatus(run.status)) {
-        await fence(run.runId).fenceTerminal(Date.now());
-      }
+    async commitRun(run, serializedMetadata, publicationExpiresAt) {
       return await stub(bindings.runCatalog, runCatalogShardName(run.runId)).upsertRun(
         run.runId,
         runKeys(run),
         serializedMetadata,
+        publicationExpiresAt,
       );
     },
 
@@ -377,24 +358,17 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
     },
 
     async releaseHookIndexes(request) {
-      if (request.terminal) {
-        await fence(request.runId).fenceTerminal(Date.now());
-      }
-      return { deleted: await releaseHooks(request, Date.now()) };
+      return { deleted: await releaseHooks(request) };
     },
 
     async expireRun(request) {
-      await fence(request.runId).fenceExpired(request.expiredAt);
       const [catalog, hookDeletes] = await Promise.all([
         stub(bindings.runCatalog, runCatalogShardName(request.runId)).expireRun(
           request.runId,
           request.keys,
           request.expiredAt,
         ),
-        releaseHooks(
-          { runId: request.runId, hooks: request.hooks, terminal: true },
-          request.expiredAt,
-        ),
+        releaseHooks({ runId: request.runId, hooks: request.hooks }),
       ]);
       return { deleted: catalog.deleted + hookDeletes };
     },

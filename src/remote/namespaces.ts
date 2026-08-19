@@ -10,7 +10,6 @@ import {
   type HookIdShardStub,
   type HookTokenShardStub,
   type RunCatalogShardStub,
-  type RunFenceStub,
 } from '../indexes.js';
 import type { QueueCellStub } from '../queue.js';
 import type { WorkflowRunDOStub } from '../storage.js';
@@ -26,6 +25,7 @@ interface MethodSpec {
 const RUNS: MethodSpec = {
   methods: [
     'applyEvent',
+    'getLifecycleStatus',
     'getRun',
     'getStep',
     'getEvent',
@@ -85,6 +85,7 @@ const QUEUE: MethodSpec = {
     'purgeDeadLetters',
     'rearmAlarm',
     'expireRun',
+    'acknowledgeExpireRun',
   ],
   mutating: new Set([
     'enqueue',
@@ -92,6 +93,7 @@ const QUEUE: MethodSpec = {
     'purgeDeadLetters',
     'rearmAlarm',
     'expireRun',
+    'acknowledgeExpireRun',
   ]),
 };
 
@@ -123,11 +125,6 @@ const RUN_CATALOG: MethodSpec = {
   mutating: new Set(),
 };
 
-const RUN_FENCES: MethodSpec = {
-  methods: ['getStatus', 'fenceTerminal', 'fenceExpired'],
-  mutating: new Set(),
-};
-
 const HOOK_TOKENS: MethodSpec = {
   methods: ['get', 'reserve', 'finalize', 'releaseClaim', 'releaseBatch'],
   mutating: new Set(),
@@ -140,19 +137,23 @@ const HOOK_IDS: MethodSpec = {
 
 export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
   const runCatalog = makeNamespace<RunCatalogShardStub>(transport, 'run-catalog', RUN_CATALOG);
-  const runFences = makeNamespace<RunFenceStub>(transport, 'run-fences', RUN_FENCES);
   const hookTokens = makeNamespace<HookTokenShardStub>(transport, 'hook-tokens', HOOK_TOKENS);
   const hookIds = makeNamespace<HookIdShardStub>(transport, 'hook-ids', HOOK_IDS);
-  const workflowIndex = createWorkflowIndex({ runCatalog, runFences, hookTokens, hookIds });
+  const workflowIndex = createWorkflowIndex({ runCatalog, hookTokens, hookIds });
   return {
     WORKFLOW_DB: makeNamespace<WorkflowRunDOStub>(transport, 'runs', RUNS),
     WORKFLOW_STREAMS: makeStreamNamespace(transport),
     WORKFLOW_INDEX: {
       ...workflowIndex,
-      commitRun: (run, serializedMetadata) =>
-        callFleetRoute(transport, '/v1/index/runs/commit', [run, serializedMetadata], {
-          idempotent: true,
-        }),
+      commitRun: (run, serializedMetadata, publicationExpiresAt) =>
+        callFleetRoute(
+          transport,
+          '/v1/index/runs/commit',
+          [run, serializedMetadata, publicationExpiresAt],
+          {
+            idempotent: true,
+          },
+        ),
       listRuns: (options) =>
         callFleetRoute(transport, '/v1/index/runs/list', [options], { idempotent: true }),
       expireRun: (request) =>

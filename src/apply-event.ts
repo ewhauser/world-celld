@@ -209,6 +209,8 @@ export interface ApplyEventSuccess {
   hasMore?: boolean;
   /** Server-owned event ceiling advertised on run lifecycle writes. */
   maxEvents?: number;
+  /** Deadline for publishing this authoritative mutation to derivative indexes. */
+  indexPublicationExpiresAt?: number;
 }
 
 export type ApplyEventOutcome = ApplyEventSuccess | ApplyEventFailure;

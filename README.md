@@ -120,7 +120,6 @@ Workflow application
 celld worker router
   |-- WorkflowRunDO  one cell per workflow run
   |-- RunCatalogDO   16 stable run-id shards; merged ordered listing
-  |-- RunFenceDO     one lifecycle fence cell per workflow run
   |-- HookTokenDO    32 stable token-ownership shards
   |-- HookIdDO       32 stable hook-id lookup shards
   |-- StreamDO       stream chunks and run/stream indexes
@@ -141,17 +140,20 @@ Index routing is a versioned hard-cutover protocol. Run catalog writes hash the
 `runId` across 16 shards, while hook ownership and hook-ID lookup hash their
 natural keys across 32 shards each. A single stateless worker request queries
 all 16 catalog shards in parallel and merges their lexicographic pages before
-authoritative RunDO reads. A terminal or expired run is hidden through its own
-`RunFenceDO`, so no global fence cell remains. Token and hook-ID admission are
-each transactional inside their natural-key shards. The RunDO remains the
-authoritative commit domain, and exact claim IDs plus a serialized cancellation
-fence resolve ambiguous delivery without pretending the two ownership shards
-form a cross-Durable-Object transaction. Stateless cohesive index routes keep
+authoritative RunDO reads. The RunDO is also the only permanent lifecycle
+authority: hook shards consult it directly, while queue and catalog expiry
+fences compact after bounded protocol leases. Token and hook-ID admission are
+each transactional inside their natural-key shards. Exact claim IDs plus a
+serialized cancellation fence resolve ambiguous delivery without pretending
+the two ownership shards form a cross-Durable-Object transaction. Stateless cohesive index routes keep
 catalog listing, terminal commits, hook finalization, and hook release to one
 public request each while exposing the internal shard work in measurements.
 
 The routing rationale and before/after RPC, storage, latency, and contention
 evidence are recorded in [`docs/index-sharding.md`](./docs/index-sharding.md).
+The expiry authority, producer/consumer map, bounded horizons, and
+post-compaction costs are recorded in
+[`docs/lifecycle-compaction.md`](./docs/lifecycle-compaction.md).
 
 ## Configuration
 
@@ -168,7 +170,7 @@ variable is shown below.
 | `runRetentionMs`        | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
 | `streamLongPollMs`      | —                        | `20000`                  |
 | `streamFlushIntervalMs` | —                        | `0`                      |
-| `rpcTimeoutMs`          | —                        | `30000`                  |
+| `rpcTimeoutMs`          | —                        | `30000` (max `300000`)   |
 
 The deployed worker also accepts these celld variables:
 
@@ -178,7 +180,7 @@ The deployed worker also accepts these celld variables:
 | `WORKFLOW_CALLBACK_SECRET`  | none     | Sent with deliveries as `x-workflow-callback-secret` |
 | `QUEUE_MAX_ATTEMPTS`        | `5`      | Attempts before a message is dead-lettered           |
 | `QUEUE_MAX_INFLIGHT`        | `5`      | Concurrent deliveries per queue cell (maximum `128`) |
-| `QUEUE_DELIVERY_TIMEOUT_MS` | `300000` | Timeout for an application callback                  |
+| `QUEUE_DELIVERY_TIMEOUT_MS` | `300000` | Callback timeout (maximum `300000`)                  |
 
 `queueShards` is part of queue placement and is pinned when a queue cell is
 first used. Drain pending work before changing it.

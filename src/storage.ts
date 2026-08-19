@@ -57,6 +57,7 @@ export interface WorkflowRunDOStub {
     token: string;
     claimId: string;
   }): Promise<{ committed: boolean }>;
+  getLifecycleStatus(): Promise<import('./retention.js').RunLifecycleStatus>;
   getRun(): Promise<RunReadOutcome<WorkflowRun | null>>;
   getStep(stepId: string): Promise<RunReadOutcome<Step | null>>;
   getEvent(eventId: string): Promise<RunReadOutcome<Event | null>>;
@@ -423,7 +424,10 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             createdAt: outcome.run.createdAt.toISOString(),
             status: outcome.run.status,
           });
-          await env.WORKFLOW_INDEX.commitRun(outcome.run, meta);
+          if (outcome.indexPublicationExpiresAt === undefined) {
+            throw new Error('world-celld: authoritative run mutation omitted its index lease');
+          }
+          await env.WORKFLOW_INDEX.commitRun(outcome.run, meta, outcome.indexPublicationExpiresAt);
         }
         if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
@@ -441,12 +445,10 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             hookAdmission.reservation,
           );
         }
-        const terminal = Boolean(outcome.run && isTerminalWorkflowRunStatus(outcome.run.status));
         if (outcome.releasedHooks.length > 0) {
           await env.WORKFLOW_INDEX.releaseHookIndexes({
             runId: effectiveRunId,
             hooks: outcome.releasedHooks,
-            terminal,
           });
         }
 

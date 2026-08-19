@@ -9,7 +9,6 @@ export { HookIdDO } from './durable-objects/HookIdDO.js';
 export { HookTokenDO } from './durable-objects/HookTokenDO.js';
 export { QueueDO } from './durable-objects/QueueDO.js';
 export { RunCatalogDO } from './durable-objects/RunCatalogDO.js';
-export { RunFenceDO } from './durable-objects/RunFenceDO.js';
 export { StreamDO } from './durable-objects/StreamDO.js';
 export { WorkflowRunDO } from './durable-objects/WorkflowRunDO.js';
 export { createRouter, type WorkerEnv } from './router.js';

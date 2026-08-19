@@ -1,5 +1,10 @@
 # Index sharding evidence and routing contract
 
+> This document records the index-sharding landing measurements. The later
+> hard cutover removes `RunFenceDO` and compacted shard-local expiry fences;
+> see [lifecycle-compaction.md](./lifecycle-compaction.md) for the current
+> authority and operation-count contract.
+
 ## Verified starting point
 
 The hard cutover started from fetched `origin/main` at
@@ -91,8 +96,9 @@ latency change.
   while keeping each uniqueness invariant in one natural-key transaction.
   Finalization remains one public call whose two exact-claim writes are
   independently idempotent.
-- Hook lookup keeps one public RPC but adds one internal RunFenceDO read. That
-  read replaces the old singleton's co-located global terminal/expiry keys.
+- At the sharding landing point, hook lookup kept one public RPC and added one
+  internal RunFenceDO read. Lifecycle compaction later replaced that cell with
+  one authoritative WorkflowRunDO lifecycle read.
 - Hook deletion uses one transaction in each ownership domain behind one
   public request. Releases are grouped into bounded batches of 64 per shard.
 - The baseline retention sample made one public `cleanupNow` plus eight status
