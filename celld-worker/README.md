@@ -1,8 +1,8 @@
 # world-celld worker
 
-The celld-deployable half of `@ewhauser/world-celld`: seven cell classes
-(WorkflowRunDO, RunCatalogDO, RunFenceDO, HookTokenDO, HookIdDO, StreamDO, and
-QueueDO) behind an authenticated HTTP router.
+The celld-deployable half of `@ewhauser/world-celld`: six cell classes
+(WorkflowRunDO, RunCatalogDO, HookTokenDO, HookIdDO, StreamDO, and QueueDO)
+behind an authenticated HTTP router.
 Storage, control, and queue methods use fixed JSON RPC routes; stream chunks use
 bounded binary batch writes and binary long-poll reads.
 

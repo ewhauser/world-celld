@@ -105,6 +105,10 @@ export interface QueueCellStub {
     expiredAt: number,
     options?: { limit?: number },
   ): Promise<import('./retention.js').ExpireQueueRunResult>;
+  acknowledgeExpireRun(
+    runId: string,
+    receipt: import('./retention.js').QueueExpiryReceipt,
+  ): Promise<import('./retention.js').AcknowledgeQueueExpiryResult>;
 }
 
 export interface QueueCellNamespace {

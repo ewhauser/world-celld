@@ -8,8 +8,8 @@ import {
   hookIdShardName,
   hookTokenShardName,
   runCatalogShardName,
-  runFenceCellName,
 } from '../src/indexes.js';
+import { QUEUE_FENCE_GRACE_MS } from '../src/lifecycle.js';
 import { CLEANUP_RECORD_KEY, type CleanupRecord } from '../src/retention.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
@@ -21,7 +21,6 @@ import { WorkflowRunDO } from '../src/worker/durable-objects/WorkflowRunDO.js';
 function workflowIndex(harness: Harness) {
   return createWorkflowIndex({
     runCatalog: harness.fleet.namespace('run-catalog'),
-    runFences: harness.fleet.namespace('run-fences'),
     hookTokens: harness.fleet.namespace('hook-tokens'),
     hookIds: harness.fleet.namespace('hook-ids'),
   });
@@ -138,6 +137,14 @@ describe('terminal workflow retention', () => {
     expect((await world.getStreamInfo('retention-stream', runId)).done).toBe(true);
 
     harness.fleet.advance(1_001);
+    expect(harness.fleet.cell('queue', 'q:0').storage.data.has(`expired-run:${runId}`)).toBe(false);
+    await expect(
+      world.queue(
+        '__wkf_workflow_retention',
+        { runId },
+        { idempotencyKey: `late-before-cleanup:${runId}` },
+      ),
+    ).rejects.toSatisfy((error) => RunExpiredError.is(error));
     const status = await driveCleanup(harness, world, runId);
     expect(status).toMatchObject({
       phase: 'tombstoned',
@@ -164,7 +171,18 @@ describe('terminal workflow retention', () => {
     expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
 
     const runKeys = Array.from(harness.fleet.cell('runs', runId).storage.data.keys()).toSorted();
-    expect(runKeys).toEqual(['retention:cleanup', 'retention:tombstone']);
+    expect(runKeys).toEqual(['retention:tombstone']);
+    const run = harness.fleet.cell('runs', runId).instance as WorkflowRunDO;
+    await expect(
+      run.resolveHookTokenClaim({
+        hookId: 'late-hook-after-tombstone',
+        token: 'late-token-after-tombstone',
+        claimId: 'late-claim-after-tombstone',
+      }),
+    ).resolves.toEqual({ committed: false });
+    expect(Array.from(harness.fleet.cell('runs', runId).storage.data.keys())).toEqual([
+      'retention:tombstone',
+    ]);
     expect(
       Array.from(
         harness.fleet.cell('streams', `run-streams:${runId}`).storage.data.keys(),
@@ -232,6 +250,105 @@ describe('terminal workflow retention', () => {
 
     const entries = await workflowIndex(harness).listRuns({ prefix: 'run:retention-retry:' });
     expect(entries.keys).toEqual([]);
+  });
+
+  it('replays lost queue cleanup and acknowledgement responses without losing the receipt', async () => {
+    process.env.CELLD_QUEUE_MODE = 'cells';
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+      baseUrl: 'http://127.0.0.1:1',
+      runRetentionMs: 100,
+    });
+    const runId = await createCompletedRun(world, 'queue-receipt-retry');
+    await world.queue(
+      '__wkf_workflow_retention',
+      { runId },
+      { delaySeconds: 3_600, idempotencyKey: `receipt:${runId}` },
+    );
+    await finishRun(world, runId);
+    await driveTerminalCleanup(harness, runId);
+
+    const queue = harness.fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
+    const originalExpireRun = queue.expireRun.bind(queue);
+    const originalAcknowledgeExpireRun = queue.acknowledgeExpireRun.bind(queue);
+    let loseFinalResponse = true;
+    let loseAcknowledgementResponse = true;
+    queue.expireRun = async (...args: Parameters<QueueDO['expireRun']>) => {
+      const result = await originalExpireRun(...args);
+      if (result.done && loseFinalResponse) {
+        loseFinalResponse = false;
+        throw new Error('injected lost final queue cleanup response');
+      }
+      return result;
+    };
+    queue.acknowledgeExpireRun = async (...args: Parameters<QueueDO['acknowledgeExpireRun']>) => {
+      const result = await originalAcknowledgeExpireRun(...args);
+      if (result.acknowledged && loseAcknowledgementResponse) {
+        loseAcknowledgementResponse = false;
+        throw new Error('injected lost queue acknowledgement response');
+      }
+      return result;
+    };
+
+    harness.fleet.advance(101);
+    for (let page = 0; page < 10; page++) {
+      harness.fleet.advance(1);
+      await harness.fleet.fireDueAlarms();
+      if ((await world.retention.getStatus(runId))?.lastError) break;
+    }
+    expect(await world.retention.getStatus(runId)).toMatchObject({
+      phase: 'queues',
+      attempts: 1,
+      lastError: 'injected lost final queue cleanup response',
+      deletedQueueMessages: 0,
+    });
+    const queueStorage = harness.fleet.cell('queue', 'q:0').storage;
+    expect(queueStorage.data.get(`expired-run:${runId}`)).toMatchObject({
+      deleted: 1,
+      compactAt: null,
+    });
+
+    harness.fleet.advance(QUEUE_FENCE_GRACE_MS * 2);
+    await queue.alarm();
+    expect(queueStorage.data.has(`expired-run:${runId}`)).toBe(true);
+
+    await harness.fleet.fireDueAlarms();
+    expect(harness.fleet.cell('runs', runId).storage.data.get('retention:progress')).toMatchObject({
+      queueShard: 0,
+      queueShardDeleted: 1,
+      pendingAck: { queueShard: 0 },
+    });
+    harness.fleet.advance(1);
+    await harness.fleet.fireDueAlarms();
+    expect(await world.retention.getStatus(runId)).toMatchObject({
+      phase: 'queues',
+      attempts: 1,
+      lastError: 'injected lost queue acknowledgement response',
+    });
+    expect(harness.fleet.cell('runs', runId).storage.data.get('retention:progress')).toMatchObject({
+      queueShard: 0,
+      queueShardDeleted: 1,
+      pendingAck: { queueShard: 0 },
+    });
+    expect(queueStorage.data.get(`expired-run:${runId}`)).toMatchObject({
+      deleted: 1,
+      compactAt: expect.any(Number),
+    });
+
+    harness.fleet.advance(QUEUE_FENCE_GRACE_MS);
+    await queue.alarm();
+    expect(queueStorage.data.has(`expired-run:${runId}`)).toBe(false);
+    await harness.fleet.fireDueAlarms();
+    expect(harness.fleet.cell('runs', runId).storage.data.get('retention:progress')).toEqual({
+      queueShard: 1,
+      queueShardDeleted: 0,
+    });
+
+    queue.expireRun = originalExpireRun;
+    queue.acknowledgeExpireRun = originalAcknowledgeExpireRun;
   });
 
   it('does at most one bounded cleanup page per alarm and resumes a large stream', async () => {
@@ -359,9 +476,9 @@ describe('terminal workflow retention', () => {
           .storage.data.has(hookTokenRecordKey(token));
       }),
     ).not.toContain(true);
-    expect(
-      harness.fleet.cell('run-fences', runFenceCellName(runId)).storage.data.get('fence'),
-    ).toMatchObject({ status: 'terminal' });
+    await expect(
+      (harness.fleet.cell('runs', runId).instance as WorkflowRunDO).getLifecycleStatus(),
+    ).resolves.toBe('terminal');
   });
 
   it('retries a failed terminal page without losing its local cursor', async () => {
@@ -420,7 +537,7 @@ describe('terminal workflow retention', () => {
     expect(idStorage.data.has(hookIdRecordKey(hookId))).toBe(false);
   });
 
-  it('uses exact claims for disposed hooks and adds only terminal run fences', async () => {
+  it('uses exact claims for disposed hooks without accumulating run fences', async () => {
     harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
     const world = createCelldWorld({
       fleetUrl: harness.url,
@@ -451,8 +568,8 @@ describe('terminal workflow retention', () => {
     await finishRun(world, runId);
     await driveTerminalCleanup(harness, runId);
 
-    expect(tokenStorage.data.has(`runfence:${encodeURIComponent(runId)}`)).toBe(true);
-    expect(idStorage.data.has(`runfence:${encodeURIComponent(runId)}`)).toBe(true);
+    expect(tokenStorage.data.has(`runfence:${encodeURIComponent(runId)}`)).toBe(false);
+    expect(idStorage.data.has(`runfence:${encodeURIComponent(runId)}`)).toBe(false);
   });
 
   it('does not regress queue cleanup progress when concurrent pages resolve out of order', async () => {

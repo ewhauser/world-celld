@@ -9,7 +9,6 @@ import {
   hookIdShardName,
   hookTokenShardName,
   runCatalogShardName,
-  runFenceCellName,
   stableIndexHash,
   type WorkflowIndex,
 } from '../src/indexes.js';
@@ -19,7 +18,20 @@ import { stringify } from '../src/vendor/shared/index.js';
 import { HookIdDO } from '../src/worker/durable-objects/HookIdDO.js';
 import { HookTokenDO } from '../src/worker/durable-objects/HookTokenDO.js';
 import { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
-import { RunFenceDO } from '../src/worker/durable-objects/RunFenceDO.js';
+import {
+  CATALOG_FENCE_GRACE_MS,
+  HOOK_CLAIM_LEASE_MS,
+  MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+} from '../src/lifecycle.js';
+import type { RunLifecycleStatus } from '../src/retention.js';
+
+class TestRunLifecycleDO {
+  constructor(private ctx: { storage: DurableObjectStorage }) {}
+
+  async getLifecycleStatus(): Promise<RunLifecycleStatus> {
+    return (await this.ctx.storage.get<RunLifecycleStatus>('status')) ?? 'active';
+  }
+}
 
 function run(sequence: number, workflowName = 'routing-workflow'): WorkflowRun {
   const createdAt = new Date(Date.UTC(2026, 0, 1, 0, 0, sequence));
@@ -77,22 +89,22 @@ describe('sharded workflow indexes', () => {
     const cellEnv: Record<string, unknown> = {};
     fleet = new FakeFleet(
       {
-        'run-catalog': RunCatalogDO as never,
-        'run-fences': RunFenceDO as never,
+        'run-catalog': RunCatalogDO,
+        runs: TestRunLifecycleDO as never,
         'hook-tokens': HookTokenDO as never,
         'hook-ids': HookIdDO as never,
       },
       cellEnv,
     );
+    cellEnv.clock = () => fleet.now;
     const bindings = {
       runCatalog: fleet.namespace('run-catalog'),
-      runFences: fleet.namespace('run-fences'),
       hookTokens: fleet.namespace('hook-tokens'),
       hookIds: fleet.namespace('hook-ids'),
     };
     Object.assign(cellEnv, {
       WORKFLOW_RUN_CATALOG: bindings.runCatalog,
-      WORKFLOW_RUN_FENCES: bindings.runFences,
+      WORKFLOW_DB: fleet.namespace('runs'),
       WORKFLOW_HOOK_TOKENS: bindings.hookTokens,
       WORKFLOW_HOOK_IDS: bindings.hookIds,
     });
@@ -115,7 +127,13 @@ describe('sharded workflow indexes', () => {
   it('commits both run keys in one shard transaction and distributes distinct runs', async () => {
     const runs = Array.from({ length: 128 }, (_, index) => run(index));
     await Promise.all(
-      runs.map((value) => indexes.commitRun(value, JSON.stringify({ runId: value.runId }))),
+      runs.map((value) =>
+        indexes.commitRun(
+          value,
+          JSON.stringify({ runId: value.runId }),
+          fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+        ),
+      ),
     );
 
     const occupied = new Set(runs.map((value) => runCatalogShardName(value.runId)));
@@ -139,7 +157,13 @@ describe('sharded workflow indexes', () => {
   it('merges shard pages without gaps in forward and reverse order', async () => {
     const runs = Array.from({ length: 75 }, (_, index) => run(index));
     await Promise.all(
-      runs.map((value) => indexes.commitRun(value, JSON.stringify({ runId: value.runId }))),
+      runs.map((value) =>
+        indexes.commitRun(
+          value,
+          JSON.stringify({ runId: value.runId }),
+          fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+        ),
+      ),
     );
 
     const collect = async (reverse: boolean) => {
@@ -176,7 +200,13 @@ describe('sharded workflow indexes', () => {
     });
     expect(new Set(values.map((value) => runCatalogShardName(value.runId)))).toHaveLength(2);
     await Promise.all(
-      values.map((value) => indexes.commitRun(value, JSON.stringify({ runId: value.runId }))),
+      values.map((value) =>
+        indexes.commitRun(
+          value,
+          JSON.stringify({ runId: value.runId }),
+          fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+        ),
+      ),
     );
 
     const collect = async (reverse: boolean) => {
@@ -317,10 +347,7 @@ describe('sharded workflow indexes', () => {
     expect(await indexes.getHookByToken(value.token)).toBe(serialized);
     expect(await indexes.getHookById(value.hookId)).toBe(serialized);
 
-    const fence = fleet.namespace('run-fences').get({
-      toString: () => runFenceCellName(value.runId),
-    }) as RunFenceDO;
-    await fence.fenceTerminal(123);
+    fleet.cell('runs', value.runId).storage.data.set('status', 'terminal');
     expect(await indexes.getHookByToken(value.token)).toBeNull();
     expect(await indexes.getHookById(value.hookId)).toBeNull();
 
@@ -344,7 +371,6 @@ describe('sharded workflow indexes', () => {
     await indexes.releaseHookIndexes({
       runId: first.runId,
       hooks: [{ hookId: first.hookId, token: first.token }],
-      terminal: false,
     });
     await expect(
       indexes.finalizeHookIndexes(
@@ -360,16 +386,13 @@ describe('sharded workflow indexes', () => {
     await indexes.releaseHookIndexes({
       runId: first.runId,
       hooks: [{ hookId: first.hookId, token: first.token }],
-      terminal: true,
     });
-    const tokenKeys = Array.from(
-      fleet.cell('hook-tokens', hookTokenShardName(first.token)).storage.data.keys(),
-    );
-    const idKeys = Array.from(
-      fleet.cell('hook-ids', hookIdShardName(first.hookId)).storage.data.keys(),
-    );
-    expect(tokenKeys).toContain(`runfence:${first.runId}`);
-    expect(idKeys).toContain(`runfence:${first.runId}`);
+    expect(
+      Array.from(fleet.cell('hook-tokens', hookTokenShardName(first.token)).storage.data.keys()),
+    ).not.toContain(`runfence:${first.runId}`);
+    expect(
+      Array.from(fleet.cell('hook-ids', hookIdShardName(first.hookId)).storage.data.keys()),
+    ).not.toContain(`runfence:${first.runId}`);
 
     const second = hook('wrun_second', 'hook-second', first.token);
     const secondOwner = { runId: second.runId, hookId: second.hookId };
@@ -387,9 +410,19 @@ describe('sharded workflow indexes', () => {
   });
 
   it('fences catalog expiry before deletion so delayed commits cannot resurrect a run', async () => {
+    const overlong = run(998, 'overlong-publication');
+    await expect(
+      indexes.commitRun(
+        overlong,
+        JSON.stringify({ runId: overlong.runId }),
+        fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS + 1,
+      ),
+    ).resolves.toEqual({ stored: false });
+
     const value = run(999, 'expiry-workflow');
     const metadata = JSON.stringify({ runId: value.runId });
-    await indexes.commitRun(value, metadata);
+    const publicationExpiresAt = fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS;
+    await indexes.commitRun(value, metadata, publicationExpiresAt);
     expect(
       await indexes.expireRun({
         runId: value.runId,
@@ -398,8 +431,81 @@ describe('sharded workflow indexes', () => {
         expiredAt: 123,
       }),
     ).toEqual({ deleted: 2 });
-    expect(await indexes.commitRun(value, metadata)).toEqual({ stored: false });
+    expect(await indexes.commitRun(value, metadata, publicationExpiresAt)).toEqual({
+      stored: false,
+    });
+    fleet.advance(CATALOG_FENCE_GRACE_MS);
+    await fleet.fireDueAlarms();
+    const catalogStorage = fleet.cell('run-catalog', runCatalogShardName(value.runId)).storage;
+    expect(catalogStorage.data.has(`expired:${value.runId}`)).toBe(false);
+    expect(await indexes.commitRun(value, metadata, publicationExpiresAt)).toEqual({
+      stored: false,
+    });
     const page = await indexes.listRuns({ prefix: 'run:expiry-workflow:' });
     expect(page.keys).toEqual([]);
+  });
+
+  it('compacts abandoned exact claims after the protocol lease and survives restart', async () => {
+    const owner = { runId: 'wrun_abandoned_claim', hookId: 'hook-abandoned-claim' };
+    const token = 'token-abandoned-claim';
+    const value = hook(owner.runId, owner.hookId, token);
+    const admission = await indexes.reserveHook(token, owner);
+    expect(admission).toMatchObject({ admitted: true });
+    if (!admission.admitted) throw new Error('expected admission');
+
+    const tokenName = hookTokenShardName(token);
+    const idName = hookIdShardName(owner.hookId);
+    fleet.restartCell('hook-tokens', tokenName);
+    fleet.restartCell('hook-ids', idName);
+    fleet.advance(HOOK_CLAIM_LEASE_MS);
+    await fleet.fireDueAlarms();
+
+    expect(
+      Array.from(fleet.cell('hook-tokens', tokenName).storage.data.keys()).filter((key) =>
+        key.startsWith('claim'),
+      ),
+    ).toEqual([]);
+    expect(
+      Array.from(fleet.cell('hook-ids', idName).storage.data.keys()).filter((key) =>
+        key.startsWith('claim'),
+      ),
+    ).toEqual([]);
+    fleet.cell('runs', owner.runId).storage.data.set('status', 'expired');
+    await expect(
+      indexes.finalizeHookIndexes(
+        token,
+        owner.hookId,
+        stringify(value),
+        owner,
+        admission.reservation,
+      ),
+    ).resolves.toBeUndefined();
+    await expect(indexes.getHookByToken(token)).resolves.toBeNull();
+  });
+
+  it('pages catalog compaction so many expired runs leave no derivative markers', async () => {
+    const shardName = 'run-catalog:v1:compaction-test';
+    const catalog = fleet.namespace('run-catalog').get({
+      toString: () => shardName,
+    }) as RunCatalogDO;
+    for (let index = 0; index < 300; index++) {
+      const runId = `wrun_catalog_compaction_${index}`;
+      await catalog.expireRun(runId, [`run:${runId}`, `runall:${runId}`], fleet.now);
+    }
+
+    const catalogStorage = fleet.cell('run-catalog', shardName).storage;
+    expect(
+      Array.from(catalogStorage.data.keys()).filter((key) => key.startsWith('expired:')),
+    ).toHaveLength(300);
+    fleet.advance(CATALOG_FENCE_GRACE_MS);
+    for (let page = 0; page < 3; page++) {
+      await fleet.fireDueAlarms();
+      fleet.advance(1);
+    }
+    expect(
+      Array.from(catalogStorage.data.keys()).filter(
+        (key) => key.startsWith('expired:') || key.startsWith('expiry-gc:'),
+      ),
+    ).toEqual([]);
   });
 });

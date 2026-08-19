@@ -154,7 +154,6 @@ describe('router auth and shape', () => {
       WORKFLOW_DB: harness.fleet.namespace('runs'),
       WORKFLOW_STREAMS: harness.fleet.namespace('streams'),
       WORKFLOW_RUN_CATALOG: harness.fleet.namespace('run-catalog'),
-      WORKFLOW_RUN_FENCES: harness.fleet.namespace('run-fences'),
       WORKFLOW_HOOK_TOKENS: harness.fleet.namespace('hook-tokens'),
       WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
       WORKFLOW_QUEUE: harness.fleet.namespace('queue'),

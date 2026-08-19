@@ -35,7 +35,11 @@ export interface RunTombstone {
   completedAt: Date;
   expiredAt: Date;
   tombstonedAt: Date;
+  /** Final cleanup accounting retained inside the single authoritative record. */
+  cleanup: CleanupRecord;
 }
+
+export type RunLifecycleStatus = 'active' | 'terminal' | 'expired' | 'missing';
 
 export type RunReadOutcome<T> =
   | { ok: true; value: T }
@@ -59,8 +63,6 @@ export interface TerminalCleanupRecord {
 export interface ReleaseHookIndexesRequest {
   runId: string;
   hooks: HookIndexReference[];
-  /** Install a fence that prevents delayed hook finalization after terminal state. */
-  terminal: boolean;
 }
 
 export interface ReleaseHookIndexesResult {
@@ -98,10 +100,25 @@ export interface ExpireStreamResult {
   done: boolean;
 }
 
-export interface ExpireQueueRunResult {
+export interface QueueExpiryReceipt {
+  expiredAt: number;
+  deleted: number;
+}
+
+export type ExpireQueueRunResult = {
   /** Cumulative messages removed for this run in this queue shard. */
   deleted: number;
-  done: boolean;
+} & (
+  | { done: false }
+  | {
+      done: true;
+      /** Durable receipt which the cleanup coordinator must acknowledge. */
+      receipt: QueueExpiryReceipt;
+    }
+);
+
+export interface AcknowledgeQueueExpiryResult {
+  acknowledged: boolean;
 }
 
 export interface ScheduleCleanupRequest {
@@ -128,6 +145,11 @@ export function hookMarkerKey(reference: HookIndexReference): string {
 }
 
 export function cleanupTombstone(record: CleanupRecord, now: Date): RunTombstone {
+  const cleanup: CleanupRecord = {
+    ...record,
+    phase: 'tombstoned',
+    tombstonedAt: now,
+  };
   return {
     version: 1,
     runId: record.runId,
@@ -135,7 +157,12 @@ export function cleanupTombstone(record: CleanupRecord, now: Date): RunTombstone
     completedAt: record.completedAt,
     expiredAt: record.dueAt,
     tombstonedAt: now,
+    cleanup,
   };
+}
+
+export function cleanupFromTombstone(tombstone: RunTombstone): CleanupRecord {
+  return tombstone.cleanup;
 }
 
 export function expiredRead<T>(tombstone: RunTombstone): RunReadOutcome<T> {

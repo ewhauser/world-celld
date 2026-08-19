@@ -3,6 +3,7 @@ import type { StreamDONamespace } from './streamer.js';
 import type { QueueCellNamespace } from './queue.js';
 import { MAX_STREAM_LONG_POLL_MS } from './stream-protocol.js';
 import type { WorkflowIndex } from './indexes.js';
+import { MAX_FLEET_RPC_TIMEOUT_MS } from './lifecycle.js';
 
 /** Public alias retained for custom in-process environments. */
 export type IndexNamespace = WorkflowIndex;
@@ -83,8 +84,12 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
   }
 
   const rpcTimeoutMs = config?.rpcTimeoutMs ?? 30_000;
-  if (!Number.isSafeInteger(rpcTimeoutMs) || rpcTimeoutMs < 1) {
-    throw new Error('world-celld: rpcTimeoutMs must be a positive safe integer');
+  if (
+    !Number.isSafeInteger(rpcTimeoutMs) ||
+    rpcTimeoutMs < 1 ||
+    rpcTimeoutMs > MAX_FLEET_RPC_TIMEOUT_MS
+  ) {
+    throw new Error(`world-celld: rpcTimeoutMs must be between 1 and ${MAX_FLEET_RPC_TIMEOUT_MS}`);
   }
   const streamLongPollMs =
     config?.streamLongPollMs ??

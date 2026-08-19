@@ -9,7 +9,6 @@ import { HookIdDO } from '../worker/durable-objects/HookIdDO.js';
 import { HookTokenDO } from '../worker/durable-objects/HookTokenDO.js';
 import { QueueDO } from '../worker/durable-objects/QueueDO.js';
 import { RunCatalogDO } from '../worker/durable-objects/RunCatalogDO.js';
-import { RunFenceDO } from '../worker/durable-objects/RunFenceDO.js';
 import { StreamDO } from '../worker/durable-objects/StreamDO.js';
 import { WorkflowRunDO } from '../worker/durable-objects/WorkflowRunDO.js';
 import { FakeFleet } from './fake-cell.js';
@@ -37,7 +36,6 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       runs: WorkflowRunDO as never,
       streams: StreamDO as never,
       'run-catalog': RunCatalogDO as never,
-      'run-fences': RunFenceDO as never,
       'hook-tokens': HookTokenDO as never,
       'hook-ids': HookIdDO as never,
       queue: QueueDO as never,
@@ -54,7 +52,6 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     WORKFLOW_DB: fleet.namespace('runs'),
     WORKFLOW_STREAMS: fleet.namespace('streams'),
     WORKFLOW_RUN_CATALOG: fleet.namespace('run-catalog'),
-    WORKFLOW_RUN_FENCES: fleet.namespace('run-fences'),
     WORKFLOW_HOOK_TOKENS: fleet.namespace('hook-tokens'),
     WORKFLOW_HOOK_IDS: fleet.namespace('hook-ids'),
     WORKFLOW_QUEUE: fleet.namespace('queue'),
@@ -64,7 +61,6 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     WORKFLOW_DB: fleet.namespace('runs'),
     WORKFLOW_STREAMS: fleet.namespace('streams'),
     WORKFLOW_RUN_CATALOG: fleet.namespace('run-catalog'),
-    WORKFLOW_RUN_FENCES: fleet.namespace('run-fences'),
     WORKFLOW_HOOK_TOKENS: fleet.namespace('hook-tokens'),
     WORKFLOW_HOOK_IDS: fleet.namespace('hook-ids'),
     WORKFLOW_QUEUE: fleet.namespace('queue'),

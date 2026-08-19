@@ -1,6 +1,18 @@
 import { DurableObject } from '../do-base.js';
 import type { EnqueueOutcome, EnqueueRequest } from '../../queue.js';
-import type { ExpireQueueRunResult } from '../../retention.js';
+import type {
+  AcknowledgeQueueExpiryResult,
+  ExpireQueueRunResult,
+  QueueExpiryReceipt,
+} from '../../retention.js';
+import type { RunLifecycleStatus } from '../../retention.js';
+import {
+  LIFECYCLE_COMPACTION_BATCH,
+  LIFECYCLE_COMPACTION_RETRY_MS,
+  MAX_QUEUE_DELIVERY_TIMEOUT_MS,
+  QUEUE_FENCE_GRACE_MS,
+  QUEUE_INFLIGHT_GRACE_MS,
+} from '../../lifecycle.js';
 
 /**
  * Queue cell: the celld replacement for Cloudflare Queues.
@@ -19,7 +31,10 @@ import type { ExpireQueueRunResult } from '../../retention.js';
  *   key:<idempotencyKey>         active dedup claim -> messageId
  *   dlq:<paddedMs>:<messageId>   DeadLetterRow
  *   run:<runId>:<messageId>      QueueRunReference for retention cleanup
- *   expired-run:<runId>          run fence preventing delayed enqueue
+ *   expired-run:<runId>          cumulative cleanup receipt; compactable only
+ *                                after RunDO acknowledgement
+ *   expired-run-gc:<paddedMs>:<runId>
+ *                                ordered compaction deadline -> runId
  *
  * celld gotchas designed around:
  * - celld#144 (alarm handlers can overlap): the storage-only claim phase runs
@@ -81,6 +96,12 @@ interface InflightClaim {
 interface ExpiredRunFence {
   expiredAt: number;
   deleted: number;
+  compactAt: number | null;
+}
+
+interface ExpiredRunGc {
+  runId: string;
+  compactAt: number;
 }
 
 const PERMANENT_STATUSES = new Set([404, 409, 410, 422]);
@@ -88,8 +109,6 @@ const PERMANENT_STATUSES = new Set([404, 409, 410, 422]);
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_MAX_INFLIGHT = 5;
 const DEFAULT_DELIVERY_TIMEOUT_MS = 300_000;
-/** Grace period past the delivery timeout before a claim counts as lost. */
-const INFLIGHT_GRACE_MS = 30_000;
 /** Move overdue alarms to a new timestamp so celld observes a fresh edge. */
 const MIN_ALARM_DELAY_MS = 1;
 /** Bound expiry recovery so one alarm cannot monopolize the cell. */
@@ -99,6 +118,7 @@ const EXPIRE_RUN_REFERENCE_BATCH = 64;
 const PURGE_DEAD_LETTER_BATCH = 128;
 
 const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
+const EXPIRED_RUN_GC_PREFIX = 'expired-run-gc:';
 
 type AlarmStorage = Pick<DurableObjectStorage, 'list' | 'getAlarm' | 'setAlarm' | 'deleteAlarm'>;
 
@@ -127,6 +147,10 @@ function runReferenceKey(runId: string, messageId: string): string {
 
 function expiredRunKey(runId: string): string {
   return `expired-run:${runId}`;
+}
+
+function expiredRunGcKey(runId: string, compactAt: number): string {
+  return `${EXPIRED_RUN_GC_PREFIX}${pad(compactAt)}:${encodeURIComponent(runId)}`;
 }
 
 function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
@@ -186,6 +210,10 @@ interface QueueCellEnv {
   /** Test seams (never set by a real deploy — celld vars are strings). */
   clock?: () => number;
   fetch?: typeof fetch;
+  WORKFLOW_DB?: {
+    idFromName(name: string): { toString(): string };
+    get(id: { toString(): string }): { getLifecycleStatus(): Promise<RunLifecycleStatus> };
+  };
 }
 
 const MAX_QUEUE_INFLIGHT = 128;
@@ -218,19 +246,46 @@ export class QueueDO extends DurableObject {
     return configured;
   }
 
+  #deliveryTimeoutMs(): number {
+    const configured = this.#intVar('QUEUE_DELIVERY_TIMEOUT_MS', DEFAULT_DELIVERY_TIMEOUT_MS);
+    if (configured > MAX_QUEUE_DELIVERY_TIMEOUT_MS) {
+      throw new Error(`QUEUE_DELIVERY_TIMEOUT_MS must be at most ${MAX_QUEUE_DELIVERY_TIMEOUT_MS}`);
+    }
+    return configured;
+  }
+
+  async #authoritativeRunExpired(runId: string): Promise<boolean> {
+    const namespace = (this.env as QueueCellEnv)?.WORKFLOW_DB;
+    if (!namespace) throw new Error('world-celld queue missing WORKFLOW_DB binding');
+    const status = await namespace.get(namespace.idFromName(runId)).getLifecycleStatus();
+    return status === 'expired';
+  }
+
+  async #withRunMutation<T>(
+    runId: string,
+    onExpired: (txn: DurableObjectTransaction) => Promise<T>,
+    onAllowed: (txn: DurableObjectTransaction) => Promise<T>,
+  ): Promise<T> {
+    // A non-expired proof is intentionally not cached: a run may become
+    // terminal and reach its retention boundary between any two requests.
+    // Recheck the exact derivative marker in the queue transaction so cleanup
+    // which raced the authority read still wins before the mutation commits.
+    const expired = await this.#authoritativeRunExpired(runId);
+    return await this.ctx.storage.transaction(async (txn) => {
+      if ((await txn.get<ExpiredRunFence>(expiredRunKey(runId))) || expired) {
+        return await onExpired(txn);
+      }
+      return await onAllowed(txn);
+    });
+  }
+
   async enqueue(request: EnqueueRequest): Promise<EnqueueOutcome> {
     this.#maxInflight();
+    this.#deliveryTimeoutMs();
     const storage = this.ctx.storage;
     const now = this.#now();
 
-    const outcome = await storage.transaction<EnqueueOutcome>(async (txn) => {
-      if (request.runId && (await txn.get(expiredRunKey(request.runId))) !== undefined) {
-        return {
-          ok: false,
-          code: 'RUN_EXPIRED',
-          message: `Workflow run "${request.runId}" has expired`,
-        };
-      }
+    const persist = async (txn: DurableObjectTransaction): Promise<EnqueueOutcome> => {
       // Pin the shard count from the first enqueue and reject drift loudly:
       // idempotencyKey -> cell affinity (and therefore dedup correctness)
       // depends on every producer agreeing on the shard count. The delivery
@@ -289,7 +344,19 @@ export class QueueDO extends DurableObject {
       await this.#armAlarmAtMost(txn, dueAt, now);
 
       return { ok: true, messageId: row.messageId, deduped: false };
-    });
+    };
+
+    const outcome = request.runId
+      ? await this.#withRunMutation<EnqueueOutcome>(
+          request.runId,
+          async (): Promise<EnqueueOutcome> => ({
+            ok: false,
+            code: 'RUN_EXPIRED',
+            message: `Workflow run "${request.runId}" has expired`,
+          }),
+          persist,
+        )
+      : await storage.transaction(persist);
 
     return outcome;
   }
@@ -312,7 +379,10 @@ export class QueueDO extends DurableObject {
     } else {
       await attempt();
     }
-    if (failure !== null) throw failure;
+    if (failure !== null) {
+      await this.ctx.storage.setAlarm(this.#now() + LIFECYCLE_COMPACTION_RETRY_MS);
+      throw failure;
+    }
 
     for (const claim of claimed) {
       this.ctx.waitUntil(this.#deliver(claim));
@@ -328,7 +398,15 @@ export class QueueDO extends DurableObject {
     const now = this.#now();
     const maxInflight = this.#maxInflight();
     const claimed = await storage.transaction<InflightClaim[]>(async (txn) => {
-      // 1. Recover: an inflight entry past its deadline is a lost delivery
+      // 1. Compact a bounded page of acknowledged derivative expiry fences.
+      // Queue operations always consult the authoritative RunDO tombstone, so
+      // deleting the receipt cannot reopen the run.
+      if (await this.#compactExpiredRunFences(txn, now)) {
+        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
+        return [];
+      }
+
+      // 2. Recover: an inflight entry past its deadline is a lost delivery
       // (node crash, deploy restart) — back to due for redelivery.
       const expiredPage = await txn.list<string>({
         prefix: INFLIGHT_DEADLINE_PREFIX,
@@ -376,7 +454,7 @@ export class QueueDO extends DurableObject {
       });
       const inflightCount = activeInflight.size;
 
-      // 2. Claim due messages up to the cap.
+      // 3. Claim due messages up to the cap.
       const rows: InflightClaim[] = [];
       if (inflightCount < maxInflight) {
         const due = await txn.list<string>({
@@ -384,7 +462,7 @@ export class QueueDO extends DurableObject {
           end: `due:${pad(now + 1)}`,
           limit: maxInflight - inflightCount,
         });
-        const timeoutMs = this.#intVar('QUEUE_DELIVERY_TIMEOUT_MS', DEFAULT_DELIVERY_TIMEOUT_MS);
+        const timeoutMs = this.#deliveryTimeoutMs();
         const dueRows = await getMany<MessageRow>(
           txn,
           Array.from(due.values(), (messageId) => `msg:${messageId}`),
@@ -394,7 +472,7 @@ export class QueueDO extends DurableObject {
         for (const [, messageId] of due) {
           const row = dueRows.get(`msg:${messageId}`);
           if (!row) continue; // orphaned schedule entry
-          const claimKey = inflightKey(now + timeoutMs + INFLIGHT_GRACE_MS, messageId);
+          const claimKey = inflightKey(now + timeoutMs + QUEUE_INFLIGHT_GRACE_MS, messageId);
           claimWrites.push([claimKey, messageId]);
           if (row.runId) {
             claimWrites.push([
@@ -419,9 +497,17 @@ export class QueueDO extends DurableObject {
 
   async #deliver({ row, inflightKey: claimKey }: InflightClaim): Promise<void> {
     const storage = this.ctx.storage;
-    const timeoutMs = this.#intVar('QUEUE_DELIVERY_TIMEOUT_MS', DEFAULT_DELIVERY_TIMEOUT_MS);
+    const timeoutMs = this.#deliveryTimeoutMs();
     const callbackSecret = (this.env as QueueCellEnv)?.WORKFLOW_CALLBACK_SECRET;
     const url = `${row.targetBaseUrl.replace(/\/$/, '')}/.well-known/workflow/v1/${row.pathname}`;
+
+    // Claiming is storage-only so it can stay bounded and atomic. Resolve the
+    // authoritative lifecycle immediately before external I/O; if retention
+    // expired after the claim, consume the claim without publishing a hook.
+    if (row.runId && (await this.#authoritativeRunExpired(row.runId))) {
+      await storage.transaction((txn) => this.#dropExpiredMessage(txn, row, claimKey, this.#now()));
+      return;
+    }
 
     let response: Response | null = null;
     let transportError: unknown = null;
@@ -459,22 +545,10 @@ export class QueueDO extends DurableObject {
         timeoutSeconds = undefined;
       }
       if (typeof timeoutSeconds === 'number') {
-        await storage.transaction(async (txn) => {
+        const reschedule = async (txn: DurableObjectTransaction) => {
           // Deleting the exact deadline key doubles as a lease-token check. A
           // late response from an expired claim must not mutate a newer claim.
           if (!(await txn.delete(claimKey))) return;
-          if (row.runId && (await txn.get(expiredRunKey(row.runId))) !== undefined) {
-            await txn.delete(`msg:${row.messageId}`);
-            await txn.delete(runReferenceKey(row.runId, row.messageId));
-            if (row.idempotencyKey) {
-              const dedupKey = `key:${row.idempotencyKey}`;
-              if ((await txn.get<string>(dedupKey)) === row.messageId) {
-                await txn.delete(dedupKey);
-              }
-            }
-            await this.#scheduleNextAlarm(txn, now);
-            return;
-          }
           const scheduleKey = dueKey(now + timeoutSeconds * 1000, row.messageId);
           await txn.put(scheduleKey, row.messageId);
           if (row.runId) {
@@ -485,7 +559,16 @@ export class QueueDO extends DurableObject {
             });
           }
           await this.#scheduleNextAlarm(txn, now);
-        });
+        };
+        if (row.runId) {
+          await this.#withRunMutation(
+            row.runId,
+            (txn) => this.#dropExpiredMessage(txn, row, claimKey, now),
+            reschedule,
+          );
+        } else {
+          await storage.transaction(reschedule);
+        }
       } else {
         await this.#retry(row, claimKey, 'HTTP 503');
       }
@@ -521,26 +604,30 @@ export class QueueDO extends DurableObject {
     });
   }
 
+  async #dropExpiredMessage(
+    txn: DurableObjectTransaction,
+    row: MessageRow,
+    claimKey: string,
+    now: number,
+  ): Promise<void> {
+    if (!(await txn.delete(claimKey))) return;
+    await txn.delete(`msg:${row.messageId}`);
+    if (row.runId) await txn.delete(runReferenceKey(row.runId, row.messageId));
+    if (row.idempotencyKey) {
+      const dedupKey = `key:${row.idempotencyKey}`;
+      if ((await txn.get<string>(dedupKey)) === row.messageId) await txn.delete(dedupKey);
+    }
+    await this.#scheduleNextAlarm(txn, now);
+  }
+
   async #retry(row: MessageRow, claimKey: string, reason: string): Promise<void> {
     const storage = this.ctx.storage;
     const now = this.#now();
     const maxAttempts = this.#intVar('QUEUE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS);
     const attempt = row.attempt + 1;
 
-    await storage.transaction(async (txn) => {
+    const persistRetry = async (txn: DurableObjectTransaction) => {
       if (!(await txn.delete(claimKey))) return;
-      if (row.runId && (await txn.get(expiredRunKey(row.runId))) !== undefined) {
-        await txn.delete(`msg:${row.messageId}`);
-        await txn.delete(runReferenceKey(row.runId, row.messageId));
-        if (row.idempotencyKey) {
-          const dedupKey = `key:${row.idempotencyKey}`;
-          if ((await txn.get<string>(dedupKey)) === row.messageId) {
-            await txn.delete(dedupKey);
-          }
-        }
-        await this.#scheduleNextAlarm(txn, now);
-        return;
-      }
 
       if (attempt >= maxAttempts) {
         const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt: now };
@@ -576,7 +663,41 @@ export class QueueDO extends DurableObject {
         });
       }
       await this.#scheduleNextAlarm(txn, now);
+    };
+    if (row.runId) {
+      await this.#withRunMutation(
+        row.runId,
+        (txn) => this.#dropExpiredMessage(txn, row, claimKey, now),
+        persistRetry,
+      );
+    } else {
+      await storage.transaction(persistRetry);
+    }
+  }
+
+  /** Return true when another due compaction page must run immediately. */
+  async #compactExpiredRunFences(txn: DurableObjectTransaction, now: number): Promise<boolean> {
+    const due = await txn.list<ExpiredRunGc>({
+      prefix: EXPIRED_RUN_GC_PREFIX,
+      end: `${EXPIRED_RUN_GC_PREFIX}${pad(now + 1)}`,
+      limit: LIFECYCLE_COMPACTION_BATCH + 1,
     });
+    const page = Array.from(due).slice(0, LIFECYCLE_COMPACTION_BATCH);
+    if (page.length === 0) return false;
+
+    const markerKeys = page.map(([, item]) => expiredRunKey(item.runId));
+    const markers = await getMany<ExpiredRunFence>(txn, markerKeys);
+    const deletes: string[] = [];
+    for (let index = 0; index < page.length; index++) {
+      const [gcKey, item] = page[index];
+      const markerKey = markerKeys[index];
+      const marker = markers.get(markerKey);
+      deletes.push(gcKey);
+      if (marker?.compactAt !== item.compactAt) continue;
+      deletes.push(markerKey);
+    }
+    await deleteMany(txn, deletes);
+    return due.size > LIFECYCLE_COMPACTION_BATCH;
   }
 
   /** Arm the alarm no later than `atMs` (durable backoff never throws). */
@@ -611,6 +732,11 @@ export class QueueDO extends DurableObject {
     for (const key of inflight.keys()) {
       const deadline = deadlineFromInflightKey(key);
       if (next === null || deadline < next) next = deadline;
+    }
+
+    const expiryGc = await storage.list<ExpiredRunGc>({ prefix: EXPIRED_RUN_GC_PREFIX, limit: 1 });
+    for (const item of expiryGc.values()) {
+      if (next === null || item.compactAt < next) next = item.compactAt;
     }
 
     if (next !== null) {
@@ -662,41 +788,54 @@ export class QueueDO extends DurableObject {
   async redriveDeadLetter(messageId: string): Promise<{ ok: boolean }> {
     const storage = this.ctx.storage;
     const now = this.#now();
-    const outcome = await storage.transaction<{ ok: boolean }>(async (txn) => {
-      const dlq = await txn.list<DeadLetterRow>({ prefix: 'dlq:' });
-      for (const [key, dead] of dlq) {
-        if (dead.messageId !== messageId) continue;
-        const { failedAt: _failedAt, ...rest } = dead;
-        const row: MessageRow = { ...rest, attempt: 0, lastError: undefined };
+    const found = Array.from(await storage.list<DeadLetterRow>({ prefix: 'dlq:' })).find(
+      ([, dead]) => dead.messageId === messageId,
+    );
+    if (!found) return { ok: false };
+    const [deadKey, candidate] = found;
 
-        if (row.idempotencyKey) {
-          const dedupKey = `key:${row.idempotencyKey}`;
-          const holder = await txn.get<string>(dedupKey);
-          if (holder && holder !== row.messageId && (await txn.get(`msg:${holder}`))) {
-            return { ok: false };
-          }
-          if (holder && holder !== row.messageId) {
-            await txn.delete(dedupKey);
-          }
-          await txn.put(dedupKey, row.messageId);
-        }
+    const redrive = async (txn: DurableObjectTransaction): Promise<{ ok: boolean }> => {
+      const dead = await txn.get<DeadLetterRow>(deadKey);
+      if (!dead || dead.messageId !== messageId) return { ok: false };
+      const { failedAt: _failedAt, ...rest } = dead;
+      const row: MessageRow = { ...rest, attempt: 0, lastError: undefined };
 
-        await txn.put(`msg:${row.messageId}`, row);
-        const scheduleKey = dueKey(now, row.messageId);
-        await txn.put(scheduleKey, row.messageId);
-        await txn.delete(key);
-        if (row.runId) {
-          await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
-            messageId: row.messageId,
-            dueKey: scheduleKey,
-            idempotencyKey: row.idempotencyKey,
-          });
+      if (row.idempotencyKey) {
+        const dedupKey = `key:${row.idempotencyKey}`;
+        const holder = await txn.get<string>(dedupKey);
+        if (holder && holder !== row.messageId && (await txn.get(`msg:${holder}`))) {
+          return { ok: false };
         }
-        await this.#armAlarmAtMost(txn, now, now);
-        return { ok: true };
+        if (holder && holder !== row.messageId) await txn.delete(dedupKey);
+        await txn.put(dedupKey, row.messageId);
+      }
+
+      await txn.put(`msg:${row.messageId}`, row);
+      const scheduleKey = dueKey(now, row.messageId);
+      await txn.put(scheduleKey, row.messageId);
+      await txn.delete(deadKey);
+      if (row.runId) {
+        await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+          messageId: row.messageId,
+          dueKey: scheduleKey,
+          idempotencyKey: row.idempotencyKey,
+        });
+      }
+      await this.#armAlarmAtMost(txn, now, now);
+      return { ok: true };
+    };
+
+    const rejectExpired = async (txn: DurableObjectTransaction): Promise<{ ok: boolean }> => {
+      const current = await txn.get<DeadLetterRow>(deadKey);
+      if (current?.messageId === messageId) {
+        await txn.delete([deadKey, runReferenceKey(candidate.runId!, messageId)]);
       }
       return { ok: false };
-    });
+    };
+
+    const outcome = candidate.runId
+      ? await this.#withRunMutation(candidate.runId, rejectExpired, redrive)
+      : await storage.transaction(redrive);
 
     return outcome;
   }
@@ -764,9 +903,44 @@ export class QueueDO extends DurableObject {
         count++;
       }
       await deleteMany(txn, keys);
-      await txn.put<ExpiredRunFence>(expiredRunKey(runId), { expiredAt, deleted: count });
+      const done = references.size <= limit;
+      const markerExpiredAt = existing?.expiredAt ?? expiredAt;
+      await txn.put<ExpiredRunFence>(expiredRunKey(runId), {
+        expiredAt: markerExpiredAt,
+        deleted: count,
+        // Keep the cumulative receipt until the cleanup coordinator has first
+        // persisted it and then explicitly acknowledged it.
+        compactAt: existing?.compactAt ?? null,
+      });
       await this.#scheduleNextAlarm(txn, this.#now());
-      return { deleted: count, done: references.size <= limit };
+      return done
+        ? { deleted: count, done: true, receipt: { expiredAt: markerExpiredAt, deleted: count } }
+        : { deleted: count, done: false };
+    });
+  }
+
+  /** Acknowledge a final cleanup receipt before making its marker compactable. */
+  async acknowledgeExpireRun(
+    runId: string,
+    receipt: QueueExpiryReceipt,
+  ): Promise<AcknowledgeQueueExpiryResult> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      const key = expiredRunKey(runId);
+      const marker = await txn.get<ExpiredRunFence>(key);
+      // A response may be lost after acknowledgement and its grace alarm may
+      // compact the marker before the coordinator retries. Absence is therefore
+      // the idempotent success state.
+      if (!marker) return { acknowledged: true };
+      if (marker.expiredAt !== receipt.expiredAt || marker.deleted !== receipt.deleted) {
+        return { acknowledged: false };
+      }
+      if (marker.compactAt === null) {
+        const compactAt = this.#now() + QUEUE_FENCE_GRACE_MS;
+        await txn.put<ExpiredRunFence>(key, { ...marker, compactAt });
+        await txn.put<ExpiredRunGc>(expiredRunGcKey(runId, compactAt), { runId, compactAt });
+      }
+      await this.#scheduleNextAlarm(txn, this.#now());
+      return { acknowledged: true };
     });
   }
 }

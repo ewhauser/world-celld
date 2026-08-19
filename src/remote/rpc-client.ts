@@ -1,5 +1,6 @@
 import { rpcParse, rpcStringify } from '../codec.js';
 import { FleetTransportError, reconstructError, type WireError } from './errors.js';
+import { FLEET_IDEMPOTENT_ATTEMPTS, MAX_FLEET_RPC_TIMEOUT_MS } from '../lifecycle.js';
 
 export interface RpcTransport {
   fleetUrl: string;
@@ -12,7 +13,6 @@ export interface RpcTransport {
 
 /** Statuses that mean "the fleet couldn't take the request" (safe to retry reads). */
 const RETRYABLE_STATUSES = new Set([502, 503, 504]);
-const READ_RETRIES = 2;
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 function delayMs(ms: number): Promise<void> {
@@ -52,7 +52,13 @@ export async function callFleetRoute<T>(
 ): Promise<T> {
   const doFetch = transport.fetchImpl ?? fetch;
   const url = `${transport.fleetUrl.replace(/\/$/, '')}${path}`;
-  const attempts = opts?.idempotent ? 1 + READ_RETRIES : 1;
+  const attempts = opts?.idempotent ? FLEET_IDEMPOTENT_ATTEMPTS : 1;
+  const timeoutMs = transport.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_FLEET_RPC_TIMEOUT_MS) {
+    throw new Error(
+      `world-celld: fleet RPC timeout must be between 1 and ${MAX_FLEET_RPC_TIMEOUT_MS}`,
+    );
+  }
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
@@ -68,7 +74,7 @@ export async function callFleetRoute<T>(
           authorization: `Bearer ${transport.secret}`,
         },
         body: rpcStringify(args),
-        signal: AbortSignal.timeout(Math.max(1, transport.timeoutMs ?? DEFAULT_TIMEOUT_MS)),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
       lastError = new FleetTransportError(`world-celld: fleet unreachable at ${url}`, error);

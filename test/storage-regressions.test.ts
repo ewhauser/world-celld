@@ -73,12 +73,12 @@ describe('Storage regressions', () => {
     const index = mockEnv.WORKFLOW_INDEX;
     const commitRun = index.commitRun.bind(index);
     let failNextRunIndexWrite = true;
-    index.commitRun = async (run, value) => {
+    index.commitRun = async (run, value, publicationExpiresAt) => {
       if (failNextRunIndexWrite) {
         failNextRunIndexWrite = false;
         throw new Error('injected index outage');
       }
-      return commitRun(run, value);
+      return commitRun(run, value, publicationExpiresAt);
     };
 
     try {
@@ -265,6 +265,7 @@ describe('Storage regressions', () => {
     await mockEnv.WORKFLOW_INDEX.commitRun(
       completed,
       JSON.stringify({ ...metadata, status: 'pending' }),
+      Date.now() + 1_000,
     );
 
     const result = await storage.runs.list({

@@ -7,7 +7,6 @@ export {
   HookTokenDO,
   QueueDO,
   RunCatalogDO,
-  RunFenceDO,
   StreamDO,
   WorkflowRunDO,
   default,

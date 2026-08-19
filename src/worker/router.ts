@@ -22,7 +22,6 @@ import {
   type HookTokenShardStub,
   type IndexListOptions,
   type RunCatalogShardStub,
-  type RunFenceStub,
 } from '../indexes.js';
 import type { ExpireRunIndexesRequest, ReleaseHookIndexesRequest } from '../retention.js';
 import {
@@ -54,7 +53,6 @@ export interface WorkerEnv {
   WORKFLOW_DB: DONamespaceLike;
   WORKFLOW_STREAMS: DONamespaceLike;
   WORKFLOW_RUN_CATALOG: DONamespaceLike;
-  WORKFLOW_RUN_FENCES: DONamespaceLike;
   WORKFLOW_HOOK_TOKENS: DONamespaceLike;
   WORKFLOW_HOOK_IDS: DONamespaceLike;
   WORKFLOW_QUEUE: DONamespaceLike;
@@ -64,7 +62,6 @@ export interface WorkerEnv {
 function workflowIndex(env: WorkerEnv) {
   return createWorkflowIndex({
     runCatalog: env.WORKFLOW_RUN_CATALOG as CellNamespaceLike<RunCatalogShardStub>,
-    runFences: env.WORKFLOW_RUN_FENCES as CellNamespaceLike<RunFenceStub>,
     hookTokens: env.WORKFLOW_HOOK_TOKENS as CellNamespaceLike<HookTokenShardStub>,
     hookIds: env.WORKFLOW_HOOK_IDS as CellNamespaceLike<HookIdShardStub>,
   });
@@ -75,6 +72,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
     env: 'WORKFLOW_DB',
     methods: new Set([
       'applyEvent',
+      'getLifecycleStatus',
       'getRun',
       'getStep',
       'getEvent',
@@ -118,6 +116,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'purgeDeadLetters',
       'rearmAlarm',
       'expireRun',
+      'acknowledgeExpireRun',
     ]),
   },
 };
@@ -251,7 +250,11 @@ export function createRouter(env: WorkerEnv) {
         if (operation === 'runs.list') {
           result = await index.listRuns(args[0] as IndexListOptions | undefined);
         } else if (operation === 'runs.commit') {
-          result = await index.commitRun(args[0] as WorkflowRun, args[1] as string);
+          result = await index.commitRun(
+            args[0] as WorkflowRun,
+            args[1] as string,
+            args[2] as number,
+          );
         } else if (operation === 'runs.expire') {
           result = await index.expireRun(args[0] as ExpireRunIndexesRequest);
         } else if (operation === 'hooks.reserve') {

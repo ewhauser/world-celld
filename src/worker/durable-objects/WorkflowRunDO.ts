@@ -4,7 +4,6 @@ import {
   type HookIdShardStub,
   type HookTokenShardStub,
   type RunCatalogShardStub,
-  type RunFenceStub,
   type WorkflowIndex,
 } from '../../indexes.js';
 import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
@@ -26,8 +25,10 @@ import {
   WAIT_KEY_PREFIX,
 } from '../../apply-event.js';
 import {
+  type AcknowledgeQueueExpiryResult,
   CLEANUP_RECORD_KEY,
   type CleanupRecord,
+  cleanupFromTombstone,
   cleanupTombstone,
   type ExpireQueueRunResult,
   type ExpireRunStreamsResult,
@@ -39,6 +40,8 @@ import {
   type HookIndexReference,
   hookMarkerKey,
   type RunReadOutcome,
+  type RunLifecycleStatus,
+  type QueueExpiryReceipt,
   type RunTombstone,
   type ScheduleCleanupRequest,
   TERMINAL_CLEANUP_KEY,
@@ -46,6 +49,7 @@ import {
   TOMBSTONE_KEY,
   workflowRunIndexKey,
 } from '../../retention.js';
+import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../../lifecycle.js';
 
 interface CellId {
   toString(): string;
@@ -76,11 +80,14 @@ interface QueueCleanupStub {
     expiredAt: number,
     options?: { limit?: number },
   ): Promise<ExpireQueueRunResult>;
+  acknowledgeExpireRun(
+    runId: string,
+    receipt: QueueExpiryReceipt,
+  ): Promise<AcknowledgeQueueExpiryResult>;
 }
 
 interface WorkflowRunDOEnv {
   WORKFLOW_RUN_CATALOG?: CellNamespace<RunCatalogShardStub>;
-  WORKFLOW_RUN_FENCES?: CellNamespace<RunFenceStub>;
   WORKFLOW_HOOK_TOKENS?: CellNamespace<HookTokenShardStub>;
   WORKFLOW_HOOK_IDS?: CellNamespace<HookIdShardStub>;
   WORKFLOW_STREAMS?: CellNamespace<StreamCleanupStub>;
@@ -98,7 +105,6 @@ const STREAMS_PER_CLEANUP_PAGE = 16;
 const STREAM_CHUNKS_PER_CLEANUP_PAGE = STORAGE_BATCH_SIZE;
 const STREAM_BYTES_PER_CLEANUP_PAGE = 16 * 1024 * 1024;
 const QUEUE_REFERENCES_PER_CLEANUP_PAGE = 64;
-const QUEUE_SHARDS_PER_CLEANUP_PAGE = 8;
 const CLEANUP_RETRY_MAX_MS = 60 * 60 * 1000;
 const CLEANUP_PROGRESS_KEY = 'retention:progress';
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
@@ -106,6 +112,10 @@ type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'canc
 interface CleanupProgress {
   queueShard: number;
   queueShardDeleted: number;
+  pendingAck?: {
+    queueShard: number;
+    receipt: QueueExpiryReceipt;
+  };
 }
 
 /**
@@ -289,6 +299,9 @@ export class WorkflowRunDO extends DurableObject {
         }
         await txn.setAlarm(this.now() + 1);
       }
+      if (outcome.run) {
+        outcome.indexPublicationExpiresAt = now.getTime() + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS;
+      }
       return finalizeEventPage(storeFrom(txn), outcome, request.params);
     });
   }
@@ -304,6 +317,11 @@ export class WorkflowRunDO extends DurableObject {
     claimId: string;
   }): Promise<{ committed: boolean }> {
     return await this.ctx.storage.transaction(async (txn) => {
+      const { tombstone } = await this.retentionState(txn);
+      // Once the authoritative expiry record exists (including the logical
+      // tombstone at dueAt), a lost-response resolver must not recreate
+      // unbounded per-claim state next to the tombstone.
+      if (tombstone) return { committed: false };
       const hook = await txn.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
       if (hook?.token === request.token) return { committed: true };
       await txn.put(hookClaimCancellationKey(request.claimId), {
@@ -317,6 +335,23 @@ export class WorkflowRunDO extends DurableObject {
 
   async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {
     return this.readKey<WorkflowRun>('run');
+  }
+
+  /** Single authoritative lifecycle answer used after derivative compaction. */
+  async getLifecycleStatus(): Promise<RunLifecycleStatus> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<RunTombstone | CleanupRecord | WorkflowRun>([
+        TOMBSTONE_KEY,
+        CLEANUP_RECORD_KEY,
+        'run',
+      ]);
+      if (this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>)) {
+        return 'expired';
+      }
+      const run = values.get('run') as WorkflowRun | undefined;
+      if (!run) return 'missing';
+      return isTerminalWorkflowRunStatus(run.status) ? 'terminal' : 'active';
+    });
   }
 
   async getStep(stepId: string): Promise<RunReadOutcome<Step | null>> {
@@ -375,7 +410,14 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async getCleanupStatus(): Promise<CleanupRecord | null> {
-    return (await this.ctx.storage.get<CleanupRecord>(CLEANUP_RECORD_KEY)) ?? null;
+    const values = await this.ctx.storage.get<CleanupRecord | RunTombstone>([
+      CLEANUP_RECORD_KEY,
+      TOMBSTONE_KEY,
+    ]);
+    const cleanup = values.get(CLEANUP_RECORD_KEY) as CleanupRecord | undefined;
+    if (cleanup) return cleanup;
+    const tombstone = values.get(TOMBSTONE_KEY) as RunTombstone | undefined;
+    return tombstone ? cleanupFromTombstone(tombstone) : null;
   }
 
   /** Explicitly schedule an existing terminal run, used for opt-in backfills. */
@@ -471,7 +513,6 @@ export class WorkflowRunDO extends DurableObject {
   private workflowIndex(): WorkflowIndex {
     return createWorkflowIndex({
       runCatalog: this.namespace<RunCatalogShardStub>('WORKFLOW_RUN_CATALOG'),
-      runFences: this.namespace<RunFenceStub>('WORKFLOW_RUN_FENCES'),
       hookTokens: this.namespace<HookTokenShardStub>('WORKFLOW_HOOK_TOKENS'),
       hookIds: this.namespace<HookIdShardStub>('WORKFLOW_HOOK_IDS'),
     });
@@ -576,7 +617,6 @@ export class WorkflowRunDO extends DurableObject {
     await this.workflowIndex().releaseHookIndexes({
       runId: cleanup.runId,
       hooks: page.map((hook) => ({ hookId: hook.hookId, token: hook.token })),
-      terminal: true,
     });
 
     await this.ctx.storage.transaction(async (txn) => {
@@ -613,7 +653,6 @@ export class WorkflowRunDO extends DurableObject {
     await this.workflowIndex().releaseHookIndexes({
       runId: cleanup.runId,
       hooks: page.map(([, reference]) => reference),
-      terminal: true,
     });
 
     await this.ctx.storage.transaction(async (txn) => {
@@ -753,37 +792,69 @@ export class WorkflowRunDO extends DurableObject {
 
   private async deleteQueuePage(cleanup: CleanupRecord): Promise<void> {
     const queues = this.namespace<QueueCleanupStub>('WORKFLOW_QUEUE');
-    let progress =
+    const progress =
       (await this.ctx.storage.get<CleanupProgress>(CLEANUP_PROGRESS_KEY)) ??
       ({ queueShard: 0, queueShardDeleted: 0 } satisfies CleanupProgress);
-    let remainingShards = QUEUE_SHARDS_PER_CLEANUP_PAGE;
-    let expectedGeneration = cleanup.generation;
 
-    while (progress.queueShard < cleanup.queueShards && remainingShards-- > 0) {
+    if (progress.pendingAck) {
+      const { queueShard, receipt } = progress.pendingAck;
+      const queue = queues.get(queues.idFromName(`q:${queueShard}`));
+      const result = await queue.acknowledgeExpireRun(cleanup.runId, receipt);
+      if (!result.acknowledged) {
+        throw new Error(`queue shard ${queueShard} rejected expiry receipt for ${cleanup.runId}`);
+      }
+      await this.ctx.storage.transaction(async (txn) => {
+        const current = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
+        if (current?.phase !== 'queues' || current.generation !== cleanup.generation) return;
+        const persisted = await txn.get<CleanupProgress>(CLEANUP_PROGRESS_KEY);
+        if (
+          persisted?.pendingAck?.queueShard !== queueShard ||
+          persisted.pendingAck.receipt.expiredAt !== receipt.expiredAt ||
+          persisted.pendingAck.receipt.deleted !== receipt.deleted
+        ) {
+          return;
+        }
+        await txn.put(CLEANUP_RECORD_KEY, {
+          ...current,
+          generation: current.generation + 1,
+          attempts: 0,
+          lastError: undefined,
+        });
+        await txn.put<CleanupProgress>(CLEANUP_PROGRESS_KEY, {
+          queueShard: queueShard + 1,
+          queueShardDeleted: 0,
+        });
+        await txn.setAlarm(this.now() + 1);
+      });
+      return;
+    }
+
+    if (progress.queueShard < cleanup.queueShards) {
       const requestedShard = progress.queueShard;
       const queue = queues.get(queues.idFromName(`q:${requestedShard}`));
       const result = await queue.expireRun(cleanup.runId, cleanup.dueAt.getTime(), {
         limit: QUEUE_REFERENCES_PER_CLEANUP_PAGE,
       });
-      const reconciled = await this.ctx.storage.transaction(async (txn) => {
+      await this.ctx.storage.transaction(async (txn) => {
         const current = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
-        if (current?.phase !== 'queues') return null;
-        if (current.generation !== expectedGeneration) {
-          return { stale: true as const };
-        }
+        if (current?.phase !== 'queues' || current.generation !== cleanup.generation) return;
         const persisted =
           (await txn.get<CleanupProgress>(CLEANUP_PROGRESS_KEY)) ??
           ({ queueShard: 0, queueShardDeleted: 0 } satisfies CleanupProgress);
-        if (persisted.queueShard !== requestedShard) {
-          return { stale: true as const };
-        }
+        if (persisted.queueShard !== requestedShard || persisted.pendingAck) return;
         if (result.deleted < persisted.queueShardDeleted) {
-          return { stale: true as const };
+          throw new Error(
+            `queue shard ${requestedShard} regressed expiry receipt for ${cleanup.runId}`,
+          );
         }
-        const next: CleanupProgress = result.done
-          ? { queueShard: persisted.queueShard + 1, queueShardDeleted: 0 }
-          : { ...persisted, queueShardDeleted: result.deleted };
         const delta = result.deleted - persisted.queueShardDeleted;
+        const next: CleanupProgress = result.done
+          ? {
+              queueShard: requestedShard,
+              queueShardDeleted: result.deleted,
+              pendingAck: { queueShard: requestedShard, receipt: result.receipt },
+            }
+          : { queueShard: requestedShard, queueShardDeleted: result.deleted };
         await txn.put(CLEANUP_RECORD_KEY, {
           ...current,
           deletedQueueMessages: current.deletedQueueMessages + delta,
@@ -793,31 +864,17 @@ export class WorkflowRunDO extends DurableObject {
         });
         await txn.put(CLEANUP_PROGRESS_KEY, next);
         await txn.setAlarm(this.now() + 1);
-        return {
-          stale: false as const,
-          progress: next,
-          generation: current.generation + 1,
-          applied:
-            result.done ||
-            next.queueShard !== persisted.queueShard ||
-            next.queueShardDeleted !== persisted.queueShardDeleted,
-        };
       });
-      if (!reconciled) return;
-      if (reconciled.stale) return;
-      progress = reconciled.progress;
-      expectedGeneration = reconciled.generation;
-      if (!reconciled.applied && progress.queueShard === requestedShard) break;
-      if (!result.done && progress.queueShard === requestedShard) break;
+      return;
     }
 
     await this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
-      if (current?.phase !== 'queues') return;
+      if (current?.phase !== 'queues' || current.generation !== cleanup.generation) return;
       const persisted =
         (await txn.get<CleanupProgress>(CLEANUP_PROGRESS_KEY)) ??
         ({ queueShard: 0, queueShardDeleted: 0 } satisfies CleanupProgress);
-      if (persisted.queueShard >= current.queueShards) {
+      if (persisted.queueShard >= current.queueShards && !persisted.pendingAck) {
         await txn.put(CLEANUP_RECORD_KEY, {
           ...current,
           phase: 'payload',
@@ -852,14 +909,16 @@ export class WorkflowRunDO extends DurableObject {
         return false;
       }
 
-      await txn.put(CLEANUP_RECORD_KEY, {
+      const completed: CleanupRecord = {
         ...cleanup,
         phase: 'tombstoned',
         generation: cleanup.generation + 1,
         attempts: 0,
         lastError: undefined,
         tombstonedAt: now,
-      });
+      };
+      await txn.put(TOMBSTONE_KEY, cleanupTombstone(completed, now));
+      await txn.delete(CLEANUP_RECORD_KEY);
       await txn.deleteAlarm();
       return true;
     });
