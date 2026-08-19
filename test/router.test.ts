@@ -2,11 +2,12 @@
  * Wire-protocol tests: real router + real DO classes (on fake cells) behind
  * node:http, driven by the real remote client. Everything except celld.
  */
-import { WorkflowRunNotFoundError } from '@workflow/errors';
+import { HookNotFoundError, WorkflowRunNotFoundError } from '@workflow/errors';
 import { createConnection } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
-import { rpcStringify } from '../src/codec.js';
+import { rpcParse, rpcStringify } from '../src/codec.js';
 import { createRemoteEnv } from '../src/remote/namespaces.js';
+import { allRunCatalogShardNames, hookIdShardName, runCatalogShardName } from '../src/indexes.js';
 import {
   MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_READ_BYTES,
@@ -86,6 +87,7 @@ describe('router auth and shape', () => {
   it('rejects rpc without a token', async () => {
     const res = await rpc('/v1/rpc/runs/wrun_x/getRun', []);
     expect(res.status).toBe(401);
+    expect((await rpc('/v1/index/runs/list', [])).status).toBe(401);
   });
 
   it('rejects rpc with a wrong token', async () => {
@@ -113,6 +115,9 @@ describe('router auth and shape', () => {
     expect((await rpc('/v1/rpc/runs/wrun_x/alarm', [], SECRET)).status).toBe(404);
     expect((await rpc('/v1/rpc/runs/wrun_x/constructor', [], SECRET)).status).toBe(404);
     expect((await rpc('/v1/rpc/streams/stream%3Ax/writeChunk', [], SECRET)).status).toBe(404);
+    expect((await rpc('/v1/rpc/run-catalog/x/upsertRun', [], SECRET)).status).toBe(404);
+    expect((await rpc('/v1/rpc/hook-tokens/x/finalize', [], SECRET)).status).toBe(404);
+    expect((await rpc('/v1/index/runs/nope', [], SECRET)).status).toBe(404);
   });
 
   it('authenticates and validates the hard-cutover binary stream route', async () => {
@@ -141,13 +146,17 @@ describe('router auth and shape', () => {
   it('400s malformed bodies', async () => {
     const res = await rpc('/v1/rpc/runs/wrun_x/getRun', { not: 'an array' }, SECRET);
     expect(res.status).toBe(400);
+    expect((await rpc('/v1/index/runs/list', { not: 'an array' }, SECRET)).status).toBe(400);
   });
 
   it('413s an oversized RPC body even when content-length is absent', async () => {
     const router = createRouter({
       WORKFLOW_DB: harness.fleet.namespace('runs'),
       WORKFLOW_STREAMS: harness.fleet.namespace('streams'),
-      WORKFLOW_INDEX: harness.fleet.namespace('index'),
+      WORKFLOW_RUN_CATALOG: harness.fleet.namespace('run-catalog'),
+      WORKFLOW_RUN_FENCES: harness.fleet.namespace('run-fences'),
+      WORKFLOW_HOOK_TOKENS: harness.fleet.namespace('hook-tokens'),
+      WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
       WORKFLOW_QUEUE: harness.fleet.namespace('queue'),
       WORLD_SECRET: SECRET,
     });
@@ -254,18 +263,21 @@ describe('full stack: vendored storage over the wire', () => {
     publicRpcs = 0;
     paths.clear();
     const runStorage = harness.fleet.cell('runs', created.run.runId).storage;
-    const indexStorage = harness.fleet.cell('index', 'index').storage;
+    const catalogStorage = harness.fleet.cell(
+      'run-catalog',
+      runCatalogShardName(created.run.runId),
+    ).storage;
     const runMutations: string[] = [];
-    const indexMutations: string[] = [];
+    const catalogMutations: string[] = [];
     const originalRunMutation = runStorage.maybeFailMutation.bind(runStorage);
-    const originalIndexMutation = indexStorage.maybeFailMutation.bind(indexStorage);
+    const originalCatalogMutation = catalogStorage.maybeFailMutation.bind(catalogStorage);
     runStorage.maybeFailMutation = (mutation) => {
       runMutations.push(`${mutation.operation}:${mutation.key}`);
       originalRunMutation(mutation);
     };
-    indexStorage.maybeFailMutation = (mutation) => {
-      indexMutations.push(`${mutation.operation}:${mutation.key}`);
-      originalIndexMutation(mutation);
+    catalogStorage.maybeFailMutation = (mutation) => {
+      catalogMutations.push(`${mutation.operation}:${mutation.key}`);
+      originalCatalogMutation(mutation);
     };
 
     try {
@@ -276,19 +288,14 @@ describe('full stack: vendored storage over the wire', () => {
       });
     } finally {
       runStorage.maybeFailMutation = originalRunMutation;
-      indexStorage.maybeFailMutation = originalIndexMutation;
+      catalogStorage.maybeFailMutation = originalCatalogMutation;
     }
 
     expect(publicRpcs).toBe(1);
     expect(paths).toEqual(new Map([[`/v1/rpc/runs/${created.run.runId}/applyEvent`, 1]]));
     expect(runMutations).toHaveLength(4);
     expect(runMutations).not.toContainEqual(expect.stringContaining('retention:index:'));
-    expect(indexMutations).toEqual([]);
-    expect(
-      Array.from(indexStorage.data.keys()).filter(
-        (key) => key.startsWith('correlation:') && key.endsWith(`:${created.run.runId}`),
-      ),
-    ).toEqual([]);
+    expect(catalogMutations).toEqual([]);
 
     publicRpcs = 0;
     paths.clear();
@@ -307,7 +314,7 @@ describe('full stack: vendored storage over the wire', () => {
     expect(paths).toEqual(new Map([[`/v1/rpc/runs/${created.run.runId}/listEvents`, 1]]));
   });
 
-  it('batches terminal hook release into one index RPC', async () => {
+  it('commits terminal catalog metadata and its per-run fence through one public RPC', async () => {
     let publicRpcs = 0;
     const paths = new Map<string, number>();
     const countedFetch: typeof fetch = async (input, init) => {
@@ -348,17 +355,16 @@ describe('full stack: vendored storage over the wire', () => {
       eventData: { output: [] },
     });
 
-    expect(publicRpcs).toBe(4);
+    expect(publicRpcs).toBe(2);
     expect(paths).toEqual(
       new Map([
         [`/v1/rpc/runs/${created.run.runId}/applyEvent`, 1],
-        ['/v1/rpc/index/index/putOwned', 2],
-        ['/v1/rpc/index/index/releaseHookIndexes', 1],
+        ['/v1/index/runs/commit', 1],
       ]),
     );
   });
 
-  it('lists runs with N+1 public RPCs, bounded run fanout, and value-bearing index pages', async () => {
+  it('merges every catalog shard behind one public call with bounded run fanout', async () => {
     let publicRpcs = 0;
     let activeRunReads = 0;
     let maxActiveRunReads = 0;
@@ -404,8 +410,7 @@ describe('full stack: vendored storage over the wire', () => {
       runIds.push(created.run.runId);
     }
 
-    let indexLists = 0;
-    let indexGets = 0;
+    let catalogLists = 0;
     let runStorageGets = 0;
     const restorers: Array<() => void> = [];
     const runStorages = runIds.map((runId) => harness.fleet.cell('runs', runId).storage);
@@ -418,49 +423,22 @@ describe('full stack: vendored storage over the wire', () => {
           total + runStorage.operationCalls.filter((call) => call.operation === 'get').length,
         0,
       );
-    const indexStorage = harness.fleet.cell('index', 'index').storage;
-    const originalIndexList = indexStorage.list.bind(indexStorage);
-    const originalIndexGet = indexStorage.get.bind(indexStorage);
-    indexStorage.list = async <T>(options) => {
-      indexLists++;
-      return originalIndexList<T>(options);
-    };
-    indexStorage.get = async <T>(key: string) => {
-      indexGets++;
-      return originalIndexGet<T>(key);
-    };
-    restorers.push(() => {
-      indexStorage.list = originalIndexList;
-      indexStorage.get = originalIndexGet;
-    });
-    try {
-      // Reproduce the legacy 2N+1 protocol against the same cells so the
-      // before/after counts include identical router and storage layers.
-      publicRpcs = 0;
-      paths.clear();
-      resetRunStorageCalls();
-      const legacyPage = await env.WORKFLOW_INDEX.list({
-        prefix: 'run:wire-list-fanout:',
-        limit: 50,
+    for (const name of allRunCatalogShardNames()) {
+      const catalogStorage = harness.fleet.cell('run-catalog', name).storage;
+      const originalList = catalogStorage.list.bind(catalogStorage);
+      catalogStorage.list = async <T>(options) => {
+        catalogLists++;
+        return originalList<T>(options);
+      };
+      restorers.push(() => {
+        catalogStorage.list = originalList;
       });
-      for (const key of legacyPage.keys) {
-        const raw = await env.WORKFLOW_INDEX.get(key.name);
-        if (!raw) continue;
-        const { runId } = JSON.parse(raw) as { runId: string };
-        await env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId)).getRun();
-      }
-      expect(publicRpcs).toBe(41);
-      expect(maxActiveRunReads).toBe(1);
-      expect(indexLists).toBe(1);
-      expect(indexGets).toBe(20);
-      runStorageGets = countRunStorageGets();
-      expect(runStorageGets).toBe(20);
-
+    }
+    try {
       publicRpcs = 0;
       maxActiveRunReads = 0;
       paths.clear();
-      indexLists = 0;
-      indexGets = 0;
+      catalogLists = 0;
       runStorageGets = 0;
       resetRunStorageCalls();
       const listed = await storage.runs.list({
@@ -469,15 +447,13 @@ describe('full stack: vendored storage over the wire', () => {
       });
 
       expect(listed.data).toHaveLength(20);
-      expect(publicRpcs).toBe(21);
-      expect(paths.get('/v1/rpc/index/index/list')).toBe(1);
-      expect(paths.get('/v1/rpc/index/index/get')).toBeUndefined();
+      expect(publicRpcs).toBe(1 + 20);
+      expect(paths.get('/v1/index/runs/list')).toBe(1);
       expect(Array.from(paths.entries()).filter(([path]) => path.endsWith('/getRun'))).toHaveLength(
         20,
       );
       expect(maxActiveRunReads).toBe(8);
-      expect(indexLists).toBe(1);
-      expect(indexGets).toBe(0);
+      expect(catalogLists).toBe(16);
       runStorageGets = countRunStorageGets();
       expect(runStorageGets).toBe(20);
 
@@ -492,8 +468,7 @@ describe('full stack: vendored storage over the wire', () => {
       publicRpcs = 0;
       maxActiveRunReads = 0;
       paths.clear();
-      indexLists = 0;
-      indexGets = 0;
+      catalogLists = 0;
       runStorageGets = 0;
       resetRunStorageCalls();
 
@@ -504,15 +479,394 @@ describe('full stack: vendored storage over the wire', () => {
       });
       expect(pending.data).toEqual([]);
       expect(publicRpcs).toBe(1);
-      expect(paths.get('/v1/rpc/index/index/list')).toBe(1);
+      expect(paths).toEqual(new Map([['/v1/index/runs/list', 1]]));
       expect(maxActiveRunReads).toBe(0);
-      expect(indexLists).toBe(1);
-      expect(indexGets).toBe(0);
+      expect(catalogLists).toBe(16);
       runStorageGets = countRunStorageGets();
       expect(runStorageGets).toBe(0);
     } finally {
       for (const restore of restorers) restore();
     }
+  });
+
+  it('repairs a run catalog commit after the authoritative run transaction succeeds', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-index-repair',
+    });
+    const runId = 'wrun_catalog_failure_repair';
+    const catalogStorage = harness.fleet.cell('run-catalog', runCatalogShardName(runId)).storage;
+    catalogStorage.failNextMutation(
+      (mutation) => mutation.operation === 'put' && mutation.key.startsWith('run:'),
+      new Error('injected catalog commit failure'),
+    );
+
+    const request = {
+      eventType: 'run_created' as const,
+      eventData: {
+        deploymentId: 'wire-index-repair',
+        workflowName: 'wire-catalog-repair',
+        input: [],
+      },
+    };
+    await expect(storage.events.create(runId, request)).rejects.toThrow(
+      /injected catalog commit failure/,
+    );
+    await expect(storage.runs.get(runId)).resolves.toMatchObject({ runId });
+    await expect(storage.runs.list({ workflowName: 'wire-catalog-repair' })).resolves.toMatchObject(
+      { data: [] },
+    );
+
+    await expect(storage.events.create(runId, request)).resolves.toMatchObject({
+      run: { runId },
+    });
+    const listed = await storage.runs.list({ workflowName: 'wire-catalog-repair' });
+    expect(listed.data.map((run) => run.runId)).toEqual([runId]);
+  });
+
+  it('repairs a partial hook publication without duplicating ownership or events', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-hook-repair',
+    });
+    const runId = 'wrun_hook_publish_repair';
+    await storage.events.create(runId, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'wire-hook-repair',
+        workflowName: 'wire-hook-repair',
+        input: [],
+      },
+    });
+    const hookId = 'hook-publication-repair';
+    const token = 'token-publication-repair';
+    const idStorage = harness.fleet.cell('hook-ids', hookIdShardName(hookId)).storage;
+    idStorage.failNextMutation(
+      (mutation) =>
+        mutation.operation === 'put' && mutation.key === `hookid:${encodeURIComponent(hookId)}`,
+      new Error('injected hook id publication failure'),
+    );
+    const request = {
+      eventType: 'hook_created' as const,
+      correlationId: hookId,
+      eventData: { token },
+    };
+
+    await expect(storage.events.create(runId, request)).rejects.toThrow(
+      /injected hook id publication failure/,
+    );
+    await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId, hookId });
+    await expect(storage.hooks.get(hookId)).rejects.toSatisfy((error) =>
+      HookNotFoundError.is(error),
+    );
+
+    await expect(storage.events.create(runId, request)).resolves.toMatchObject({
+      hook: { runId, hookId, token },
+    });
+    await expect(storage.hooks.get(hookId)).resolves.toMatchObject({ runId, hookId, token });
+    const events = await storage.events.list({ runId, pagination: { sortOrder: 'asc' } });
+    expect(events.data.filter((event) => event.eventType === 'hook_created')).toHaveLength(1);
+  });
+
+  it('keeps token ownership after a commit-then-lost applyEvent response', async () => {
+    const normalEnv = transport();
+    const normalStorage = createStorage({
+      env: {
+        WORKFLOW_DB: normalEnv.WORKFLOW_DB,
+        WORKFLOW_INDEX: normalEnv.WORKFLOW_INDEX,
+      },
+      deploymentId: 'wire-lost-response',
+    });
+    const ownerRunId = 'wrun_lost_response_owner';
+    const contenderRunId = 'wrun_lost_response_contender';
+    for (const runId of [ownerRunId, contenderRunId]) {
+      await normalStorage.events.create(runId, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'wire-lost-response',
+          workflowName: 'wire-lost-response',
+          input: [],
+        },
+      });
+    }
+
+    let loseApplyResponse = true;
+    const ambiguousEnv = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: async (input, init) => {
+        const response = await fetch(input, init);
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (loseApplyResponse && path === `/v1/rpc/runs/${ownerRunId}/applyEvent`) {
+          loseApplyResponse = false;
+          throw new Error('injected lost applyEvent response');
+        }
+        return response;
+      },
+    });
+    const ambiguousStorage = createStorage({
+      env: {
+        WORKFLOW_DB: ambiguousEnv.WORKFLOW_DB,
+        WORKFLOW_INDEX: ambiguousEnv.WORKFLOW_INDEX,
+      },
+      deploymentId: 'wire-lost-response',
+    });
+    const token = 'lost-response-token';
+    const ownerHookId = 'lost-response-owner-hook';
+    const ownerRequest = {
+      eventType: 'hook_created' as const,
+      correlationId: ownerHookId,
+      eventData: { token },
+    };
+    await expect(ambiguousStorage.events.create(ownerRunId, ownerRequest)).rejects.toThrow(
+      /fleet unreachable/,
+    );
+
+    const contender = await normalStorage.events.create(contenderRunId, {
+      eventType: 'hook_created',
+      correlationId: 'lost-response-contender-hook',
+      eventData: { token },
+    });
+    expect(contender.event?.eventType).toBe('hook_conflict');
+    await expect(normalStorage.hooks.getByToken(token)).rejects.toSatisfy((error) =>
+      HookNotFoundError.is(error),
+    );
+
+    await normalStorage.events.create(ownerRunId, ownerRequest);
+    await expect(normalStorage.hooks.getByToken(token)).resolves.toMatchObject({
+      runId: ownerRunId,
+      hookId: ownerHookId,
+    });
+    const ownerEvents = await normalStorage.events.list({
+      runId: ownerRunId,
+      pagination: { sortOrder: 'asc' },
+    });
+    expect(ownerEvents.data.filter((event) => event.eventType === 'hook_created')).toHaveLength(1);
+  });
+
+  it('releases token and hook-ID claims when applyEvent never reaches the RunDO', async () => {
+    const normalEnv = transport();
+    const normalStorage = createStorage({
+      env: {
+        WORKFLOW_DB: normalEnv.WORKFLOW_DB,
+        WORKFLOW_INDEX: normalEnv.WORKFLOW_INDEX,
+      },
+      deploymentId: 'wire-pre-dispatch',
+    });
+    const ownerRunId = 'wrun_pre_dispatch_owner';
+    const contenderRunId = 'wrun_pre_dispatch_contender';
+    for (const runId of [ownerRunId, contenderRunId]) {
+      await normalStorage.events.create(runId, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'wire-pre-dispatch',
+          workflowName: 'wire-pre-dispatch',
+          input: [],
+        },
+      });
+    }
+
+    let rejectBeforeDispatch = true;
+    let delayedApplyRequest: Request | undefined;
+    const ambiguousEnv = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: async (input, init) => {
+        const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+        if (rejectBeforeDispatch && path === `/v1/rpc/runs/${ownerRunId}/applyEvent`) {
+          rejectBeforeDispatch = false;
+          delayedApplyRequest = new Request(input, { ...init, signal: undefined });
+          throw new Error('injected pre-dispatch failure');
+        }
+        return fetch(input, init);
+      },
+    });
+    const ambiguousStorage = createStorage({
+      env: {
+        WORKFLOW_DB: ambiguousEnv.WORKFLOW_DB,
+        WORKFLOW_INDEX: ambiguousEnv.WORKFLOW_INDEX,
+      },
+      deploymentId: 'wire-pre-dispatch',
+    });
+    const token = 'pre-dispatch-token';
+    await expect(
+      ambiguousStorage.events.create(ownerRunId, {
+        eventType: 'hook_created',
+        correlationId: 'pre-dispatch-owner-hook',
+        eventData: { token },
+      }),
+    ).rejects.toThrow(/fleet unreachable/);
+
+    await expect(
+      normalStorage.events.create(contenderRunId, {
+        eventType: 'hook_created',
+        correlationId: 'pre-dispatch-contender-hook',
+        eventData: { token },
+      }),
+    ).resolves.toMatchObject({
+      hook: { runId: contenderRunId, hookId: 'pre-dispatch-contender-hook', token },
+    });
+    await expect(normalStorage.hooks.getByToken(token)).resolves.toMatchObject({
+      runId: contenderRunId,
+    });
+
+    if (!delayedApplyRequest) throw new Error('expected intercepted applyEvent request');
+    const delayedResponse = await fetch(delayedApplyRequest);
+    expect(delayedResponse.ok).toBe(true);
+    expect(rpcParse(await delayedResponse.text())).toMatchObject({
+      ok: false,
+      code: 'HOOK_CLAIM_CANCELLED',
+    });
+    const ownerEvents = await normalStorage.events.list({
+      runId: ownerRunId,
+      pagination: { sortOrder: 'asc' },
+    });
+    expect(ownerEvents.data.filter((event) => event.eventType === 'hook_created')).toHaveLength(0);
+  });
+
+  it('rejects a hook-ID collision without publishing the contender token', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-id-collision',
+    });
+    const firstRunId = 'wrun_id_collision_first';
+    const secondRunId = 'wrun_id_collision_second';
+    for (const runId of [firstRunId, secondRunId]) {
+      await storage.events.create(runId, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'wire-id-collision',
+          workflowName: 'wire-id-collision',
+          input: [],
+        },
+      });
+    }
+    const hookId = 'wire-shared-hook-id';
+    await storage.events.create(firstRunId, {
+      eventType: 'hook_created',
+      correlationId: hookId,
+      eventData: { token: 'wire-first-id-token' },
+    });
+
+    const collision = await storage.events.create(secondRunId, {
+      eventType: 'hook_created',
+      correlationId: hookId,
+      eventData: { token: 'wire-second-id-token' },
+    });
+    expect(collision.event?.eventType).toBe('hook_conflict');
+    await expect(storage.hooks.getByToken('wire-second-id-token')).rejects.toSatisfy((error) =>
+      HookNotFoundError.is(error),
+    );
+    await expect(storage.hooks.get(hookId)).resolves.toMatchObject({ runId: firstRunId });
+
+    await expect(
+      storage.events.create(secondRunId, {
+        eventType: 'hook_created',
+        correlationId: 'wire-replacement-hook-id',
+        eventData: { token: 'wire-second-id-token' },
+      }),
+    ).resolves.toMatchObject({ hook: { runId: secondRunId } });
+  });
+
+  it('repairs a partial hook deletion from its durable release marker', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-hook-delete-repair',
+    });
+    const runId = 'wrun_hook_delete_repair';
+    const hookId = 'hook-delete-repair';
+    const token = 'token-delete-repair';
+    await storage.events.create(runId, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'wire-hook-delete-repair',
+        workflowName: 'wire-hook-delete-repair',
+        input: [],
+      },
+    });
+    await storage.events.create(runId, {
+      eventType: 'hook_created',
+      correlationId: hookId,
+      eventData: { token },
+    });
+    const idStorage = harness.fleet.cell('hook-ids', hookIdShardName(hookId)).storage;
+    idStorage.failNextMutation(
+      (mutation) =>
+        mutation.operation === 'delete' && mutation.key === `hookid:${encodeURIComponent(hookId)}`,
+      new Error('injected hook id deletion failure'),
+    );
+
+    const disposal = { eventType: 'hook_disposed' as const, correlationId: hookId };
+    await expect(storage.events.create(runId, disposal)).rejects.toThrow(
+      /injected hook id deletion failure/,
+    );
+    await expect(storage.events.create(runId, disposal)).resolves.toBeDefined();
+    await expect(storage.hooks.getByToken(token)).rejects.toSatisfy((error) =>
+      HookNotFoundError.is(error),
+    );
+    await expect(storage.hooks.get(hookId)).rejects.toSatisfy((error) =>
+      HookNotFoundError.is(error),
+    );
+    const events = await storage.events.list({ runId, pagination: { sortOrder: 'asc' } });
+    expect(events.data.filter((event) => event.eventType === 'hook_disposed')).toHaveLength(1);
+  });
+
+  it('converges concurrent token claims and concurrent resumes without duplicates', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-hook-concurrency',
+    });
+    const runIds = ['wrun_hook_concurrency_a', 'wrun_hook_concurrency_b'];
+    await Promise.all(
+      runIds.map((runId) =>
+        storage.events.create(runId, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'wire-hook-concurrency',
+            workflowName: 'wire-hook-concurrency',
+            input: [],
+          },
+        }),
+      ),
+    );
+    const token = 'concurrent-shared-token';
+    const creations = await Promise.all(
+      runIds.map((runId, index) =>
+        storage.events.create(runId, {
+          eventType: 'hook_created',
+          correlationId: `concurrent-hook-${index}`,
+          eventData: { token },
+        }),
+      ),
+    );
+    const owner = await storage.hooks.getByToken(token);
+    expect(runIds).toContain(owner.runId);
+    expect(creations.filter((result) => result.hook !== undefined)).toHaveLength(1);
+    expect(creations.filter((result) => result.event?.eventType === 'hook_conflict')).toHaveLength(
+      1,
+    );
+
+    const received = {
+      eventType: 'hook_received' as const,
+      correlationId: owner.hookId,
+      eventData: { payload: ['once'] },
+    };
+    const params = { resumeId: 'concurrent-resume', resumePayloadDigest: 'digest' };
+    const resumed = await Promise.all([
+      storage.events.create(owner.runId, received, params),
+      storage.events.create(owner.runId, received, params),
+    ]);
+    expect(resumed[0].event?.eventId).toBe(resumed[1].event?.eventId);
+    const events = await storage.events.list({
+      runId: owner.runId,
+      pagination: { sortOrder: 'asc' },
+    });
+    expect(events.data.filter((event) => event.eventType === 'hook_received')).toHaveLength(1);
   });
 
   it('reconstructs typed errors across the wire', async () => {

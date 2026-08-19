@@ -2,40 +2,10 @@ import type { WorkflowRunDONamespace } from './storage.js';
 import type { StreamDONamespace } from './streamer.js';
 import type { QueueCellNamespace } from './queue.js';
 import { MAX_STREAM_LONG_POLL_MS } from './stream-protocol.js';
+import type { WorkflowIndex } from './indexes.js';
 
-/** Storage-layer index interface (satisfied by IndexDO over HTTP, or a mock). */
-export interface IndexNamespace {
-  get(key: string): Promise<string | null>;
-  put(key: string, value: string): Promise<void>;
-  delete(key: string): Promise<void>;
-  putOwned(runId: string, key: string, value: string): Promise<{ stored: boolean }>;
-  expireRun(
-    request: import('./retention.js').ExpireRunIndexesRequest,
-  ): Promise<import('./retention.js').ExpireRunIndexesResult>;
-  list(options?: { prefix?: string; cursor?: string; limit?: number; reverse?: boolean }): Promise<{
-    /**
-     * IndexDO includes values so callers do not need one follow-up RPC per key.
-     * `value` remains optional for compatibility with KV-like custom adapters.
-     */
-    keys: Array<{ name: string; value?: string }>;
-    list_complete: boolean;
-    cursor?: string;
-  }>;
-  reserveHookToken(
-    token: string,
-    owner: HookTokenOwner,
-  ): Promise<{ claimed: boolean; holder?: HookTokenOwner }>;
-  finalizeHookIndexes(
-    token: string,
-    hookId: string,
-    serializedHook: string,
-    owner: HookTokenOwner,
-  ): Promise<void>;
-  releaseHookToken(token: string, owner: HookTokenOwner): Promise<void>;
-  releaseHookIndexes(
-    request: import('./retention.js').ReleaseHookIndexesRequest,
-  ): Promise<import('./retention.js').ReleaseHookIndexesResult>;
-}
+/** Public alias retained for custom in-process environments. */
+export type IndexNamespace = WorkflowIndex;
 
 export interface HookTokenOwner {
   runId: string;

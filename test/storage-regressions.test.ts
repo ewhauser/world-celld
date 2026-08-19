@@ -71,20 +71,20 @@ describe('Storage regressions', () => {
       },
     };
     const index = mockEnv.WORKFLOW_INDEX;
-    const putOwned = index.putOwned.bind(index);
+    const commitRun = index.commitRun.bind(index);
     let failNextRunIndexWrite = true;
-    index.putOwned = async (ownerRunId, key, value) => {
-      if (failNextRunIndexWrite && key.startsWith('run:')) {
+    index.commitRun = async (run, value) => {
+      if (failNextRunIndexWrite) {
         failNextRunIndexWrite = false;
         throw new Error('injected index outage');
       }
-      return putOwned(ownerRunId, key, value);
+      return commitRun(run, value);
     };
 
     try {
       await expect(storage.events.create(runId, event)).rejects.toThrow('injected index outage');
     } finally {
-      index.putOwned = putOwned;
+      index.commitRun = commitRun;
     }
 
     expect((await storage.runs.get(runId)).status).toBe('running');
@@ -259,11 +259,11 @@ describe('Storage regressions', () => {
       eventData: { output: [] },
     });
 
-    const entries = await mockEnv.WORKFLOW_INDEX.list({ prefix: 'run:stale-status-index:' });
+    const entries = await mockEnv.WORKFLOW_INDEX.listRuns({ prefix: 'run:stale-status-index:' });
     const entry = entries.keys[0];
     const metadata = JSON.parse(entry.value);
-    await mockEnv.WORKFLOW_INDEX.put(
-      entry.name,
+    await mockEnv.WORKFLOW_INDEX.commitRun(
+      completed,
       JSON.stringify({ ...metadata, status: 'pending' }),
     );
 

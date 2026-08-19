@@ -49,7 +49,7 @@ export interface HookIndexReference {
 export interface TerminalCleanupRecord {
   version: 1;
   runId: string;
-  phase: 'hooks' | 'waits';
+  phase: 'hooks' | 'markers' | 'waits';
   generation: number;
   attempts: number;
   lastError?: string;

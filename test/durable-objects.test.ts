@@ -152,8 +152,8 @@ describe('Cloudflare Durable Objects Features', () => {
       });
 
       // Verify KV index
-      const listed = await mockEnv.WORKFLOW_INDEX.list({ prefix: 'run:indexed-workflow:' });
-      const indexValue = await mockEnv.WORKFLOW_INDEX.get(listed.keys[0].name);
+      const listed = await mockEnv.WORKFLOW_INDEX.listRuns({ prefix: 'run:indexed-workflow:' });
+      const indexValue = listed.keys[0].value;
 
       expect(indexValue).toBeDefined();
       const parsed = JSON.parse(indexValue as string);
@@ -182,7 +182,7 @@ describe('Cloudflare Durable Objects Features', () => {
       });
 
       // List via KV prefix
-      const result = await mockEnv.WORKFLOW_INDEX.list({
+      const result = await mockEnv.WORKFLOW_INDEX.listRuns({
         prefix: 'run:workflow-a:',
       });
 
@@ -201,7 +201,7 @@ describe('Cloudflare Durable Objects Features', () => {
       }
 
       // List with limit
-      const page1 = await mockEnv.WORKFLOW_INDEX.list({
+      const page1 = await mockEnv.WORKFLOW_INDEX.listRuns({
         prefix: 'run:paginated-workflow:',
         limit: 10,
       });

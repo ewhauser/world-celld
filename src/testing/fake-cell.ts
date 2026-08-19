@@ -91,6 +91,7 @@ export class FakeStorage {
     transaction: 0,
   };
   private transactionTail: Promise<void> = Promise.resolve();
+  private transactionDelayMs = 0;
   /** Deterministic query-shape instrumentation for storage scaling tests. */
   listCalls: FakeStorageListCall[] = [];
   operationCalls: FakeStorageOperationCall[] = [];
@@ -174,6 +175,9 @@ export class FakeStorage {
     });
     await previous;
     try {
+      if (this.transactionDelayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, this.transactionDelayMs));
+      }
       const txn = new FakeTransaction(this);
       const result = await cb(txn);
       txn.commit();
@@ -181,6 +185,12 @@ export class FakeStorage {
     } finally {
       release();
     }
+  }
+
+  /** Add deterministic per-transaction work for contention benchmarks. */
+  setTransactionDelay(ms: number): void {
+    if (!Number.isFinite(ms) || ms < 0) throw new Error('transaction delay must be non-negative');
+    this.transactionDelayMs = ms;
   }
 
   async getAlarm(): Promise<number | null> {

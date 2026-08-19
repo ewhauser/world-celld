@@ -58,6 +58,8 @@
     "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives .",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:perf:index": "vitest run --config vitest.index-perf.config.ts",
+    "test:perf:index:baseline": "node scripts/measure-index-main-baseline.mjs",
     "test:perf:minio": "bash test/perf/minio/run.sh",
     "typecheck": "tsc --noEmit",
     "check:worker-bundle": "node scripts/check-worker-bundle.mjs",
