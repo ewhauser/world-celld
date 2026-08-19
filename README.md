@@ -119,8 +119,11 @@ Workflow application
   v
 celld worker router
   |-- WorkflowRunDO  one cell per workflow run
+  |-- RunCatalogDO   16 stable run-id shards; merged ordered listing
+  |-- RunFenceDO     one lifecycle fence cell per workflow run
+  |-- HookTokenDO    32 stable token-ownership shards
+  |-- HookIdDO       32 stable hook-id lookup shards
   |-- StreamDO       stream chunks and run/stream indexes
-  |-- IndexDO        run and hook lookup indexes
   `-- QueueDO        delayed delivery, retries, and dead letters
           |
           | HTTP callbacks
@@ -133,6 +136,22 @@ translates its storage and queue operations into JSON RPC calls. Stream chunk
 writes and bounded long-poll reads use a binary batch route; stream control and
 retention operations remain fixed, authenticated RPC methods. The worker routes
 each request to the named cell that owns the data.
+
+Index routing is a versioned hard-cutover protocol. Run catalog writes hash the
+`runId` across 16 shards, while hook ownership and hook-ID lookup hash their
+natural keys across 32 shards each. A single stateless worker request queries
+all 16 catalog shards in parallel and merges their lexicographic pages before
+authoritative RunDO reads. A terminal or expired run is hidden through its own
+`RunFenceDO`, so no global fence cell remains. Token and hook-ID admission are
+each transactional inside their natural-key shards. The RunDO remains the
+authoritative commit domain, and exact claim IDs plus a serialized cancellation
+fence resolve ambiguous delivery without pretending the two ownership shards
+form a cross-Durable-Object transaction. Stateless cohesive index routes keep
+catalog listing, terminal commits, hook finalization, and hook release to one
+public request each while exposing the internal shard work in measurements.
+
+The routing rationale and before/after RPC, storage, latency, and contention
+evidence are recorded in [`docs/index-sharding.md`](./docs/index-sharding.md).
 
 ## Configuration
 

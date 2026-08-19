@@ -3,14 +3,50 @@ import type { Hook } from '@workflow/world';
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createCelldWorld } from '../src/index.js';
+import {
+  createWorkflowIndex,
+  hookIdShardName,
+  hookTokenShardName,
+  runCatalogShardName,
+  runFenceCellName,
+} from '../src/indexes.js';
 import { CLEANUP_RECORD_KEY, type CleanupRecord } from '../src/retention.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import { stringify } from '../src/vendor/shared/index.js';
-import type { IndexDO } from '../src/worker/durable-objects/IndexDO.js';
 import type { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
 import type { StreamDO } from '../src/worker/durable-objects/StreamDO.js';
 import { WorkflowRunDO } from '../src/worker/durable-objects/WorkflowRunDO.js';
+
+function workflowIndex(harness: Harness) {
+  return createWorkflowIndex({
+    runCatalog: harness.fleet.namespace('run-catalog'),
+    runFences: harness.fleet.namespace('run-fences'),
+    hookTokens: harness.fleet.namespace('hook-tokens'),
+    hookIds: harness.fleet.namespace('hook-ids'),
+  });
+}
+
+async function seedHookIndex(harness: Harness, hook: Hook): Promise<void> {
+  const owner = { runId: hook.runId, hookId: hook.hookId };
+  const admission = await workflowIndex(harness).reserveHook(hook.token, owner);
+  if (!admission.admitted) throw new Error('expected seeded hook admission');
+  await workflowIndex(harness).finalizeHookIndexes(
+    hook.token,
+    hook.hookId,
+    stringify(hook),
+    owner,
+    admission.reservation,
+  );
+}
+
+function hookTokenRecordKey(token: string): string {
+  return `hook:${encodeURIComponent(token)}`;
+}
+
+function hookIdRecordKey(hookId: string): string {
+  return `hookid:${encodeURIComponent(hookId)}`;
+}
 
 async function createCompletedRun(world: ReturnType<typeof createCelldWorld>, suffix: string) {
   const created = await world.events.create(null, {
@@ -174,7 +210,7 @@ describe('terminal workflow retention', () => {
     await finishRun(world, runId);
     await driveTerminalCleanup(harness, runId);
 
-    const indexSlot = harness.fleet.cell('index', 'index');
+    const indexSlot = harness.fleet.cell('run-catalog', runCatalogShardName(runId));
     indexSlot.storage.failNextMutation(
       (mutation) => mutation.operation === 'delete' && mutation.key.startsWith('run:'),
       new Error('injected index cleanup failure'),
@@ -194,8 +230,7 @@ describe('terminal workflow retention', () => {
     const status = await driveCleanup(harness, world, runId);
     expect(status.phase).toBe('tombstoned');
 
-    const index = harness.fleet.namespace('index').get({ toString: () => 'index' }) as IndexDO;
-    const entries = await index.list({ prefix: 'run:retention-retry:' });
+    const entries = await workflowIndex(harness).listRuns({ prefix: 'run:retention-retry:' });
     expect(entries.keys).toEqual([]);
   });
 
@@ -260,7 +295,6 @@ describe('terminal workflow retention', () => {
     });
     const runId = await createCompletedRun(world, 'terminal-pages');
     const runStorage = harness.fleet.cell('runs', runId).storage;
-    const indexStorage = harness.fleet.cell('index', 'index').storage;
 
     for (let hookIndex = 0; hookIndex < 150; hookIndex++) {
       const hookId = `hook-${String(hookIndex).padStart(3, '0')}`;
@@ -279,9 +313,7 @@ describe('terminal workflow retention', () => {
       } as Hook;
       runStorage.data.set(`hook:${hookId}`, hook);
       runStorage.data.set(`hookcreated:${createdAt.toISOString()}:${hookId}`, hookId);
-      const serialized = stringify(hook);
-      indexStorage.data.set(`hook:${token}`, serialized);
-      indexStorage.data.set(`hookid:${hookId}`, serialized);
+      await seedHookIndex(harness, hook);
     }
     for (let waitIndex = 0; waitIndex < 300; waitIndex++) {
       runStorage.data.set(`wait:wait-${String(waitIndex).padStart(3, '0')}`, { waitIndex });
@@ -315,16 +347,21 @@ describe('terminal workflow retention', () => {
       );
     }
 
-    expect(hookCounts).toEqual([86, 22, 0, 0, 0, 0]);
-    expect(waitCounts).toEqual([300, 300, 300, 172, 44, 0]);
+    expect(hookCounts).toEqual([86, 22, 0, 0, 0, 0, 0]);
+    expect(waitCounts).toEqual([300, 300, 300, 300, 172, 44, 0]);
     expect(runStorage.data.has('terminal:cleanup')).toBe(false);
     expect(runStorage.alarmAt).toBeNull();
     expect(
-      Array.from(indexStorage.data.keys()).filter(
-        (key) => key.startsWith('hook:') || key.startsWith('hookid:'),
-      ),
-    ).toEqual([]);
-    expect(indexStorage.data.has(`terminal:${runId}`)).toBe(true);
+      Array.from({ length: 150 }, (_, hookIndex) => {
+        const token = `token-${String(hookIndex).padStart(3, '0')}`;
+        return harness.fleet
+          .cell('hook-tokens', hookTokenShardName(token))
+          .storage.data.has(hookTokenRecordKey(token));
+      }),
+    ).not.toContain(true);
+    expect(
+      harness.fleet.cell('run-fences', runFenceCellName(runId)).storage.data.get('fence'),
+    ).toMatchObject({ status: 'terminal' });
   });
 
   it('retries a failed terminal page without losing its local cursor', async () => {
@@ -336,7 +373,6 @@ describe('terminal workflow retention', () => {
     });
     const runId = await createCompletedRun(world, 'terminal-retry');
     const runStorage = harness.fleet.cell('runs', runId).storage;
-    const indexStorage = harness.fleet.cell('index', 'index').storage;
     const hookId = 'hook-retry';
     const token = 'token-retry';
     const hook = {
@@ -352,12 +388,13 @@ describe('terminal workflow retention', () => {
     } as Hook;
     runStorage.data.set(`hook:${hookId}`, hook);
     runStorage.data.set(`hookcreated:${hook.createdAt.toISOString()}:${hookId}`, hookId);
-    indexStorage.data.set(`hook:${token}`, stringify(hook));
-    indexStorage.data.set(`hookid:${hookId}`, stringify(hook));
+    await seedHookIndex(harness, hook);
     await finishRun(world, runId);
 
-    indexStorage.failNextMutation(
-      (mutation) => mutation.operation === 'delete' && mutation.key === `hook:${token}`,
+    const tokenStorage = harness.fleet.cell('hook-tokens', hookTokenShardName(token)).storage;
+    const idStorage = harness.fleet.cell('hook-ids', hookIdShardName(hookId)).storage;
+    tokenStorage.failNextMutation(
+      (mutation) => mutation.operation === 'delete' && mutation.key === hookTokenRecordKey(token),
       new Error('injected terminal cleanup crash'),
     );
     harness.fleet.advance(1);
@@ -369,16 +406,53 @@ describe('terminal workflow retention', () => {
       lastError: 'injected terminal cleanup crash',
     });
     expect(runStorage.data.has(`hook:${hookId}`)).toBe(true);
-    expect(indexStorage.data.has(`hook:${token}`)).toBe(true);
+    expect(tokenStorage.data.has(hookTokenRecordKey(token))).toBe(true);
 
     harness.fleet.advance(1_000);
     await harness.fleet.fireDueAlarms();
     harness.fleet.advance(1);
     await harness.fleet.fireDueAlarms();
+    harness.fleet.advance(1);
+    await harness.fleet.fireDueAlarms();
     expect(runStorage.data.has('terminal:cleanup')).toBe(false);
     expect(runStorage.data.has(`hook:${hookId}`)).toBe(false);
-    expect(indexStorage.data.has(`hook:${token}`)).toBe(false);
-    expect(indexStorage.data.has(`hookid:${hookId}`)).toBe(false);
+    expect(tokenStorage.data.has(hookTokenRecordKey(token))).toBe(false);
+    expect(idStorage.data.has(hookIdRecordKey(hookId))).toBe(false);
+  });
+
+  it('uses exact claims for disposed hooks and adds only terminal run fences', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+    });
+    const runId = await createCompletedRun(world, 'disposed-hook-fences');
+    const hookId = 'disposed-before-terminal';
+    const token = 'disposed-before-terminal-token';
+
+    await world.events.create(runId, {
+      eventType: 'hook_created',
+      correlationId: hookId,
+      eventData: { token },
+    });
+    await world.events.create(runId, {
+      eventType: 'hook_disposed',
+      correlationId: hookId,
+    });
+
+    const tokenStorage = harness.fleet.cell('hook-tokens', hookTokenShardName(token)).storage;
+    const idStorage = harness.fleet.cell('hook-ids', hookIdShardName(hookId)).storage;
+    expect(Array.from(tokenStorage.data.keys()).filter((key) => key.startsWith('fence:'))).toEqual(
+      [],
+    );
+    expect(Array.from(idStorage.data.keys()).filter((key) => key.startsWith('fence:'))).toEqual([]);
+
+    await finishRun(world, runId);
+    await driveTerminalCleanup(harness, runId);
+
+    expect(tokenStorage.data.has(`runfence:${encodeURIComponent(runId)}`)).toBe(true);
+    expect(idStorage.data.has(`runfence:${encodeURIComponent(runId)}`)).toBe(true);
   });
 
   it('does not regress queue cleanup progress when concurrent pages resolve out of order', async () => {

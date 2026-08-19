@@ -7,8 +7,16 @@
  * storage medium (an in-memory sorted map) is mocked.
  */
 
-import { slotToEventId, type Event, type Hook, type Step, type WorkflowRun } from '@workflow/world';
+import {
+  isTerminalWorkflowRunStatus,
+  slotToEventId,
+  type Event,
+  type Hook,
+  type Step,
+  type WorkflowRun,
+} from '@workflow/world';
 import type { HookTokenOwner } from './config.js';
+import type { HookReservation, HookReservationResult } from './indexes.js';
 import type { EnqueueOutcome, EnqueueRequest, QueueCellStub } from './queue.js';
 import {
   normalizeStreamError,
@@ -23,6 +31,7 @@ import {
 import {
   applyEvent,
   finalizeEventPage,
+  hookClaimCancellationKey,
   type ApplyEventOutcome,
   type ApplyEventRequest,
   EVENT_KEY_PREFIX,
@@ -36,6 +45,7 @@ import {
   STEP_KEY_PREFIX,
 } from './apply-event.js';
 import { parse } from './vendor/shared/index.js';
+import { globalRunIndexKey, workflowRunIndexKey } from './retention.js';
 import type {
   CleanupRecord,
   ExpireRunIndexesRequest,
@@ -104,6 +114,11 @@ interface InflightClaim {
   claimedAt: number;
 }
 
+interface MockHookClaim {
+  owner: HookTokenOwner;
+  claimId: string;
+}
+
 /**
  * Mock Durable Object stub with the same RPC surface as WorkflowRunDO.
  */
@@ -135,6 +150,28 @@ class MockWorkflowRunDOStub {
       await this.store.put('event_sequence', eventSequence);
     }
     return finalizeEventPage(this.store, outcome, request.params);
+  }
+
+  async resolveHookTokenClaim(request: {
+    hookId: string;
+    token: string;
+    claimId: string;
+  }): Promise<{ committed: boolean }> {
+    const result = this.applyChain.then(async () => {
+      const hook = await this.store.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
+      if (hook?.token === request.token) return { committed: true };
+      await this.store.put(hookClaimCancellationKey(request.claimId), {
+        hookId: request.hookId,
+        token: request.token,
+        canceledAt: Date.now(),
+      });
+      return { committed: false };
+    });
+    this.applyChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 
   async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {
@@ -240,54 +277,22 @@ class MockWorkflowRunDOStub {
 }
 
 /**
- * Mock KV Namespace with real cursor pagination semantics: the cursor
+ * In-memory composite workflow index with real cursor pagination semantics: the cursor
  * continues after the last key returned by the previous list call, and
  * `list_complete` reflects whether further keys exist.
  */
-class MockKVNamespace {
-  async get(key: string): Promise<string | null> {
-    const value = kvData.get(key);
-    if (value && (key.startsWith('hook:') || key.startsWith('hookid:'))) {
-      const hook = parse<Hook>(value);
-      if (kvData.has(`terminal:${hook.runId}`) || kvData.has(`expired:${hook.runId}`)) return null;
+class MockWorkflowIndex {
+  async commitRun(run: WorkflowRun, serializedMetadata: string): Promise<{ stored: boolean }> {
+    if (kvData.has(`expired:${run.runId}`)) return { stored: false };
+    if (isTerminalWorkflowRunStatus(run.status)) {
+      kvData.set(`terminal:${run.runId}`, String(Date.now()));
     }
-    return value ?? null;
-  }
-
-  async put(key: string, value: string): Promise<void> {
-    kvData.set(key, value);
-  }
-
-  async putOwned(runId: string, key: string, value: string): Promise<{ stored: boolean }> {
-    if (kvData.has(`expired:${runId}`)) return { stored: false };
-    kvData.set(key, value);
+    kvData.set(workflowRunIndexKey(run), serializedMetadata);
+    kvData.set(globalRunIndexKey(run), serializedMetadata);
     return { stored: true };
   }
 
-  async expireRun(request: ExpireRunIndexesRequest): Promise<{ deleted: number }> {
-    kvData.set(`expired:${request.runId}`, String(request.expiredAt));
-    let deleted = 0;
-    if (kvData.delete(`terminal:${request.runId}`)) deleted++;
-    for (const key of request.keys) {
-      if (kvData.delete(key)) deleted++;
-    }
-    for (const hook of request.hooks) {
-      for (const key of [
-        `hook:${hook.token}`,
-        `hookid:${hook.hookId}`,
-        `hookclaim:${hook.token}`,
-      ]) {
-        if (kvData.delete(key)) deleted++;
-      }
-    }
-    return { deleted };
-  }
-
-  async delete(key: string): Promise<void> {
-    kvData.delete(key);
-  }
-
-  async list(options?: {
+  async listRuns(options?: {
     prefix?: string;
     cursor?: string;
     limit?: number;
@@ -323,28 +328,98 @@ class MockKVNamespace {
     };
   }
 
-  async reserveHookToken(
-    token: string,
-    owner: HookTokenOwner,
-  ): Promise<{ claimed: boolean; holder?: HookTokenOwner }> {
+  private async getHook(key: string): Promise<string | null> {
+    const value = kvData.get(key);
+    if (!value) return null;
+    const hook = parse<Hook>(value);
+    if (kvData.has(`terminal:${hook.runId}`) || kvData.has(`expired:${hook.runId}`)) return null;
+    return value;
+  }
+
+  getHookByToken(token: string): Promise<string | null> {
+    return this.getHook(`hook:${token}`);
+  }
+
+  getHookById(hookId: string): Promise<string | null> {
+    return this.getHook(`hookid:${hookId}`);
+  }
+
+  async expireRun(request: ExpireRunIndexesRequest): Promise<{ deleted: number }> {
+    kvData.set(`expired:${request.runId}`, String(request.expiredAt));
+    let deleted = 0;
+    if (kvData.delete(`terminal:${request.runId}`)) deleted++;
+    for (const key of request.keys) {
+      if (kvData.delete(key)) deleted++;
+    }
+    for (const hook of request.hooks) {
+      for (const key of [
+        `hook:${hook.token}`,
+        `hookid:${hook.hookId}`,
+        `hookclaim:${hook.token}`,
+        `hookidclaim:${hook.hookId}`,
+      ]) {
+        if (kvData.delete(key)) deleted++;
+      }
+    }
+    return { deleted };
+  }
+
+  async reserveHook(token: string, owner: HookTokenOwner): Promise<HookReservationResult> {
     const raw = kvData.get(`hook:${token}`);
+    let tokenClaimId: string | undefined;
     if (raw !== undefined) {
       const hook = parse<Hook>(raw);
       const holder = { runId: hook.runId, hookId: hook.hookId };
-      return { claimed: false, holder };
+      if (holder.runId !== owner.runId || holder.hookId !== owner.hookId) {
+        return { admitted: false, holder };
+      }
+    } else {
+      const claimKey = `hookclaim:${token}`;
+      const claim = kvData.get(claimKey);
+      if (claim !== undefined) {
+        const existing = JSON.parse(claim) as MockHookClaim;
+        if (existing.owner.runId !== owner.runId || existing.owner.hookId !== owner.hookId) {
+          return { admitted: false, holder: existing.owner };
+        }
+        tokenClaimId = existing.claimId;
+      } else {
+        tokenClaimId = crypto.randomUUID();
+        kvData.set(claimKey, JSON.stringify({ owner, claimId: tokenClaimId }));
+      }
     }
 
-    const claimKey = `hookclaim:${token}`;
-    const claim = kvData.get(claimKey);
-    if (claim !== undefined) {
-      const holder = JSON.parse(claim) as HookTokenOwner;
-      return holder.runId === owner.runId && holder.hookId === owner.hookId
-        ? { claimed: true }
-        : { claimed: false, holder };
+    const idRaw = kvData.get(`hookid:${owner.hookId}`);
+    if (idRaw !== undefined) {
+      const hook = parse<Hook>(idRaw);
+      const holder = { runId: hook.runId, hookId: hook.hookId };
+      if (tokenClaimId) kvData.delete(`hookclaim:${token}`);
+      return { admitted: false, holder };
     }
-
-    kvData.set(claimKey, JSON.stringify(owner));
-    return { claimed: true };
+    const idClaimKey = `hookidclaim:${owner.hookId}`;
+    const idClaimRaw = kvData.get(idClaimKey);
+    let hookIdClaimId: string;
+    if (idClaimRaw !== undefined) {
+      const existing = JSON.parse(idClaimRaw) as MockHookClaim;
+      if (existing.owner.runId !== owner.runId || existing.owner.hookId !== owner.hookId) {
+        if (tokenClaimId) kvData.delete(`hookclaim:${token}`);
+        return { admitted: false, holder: existing.owner };
+      }
+      hookIdClaimId = tokenClaimId ?? existing.claimId;
+      if (hookIdClaimId !== existing.claimId) {
+        kvData.set(idClaimKey, JSON.stringify({ owner, claimId: hookIdClaimId }));
+      }
+    } else {
+      hookIdClaimId = tokenClaimId ?? crypto.randomUUID();
+      kvData.set(idClaimKey, JSON.stringify({ owner, claimId: hookIdClaimId }));
+    }
+    return {
+      admitted: true,
+      reservation: {
+        claimId: `${tokenClaimId ?? '-'}:${hookIdClaimId}`,
+        tokenClaimId,
+        hookIdClaimId,
+      },
+    };
   }
 
   async finalizeHookIndexes(
@@ -352,9 +427,10 @@ class MockKVNamespace {
     hookId: string,
     serializedHook: string,
     owner: HookTokenOwner,
+    reservation?: HookReservation,
   ): Promise<void> {
     if (kvData.has(`terminal:${owner.runId}`) || kvData.has(`expired:${owner.runId}`)) {
-      await this.releaseHookToken(token, owner);
+      if (reservation) await this.releaseHookReservation(token, owner, reservation);
       return;
     }
     const raw = kvData.get(`hook:${token}`);
@@ -366,23 +442,62 @@ class MockKVNamespace {
     }
     const claim = kvData.get(`hookclaim:${token}`);
     if (claim !== undefined) {
-      const holder = JSON.parse(claim) as HookTokenOwner;
-      if (holder.runId !== owner.runId || holder.hookId !== owner.hookId) {
+      const existing = JSON.parse(claim) as MockHookClaim;
+      if (
+        existing.owner.runId !== owner.runId ||
+        existing.owner.hookId !== owner.hookId ||
+        existing.claimId !== reservation?.tokenClaimId
+      ) {
         throw new Error(`Hook token ${token} is reserved by another hook`);
       }
+    } else if (raw === undefined) {
+      throw new Error(`Hook token ${token} has no active reservation`);
+    }
+    const idClaim = kvData.get(`hookidclaim:${hookId}`);
+    const idRaw = kvData.get(`hookid:${hookId}`);
+    if (idRaw !== undefined) {
+      const holder = parse<Hook>(idRaw);
+      if (holder.runId !== owner.runId || holder.hookId !== owner.hookId) {
+        throw new Error(`Hook id ${hookId} is owned by another hook`);
+      }
+    }
+    if (idClaim !== undefined) {
+      const existing = JSON.parse(idClaim) as MockHookClaim;
+      if (
+        existing.owner.runId !== owner.runId ||
+        existing.owner.hookId !== owner.hookId ||
+        existing.claimId !== reservation?.hookIdClaimId
+      ) {
+        throw new Error(`Hook id ${hookId} is reserved by another hook`);
+      }
+    } else if (idRaw === undefined) {
+      throw new Error(`Hook id ${hookId} has no active reservation`);
     }
     kvData.set(`hook:${token}`, serializedHook);
     kvData.set(`hookid:${hookId}`, serializedHook);
     kvData.delete(`hookclaim:${token}`);
+    kvData.delete(`hookidclaim:${hookId}`);
   }
 
-  async releaseHookToken(token: string, owner: HookTokenOwner): Promise<void> {
-    const key = `hookclaim:${token}`;
-    const claim = kvData.get(key);
-    if (claim !== undefined) {
-      const holder = JSON.parse(claim) as HookTokenOwner;
-      if (holder.runId === owner.runId && holder.hookId === owner.hookId) {
-        kvData.delete(key);
+  async releaseHookReservation(
+    token: string,
+    owner: HookTokenOwner,
+    reservation: HookReservation,
+  ): Promise<void> {
+    for (const [key, claimId] of [
+      [`hookclaim:${token}`, reservation.tokenClaimId],
+      [`hookidclaim:${owner.hookId}`, reservation.hookIdClaimId],
+    ] as const) {
+      const claim = kvData.get(key);
+      if (claim !== undefined && claimId !== undefined) {
+        const existing = JSON.parse(claim) as MockHookClaim;
+        if (
+          existing.owner.runId === owner.runId &&
+          existing.owner.hookId === owner.hookId &&
+          existing.claimId === claimId
+        ) {
+          kvData.delete(key);
+        }
       }
     }
   }
@@ -404,9 +519,17 @@ class MockKVNamespace {
       const claimKey = `hookclaim:${token}`;
       const claim = kvData.get(claimKey);
       if (claim !== undefined) {
-        const holder = JSON.parse(claim) as HookTokenOwner;
-        if (holder.runId === owner.runId && holder.hookId === owner.hookId) {
+        const existing = JSON.parse(claim) as MockHookClaim;
+        if (existing.owner.runId === owner.runId && existing.owner.hookId === owner.hookId) {
           deleted += Number(kvData.delete(claimKey));
+        }
+      }
+      const idClaimKey = `hookidclaim:${hookId}`;
+      const idClaim = kvData.get(idClaimKey);
+      if (idClaim !== undefined) {
+        const existing = JSON.parse(idClaim) as MockHookClaim;
+        if (existing.owner.runId === owner.runId && existing.owner.hookId === owner.hookId) {
+          deleted += Number(kvData.delete(idClaimKey));
         }
       }
     }
@@ -641,7 +764,7 @@ class MockDurableObjectNamespace<T> {
 export function createMockEnv() {
   return {
     WORKFLOW_DB: new MockDurableObjectNamespace((name) => new MockWorkflowRunDOStub(name)),
-    WORKFLOW_INDEX: new MockKVNamespace(),
+    WORKFLOW_INDEX: new MockWorkflowIndex(),
     WORKFLOW_QUEUE: new MockDurableObjectNamespace((name) => new MockQueueCellStub(name)),
     WORKFLOW_STREAMS: new MockDurableObjectNamespace(() => new MockStreamDOStub()),
   };

@@ -35,10 +35,23 @@ export async function callDO<T>(
   args: unknown[],
   opts?: { idempotent?: boolean },
 ): Promise<T> {
+  return await callFleetRoute(
+    transport,
+    `/v1/rpc/${binding}/${encodeURIComponent(name)}/${method}`,
+    args,
+    opts,
+  );
+}
+
+/** Invoke a fixed authenticated worker route using the generic RPC codec. */
+export async function callFleetRoute<T>(
+  transport: RpcTransport,
+  path: string,
+  args: unknown[],
+  opts?: { idempotent?: boolean },
+): Promise<T> {
   const doFetch = transport.fetchImpl ?? fetch;
-  const url = `${transport.fleetUrl.replace(/\/$/, '')}/v1/rpc/${binding}/${encodeURIComponent(
-    name,
-  )}/${method}`;
+  const url = `${transport.fleetUrl.replace(/\/$/, '')}${path}`;
   const attempts = opts?.idempotent ? 1 + READ_RETRIES : 1;
 
   let lastError: unknown;

@@ -69,6 +69,10 @@ export const HOOK_CREATED_KEY_PREFIX = 'hookcreated:';
  * rejected as a duplicate instead of resurrecting the hook.
  */
 const HOOK_EVENT_MARKER_PREFIX = 'hookevent:';
+/** Durable repair record for idempotent post-commit hook-index release. */
+const HOOK_RELEASE_MARKER_PREFIX = 'hookreleased:';
+/** Exact ambiguous reservations canceled by a serialized RunDO resolution. */
+export const HOOK_CLAIM_CANCELLATION_PREFIX = 'hookclaimcancelled:';
 /** Workflow-authored attr_set correlation claims. */
 const ATTRIBUTE_EVENT_MARKER_PREFIX = 'attrevent:';
 /** Durable lazy-hook resume claims, scoped by the containing run DO. */
@@ -151,10 +155,12 @@ export interface ApplyEventRequest {
   /** Workflow 5 event-log position and preload options. */
   params?: CreateEventParams;
   /**
-   * Current holder of the hook token per the global KV token index
+   * Current holder of the hook token per the sharded token-ownership index
    * (hook_created only). `null` means the token is unclaimed.
    */
   tokenHolder?: { runId: string; hookId: string } | null;
+  /** Exact token/ID reservation fenced on ambiguous-delivery resolution. */
+  hookClaimId?: string;
   /** Internal world-celld retention policy captured with the event. */
   cleanup?: ScheduleCleanupRequest;
 }
@@ -165,6 +171,7 @@ export type ApplyEventErrorCode =
   | 'HOOK_NOT_FOUND'
   | 'WAIT_NOT_FOUND'
   | 'ENTITY_CONFLICT'
+  | 'HOOK_CLAIM_CANCELLED'
   | 'RUN_EXPIRED'
   | 'TOO_EARLY'
   | 'RUN_NOT_SUPPORTED';
@@ -189,11 +196,11 @@ export interface ApplyEventSuccess {
   wait?: Wait;
   /** True when a lazy step_started atomically created its step. */
   stepCreated?: true;
-  /** Hooks whose tokens must be released from the global KV index. */
+  /** Hooks whose token and ID indexes must be released. */
   releasedHooks: Array<{ hookId: string; token: string }>;
   /** Set when a run entity was created (run_created or resilient bootstrap). */
   runCreated?: { workflowName: string; createdAt: Date };
-  /** Set when the global KV hook index must be (re)written. */
+  /** Set when the sharded hook indexes must be (re)written. */
   hookToIndex?: Hook;
   /** All events (ascending), preloaded for run_started responses. */
   events?: Event[];
@@ -217,6 +224,10 @@ function failure(
   extra?: Pick<ApplyEventFailure, 'retryAfterSeconds' | 'runSpecVersion'>,
 ): ApplyEventFailure {
   return { ok: false, code, message, ...extra };
+}
+
+export function hookClaimCancellationKey(claimId: string): string {
+  return `${HOOK_CLAIM_CANCELLATION_PREFIX}${encodeURIComponent(claimId)}`;
 }
 
 function readStringProp(value: unknown, key: string): string | undefined {
@@ -602,6 +613,12 @@ export async function applyEvent(
   ) {
     const existingHook = await store.get<Hook>(`${HOOK_KEY_PREFIX}${data.correlationId}`);
     if (!existingHook) {
+      if (data.eventType === 'hook_disposed') {
+        const released = await store.get<{ hookId: string; token: string }>(
+          `${HOOK_RELEASE_MARKER_PREFIX}${data.correlationId}`,
+        );
+        if (released) return { ok: true, releasedHooks: [released] };
+      }
       return failure('HOOK_NOT_FOUND', `Hook "${data.correlationId}" not found`);
     }
   }
@@ -995,6 +1012,16 @@ export async function applyEvent(
       const markerKey = `${HOOK_EVENT_MARKER_PREFIX}${hookId}`;
       const hookKey = `${HOOK_KEY_PREFIX}${hookId}`;
 
+      if (
+        ctx.hookClaimId &&
+        (await store.get(hookClaimCancellationKey(ctx.hookClaimId))) !== undefined
+      ) {
+        return failure(
+          'HOOK_CLAIM_CANCELLED',
+          `Hook reservation for "${hookId}" was canceled before commit`,
+        );
+      }
+
       if (holder && (holder.runId !== runId || holder.hookId !== hookId)) {
         // A different (runId, hookId) holds this token. Record a
         // hook_conflict event carrying conflictingRunId so the claiming
@@ -1013,8 +1040,8 @@ export async function applyEvent(
       if (existingMarker !== undefined) {
         const existingHook = await store.get<Hook>(hookKey);
         if (existingHook && !holder) {
-          // Crash orphan: hook + event committed but the global KV index
-          // write was lost. Complete the partial write by re-indexing.
+          // Crash orphan: hook + event committed but one or both sharded
+          // index writes were lost. Complete the partial write by re-indexing.
           return { ok: true, hook: existingHook, hookToIndex: existingHook, releasedHooks: [] };
         }
         // Fully-committed duplicate (or re-create after disposal): reject so
@@ -1058,6 +1085,10 @@ export async function applyEvent(
       }
       await store.delete(hookKey);
       await store.delete(creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId));
+      await store.put(`${HOOK_RELEASE_MARKER_PREFIX}${hook.hookId}`, {
+        hookId: hook.hookId,
+        token: hook.token,
+      });
       const event = buildEvent({ ...data });
       await putEvent(event);
       return {

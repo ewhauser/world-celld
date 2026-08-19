@@ -118,8 +118,8 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         });
 
         // Verify KV index
-        const listed = await mockEnv.WORKFLOW_INDEX.list({ prefix: 'run:test-workflow:' });
-        const indexValue = await mockEnv.WORKFLOW_INDEX.get(listed.keys[0].name);
+        const listed = await mockEnv.WORKFLOW_INDEX.listRuns({ prefix: 'run:test-workflow:' });
+        const indexValue = listed.keys[0].value;
         expect(indexValue).toBeDefined();
         const parsed = JSON.parse(indexValue as string);
         expect(parsed.runId).toBe(run.runId);

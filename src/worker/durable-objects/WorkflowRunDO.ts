@@ -1,9 +1,18 @@
 import { DurableObject } from '../do-base.js';
+import {
+  createWorkflowIndex,
+  type HookIdShardStub,
+  type HookTokenShardStub,
+  type RunCatalogShardStub,
+  type RunFenceStub,
+  type WorkflowIndex,
+} from '../../indexes.js';
 import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
 import { isTerminalWorkflowRunStatus, slotToEventId, WorkflowRunSchema } from '@workflow/world';
 import {
   applyEvent,
   finalizeEventPage,
+  hookClaimCancellationKey,
   type ApplyEventOutcome,
   type ApplyEventRequest,
   EVENT_KEY_PREFIX,
@@ -21,8 +30,6 @@ import {
   type CleanupRecord,
   cleanupTombstone,
   type ExpireQueueRunResult,
-  type ExpireRunIndexesRequest,
-  type ExpireRunIndexesResult,
   type ExpireRunStreamsResult,
   type ExpireStreamResult,
   type FinalizeRunStreamsResult,
@@ -31,8 +38,6 @@ import {
   HOOK_MARKER_PREFIX,
   type HookIndexReference,
   hookMarkerKey,
-  type ReleaseHookIndexesRequest,
-  type ReleaseHookIndexesResult,
   type RunReadOutcome,
   type RunTombstone,
   type ScheduleCleanupRequest,
@@ -49,11 +54,6 @@ interface CellId {
 interface CellNamespace<T> {
   idFromName(name: string): CellId;
   get(id: CellId): T;
-}
-
-interface IndexCleanupStub {
-  expireRun(request: ExpireRunIndexesRequest): Promise<ExpireRunIndexesResult>;
-  releaseHookIndexes(request: ReleaseHookIndexesRequest): Promise<ReleaseHookIndexesResult>;
 }
 
 interface StreamCleanupStub {
@@ -79,7 +79,10 @@ interface QueueCleanupStub {
 }
 
 interface WorkflowRunDOEnv {
-  WORKFLOW_INDEX?: CellNamespace<IndexCleanupStub>;
+  WORKFLOW_RUN_CATALOG?: CellNamespace<RunCatalogShardStub>;
+  WORKFLOW_RUN_FENCES?: CellNamespace<RunFenceStub>;
+  WORKFLOW_HOOK_TOKENS?: CellNamespace<HookTokenShardStub>;
+  WORKFLOW_HOOK_IDS?: CellNamespace<HookIdShardStub>;
   WORKFLOW_STREAMS?: CellNamespace<StreamCleanupStub>;
   WORKFLOW_QUEUE?: CellNamespace<QueueCleanupStub>;
   /** Test seam; celld deployments use Date.now(). */
@@ -290,6 +293,28 @@ export class WorkflowRunDO extends DurableObject {
     });
   }
 
+  /**
+   * Resolve an ambiguous hook-creation RPC in the same serialization domain as
+   * applyEvent. If the hook is absent, the exact reservation is durably fenced
+   * before the caller releases its token and hook-ID claims.
+   */
+  async resolveHookTokenClaim(request: {
+    hookId: string;
+    token: string;
+    claimId: string;
+  }): Promise<{ committed: boolean }> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      const hook = await txn.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
+      if (hook?.token === request.token) return { committed: true };
+      await txn.put(hookClaimCancellationKey(request.claimId), {
+        hookId: request.hookId,
+        token: request.token,
+        canceledAt: this.now(),
+      });
+      return { committed: false };
+    });
+  }
+
   async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {
     return this.readKey<WorkflowRun>('run');
   }
@@ -443,6 +468,15 @@ export class WorkflowRunDO extends DurableObject {
     return namespace as CellNamespace<T>;
   }
 
+  private workflowIndex(): WorkflowIndex {
+    return createWorkflowIndex({
+      runCatalog: this.namespace<RunCatalogShardStub>('WORKFLOW_RUN_CATALOG'),
+      runFences: this.namespace<RunFenceStub>('WORKFLOW_RUN_FENCES'),
+      hookTokens: this.namespace<HookTokenShardStub>('WORKFLOW_HOOK_TOKENS'),
+      hookIds: this.namespace<HookIdShardStub>('WORKFLOW_HOOK_IDS'),
+    });
+  }
+
   private async setCleanupPhase(
     expected: CleanupRecord,
     next: CleanupRecord['phase'],
@@ -526,6 +560,8 @@ export class WorkflowRunDO extends DurableObject {
   private async executeTerminalCleanup(cleanup: TerminalCleanupRecord): Promise<void> {
     if (cleanup.phase === 'hooks') {
       await this.deleteTerminalHookPage(cleanup);
+    } else if (cleanup.phase === 'markers') {
+      await this.deleteTerminalHookMarkerPage(cleanup);
     } else {
       await this.deleteTerminalWaitPage(cleanup);
     }
@@ -537,9 +573,7 @@ export class WorkflowRunDO extends DurableObject {
       limit: TERMINAL_HOOK_PAGE_SIZE + 1,
     });
     const page = Array.from(entries.values()).slice(0, TERMINAL_HOOK_PAGE_SIZE);
-    const indexNamespace = this.namespace<IndexCleanupStub>('WORKFLOW_INDEX');
-    const index = indexNamespace.get(indexNamespace.idFromName('index'));
-    await index.releaseHookIndexes({
+    await this.workflowIndex().releaseHookIndexes({
       runId: cleanup.runId,
       hooks: page.map((hook) => ({ hookId: hook.hookId, token: hook.token })),
       terminal: true,
@@ -561,7 +595,41 @@ export class WorkflowRunDO extends DurableObject {
       if (keys.length > 0) await txn.delete(keys);
       await txn.put<TerminalCleanupRecord>(TERMINAL_CLEANUP_KEY, {
         ...current,
-        phase: entries.size <= TERMINAL_HOOK_PAGE_SIZE ? 'waits' : 'hooks',
+        phase: entries.size <= TERMINAL_HOOK_PAGE_SIZE ? 'markers' : 'hooks',
+        generation: current.generation + 1,
+        attempts: 0,
+        lastError: undefined,
+      });
+      await txn.setAlarm(this.now() + 1);
+    });
+  }
+
+  private async deleteTerminalHookMarkerPage(cleanup: TerminalCleanupRecord): Promise<void> {
+    const entries = await this.ctx.storage.list<HookIndexReference>({
+      prefix: HOOK_MARKER_PREFIX,
+      limit: HOOK_MARKER_PAGE_SIZE + 1,
+    });
+    const page = Array.from(entries).slice(0, HOOK_MARKER_PAGE_SIZE);
+    await this.workflowIndex().releaseHookIndexes({
+      runId: cleanup.runId,
+      hooks: page.map(([, reference]) => reference),
+      terminal: true,
+    });
+
+    await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<TerminalCleanupRecord>(TERMINAL_CLEANUP_KEY);
+      if (
+        !current ||
+        current.phase !== cleanup.phase ||
+        current.generation !== cleanup.generation
+      ) {
+        return;
+      }
+      const keys = page.map(([key]) => key);
+      if (keys.length > 0) await txn.delete(keys);
+      await txn.put<TerminalCleanupRecord>(TERMINAL_CLEANUP_KEY, {
+        ...current,
+        phase: entries.size <= HOOK_MARKER_PAGE_SIZE ? 'waits' : 'markers',
         generation: current.generation + 1,
         attempts: 0,
         lastError: undefined,
@@ -614,9 +682,7 @@ export class WorkflowRunDO extends DurableObject {
       limit: HOOK_MARKER_PAGE_SIZE + 1,
     });
     const hookMarkers = Array.from(hookEntries).slice(0, HOOK_MARKER_PAGE_SIZE);
-    const indexNamespace = this.namespace<IndexCleanupStub>('WORKFLOW_INDEX');
-    const index = indexNamespace.get(indexNamespace.idFromName('index'));
-    await index.expireRun({
+    await this.workflowIndex().expireRun({
       runId: cleanup.runId,
       keys: [workflowRunIndexKey(cleanup), globalRunIndexKey(cleanup)],
       hooks: hookMarkers.map(([, value]) => value),

@@ -4,14 +4,27 @@
  * Routes:
  *   GET  /v1/health                              — liveness + spec version (unauthenticated)
  *   POST /v1/rpc/{binding}/{name}/{method}       — DO RPC (bearer auth)
+ *   POST /v1/index/{domain}/{method}             — cohesive index operation
  *   GET  /v1/streams/{name}/chunks               — bounded binary long-poll read
  *   POST /v1/streams/{name}/chunks               — bounded binary batch append
  *
  * Generic RPC bodies use the tagged JSON codec. Stream chunk bodies use the
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
-import { SPEC_VERSION_CURRENT } from '@workflow/world';
+import { SPEC_VERSION_CURRENT, type WorkflowRun } from '@workflow/world';
 import { rpcParse, rpcStringify } from '../codec.js';
+import type { HookTokenOwner } from '../config.js';
+import {
+  createWorkflowIndex,
+  type CellNamespaceLike,
+  type HookReservation,
+  type HookIdShardStub,
+  type HookTokenShardStub,
+  type IndexListOptions,
+  type RunCatalogShardStub,
+  type RunFenceStub,
+} from '../indexes.js';
+import type { ExpireRunIndexesRequest, ReleaseHookIndexesRequest } from '../retention.js';
 import {
   MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_CHUNK_BYTES,
@@ -40,9 +53,21 @@ export interface DONamespaceLike {
 export interface WorkerEnv {
   WORKFLOW_DB: DONamespaceLike;
   WORKFLOW_STREAMS: DONamespaceLike;
-  WORKFLOW_INDEX: DONamespaceLike;
+  WORKFLOW_RUN_CATALOG: DONamespaceLike;
+  WORKFLOW_RUN_FENCES: DONamespaceLike;
+  WORKFLOW_HOOK_TOKENS: DONamespaceLike;
+  WORKFLOW_HOOK_IDS: DONamespaceLike;
   WORKFLOW_QUEUE: DONamespaceLike;
   WORLD_SECRET?: string;
+}
+
+function workflowIndex(env: WorkerEnv) {
+  return createWorkflowIndex({
+    runCatalog: env.WORKFLOW_RUN_CATALOG as CellNamespaceLike<RunCatalogShardStub>,
+    runFences: env.WORKFLOW_RUN_FENCES as CellNamespaceLike<RunFenceStub>,
+    hookTokens: env.WORKFLOW_HOOK_TOKENS as CellNamespaceLike<HookTokenShardStub>,
+    hookIds: env.WORKFLOW_HOOK_IDS as CellNamespaceLike<HookIdShardStub>,
+  });
 }
 
 const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<string> }> = {
@@ -60,6 +85,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'scheduleCleanup',
       'cleanupNow',
       'rearmCleanup',
+      'resolveHookTokenClaim',
     ]),
   },
   streams: {
@@ -74,20 +100,13 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'expireStream',
     ]),
   },
-  index: {
-    env: 'WORKFLOW_INDEX',
-    methods: new Set([
-      'get',
-      'put',
-      'delete',
-      'putOwned',
-      'expireRun',
-      'list',
-      'reserveHookToken',
-      'finalizeHookIndexes',
-      'releaseHookToken',
-      'releaseHookIndexes',
-    ]),
+  'hook-tokens': {
+    env: 'WORKFLOW_HOOK_TOKENS',
+    methods: new Set(['get']),
+  },
+  'hook-ids': {
+    env: 'WORKFLOW_HOOK_IDS',
+    methods: new Set(['get']),
   },
   queue: {
     env: 'WORKFLOW_QUEUE',
@@ -201,6 +220,78 @@ export function createRouter(env: WorkerEnv) {
     const auth = await authenticate(request, env.WORLD_SECRET);
     if (!auth.ok) {
       return auth.response;
+    }
+
+    if (parts[1] === 'index' && parts.length === 4) {
+      if (request.method !== 'POST') {
+        return errorResponse(405, 'MethodNotAllowed', 'expected POST');
+      }
+      const contentLength = Number(request.headers.get('content-length') ?? '0');
+      if (contentLength > MAX_BODY_BYTES) {
+        return errorResponse(413, 'PayloadTooLarge', `body exceeds ${MAX_BODY_BYTES} bytes`);
+      }
+      let args: unknown[];
+      try {
+        const text = await readBoundedBody(request);
+        if (text === null) {
+          return errorResponse(413, 'PayloadTooLarge', `body exceeds ${MAX_BODY_BYTES} bytes`);
+        }
+        const parsed = rpcParse<unknown>(text);
+        if (!Array.isArray(parsed)) {
+          return errorResponse(400, 'BadRequest', 'body must be an argument array');
+        }
+        args = parsed;
+      } catch {
+        return errorResponse(400, 'BadRequest', 'malformed rpc body');
+      }
+      try {
+        const index = workflowIndex(env);
+        let result: unknown;
+        const operation = `${parts[2]}.${parts[3]}`;
+        if (operation === 'runs.list') {
+          result = await index.listRuns(args[0] as IndexListOptions | undefined);
+        } else if (operation === 'runs.commit') {
+          result = await index.commitRun(args[0] as WorkflowRun, args[1] as string);
+        } else if (operation === 'runs.expire') {
+          result = await index.expireRun(args[0] as ExpireRunIndexesRequest);
+        } else if (operation === 'hooks.reserve') {
+          result = await index.reserveHook(args[0] as string, args[1] as HookTokenOwner);
+        } else if (operation === 'hooks.finalize') {
+          result = await index.finalizeHookIndexes(
+            args[0] as string,
+            args[1] as string,
+            args[2] as string,
+            args[3] as HookTokenOwner,
+            args[4] as HookReservation | undefined,
+          );
+        } else if (operation === 'hooks.release-reservation') {
+          result = await index.releaseHookReservation(
+            args[0] as string,
+            args[1] as HookTokenOwner,
+            args[2] as HookReservation,
+          );
+        } else if (operation === 'hooks.release') {
+          result = await index.releaseHookIndexes(args[0] as ReleaseHookIndexesRequest);
+        } else {
+          return errorResponse(404, 'NotFound', `unknown index operation: ${operation}`);
+        }
+        return new Response(rpcStringify(result ?? null), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      } catch (error) {
+        const err = error as { name?: string; message?: string; status?: number };
+        return Response.json(
+          {
+            error: {
+              name: err?.name ?? 'Error',
+              message: err?.message ?? String(error),
+              status: typeof err?.status === 'number' ? err.status : undefined,
+            },
+          },
+          { status: 500 },
+        );
+      }
     }
 
     if (parts[1] === 'streams' && parts.length === 4 && parts[3] === 'chunks') {

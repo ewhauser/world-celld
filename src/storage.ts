@@ -42,8 +42,9 @@ import { parse, stringify } from './vendor/shared/index.js';
 import { monotonicFactory } from 'ulid';
 import type { ApplyEventFailure, ApplyEventOutcome, ApplyEventRequest } from './apply-event.js';
 import type { HookTokenOwner, IndexNamespace } from './config.js';
+import type { HookReservation } from './indexes.js';
 import { compact } from './util.js';
-import { globalRunIndexKey, type RunReadOutcome, workflowRunIndexKey } from './retention.js';
+import type { RunReadOutcome } from './retention.js';
 
 /**
  * RPC surface of WorkflowRunDO used by the storage layer. Declared
@@ -51,6 +52,11 @@ import { globalRunIndexKey, type RunReadOutcome, workflowRunIndexKey } from './r
  */
 export interface WorkflowRunDOStub {
   applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome>;
+  resolveHookTokenClaim(request: {
+    hookId: string;
+    token: string;
+    claimId: string;
+  }): Promise<{ committed: boolean }>;
   getRun(): Promise<RunReadOutcome<WorkflowRun | null>>;
   getStep(stepId: string): Promise<RunReadOutcome<Step | null>>;
   getEvent(eventId: string): Promise<RunReadOutcome<Event | null>>;
@@ -156,6 +162,8 @@ function throwOutcomeError(
       throw new WorkflowWorldError(outcome.message, { status: 404 });
     case 'ENTITY_CONFLICT':
       throw new EntityConflictError(outcome.message);
+    case 'HOOK_CLAIM_CANCELLED':
+      throw new WorkflowWorldError(outcome.message, { status: 503 });
     case 'RUN_EXPIRED':
       throw new RunExpiredError(outcome.message);
     case 'TOO_EARLY':
@@ -182,8 +190,7 @@ const RUN_LIST_CONCURRENCY = 8;
 
 interface RunIndexMetadata {
   runId: string;
-  /** Optional so indexes written by older deployments remain readable. */
-  status?: WorkflowRun['status'];
+  status: WorkflowRun['status'];
 }
 
 /**
@@ -194,10 +201,10 @@ interface RunIndexMetadata {
  * exclude a later status because a post-commit index write may need replay.
  */
 function indexStatusExcludes(
-  indexed: WorkflowRun['status'] | undefined,
+  indexed: WorkflowRun['status'],
   requested: WorkflowRun['status'] | undefined,
 ): boolean {
-  if (indexed === undefined || requested === undefined || indexed === requested) return false;
+  if (requested === undefined || indexed === requested) return false;
   return isTerminalWorkflowRunStatus(indexed) || requested === 'pending';
 }
 
@@ -250,7 +257,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // prevents status filters and stale derived entries from producing
         // short pages or cursors that skip matching runs.
         while (matches.length <= limit && !exhausted) {
-          const kvList = await env.WORKFLOW_INDEX.list({
+          const kvList = await env.WORKFLOW_INDEX.listRuns({
             prefix,
             limit: Math.min(1000, Math.max(50, limit)),
             cursor: scanCursor,
@@ -261,29 +268,16 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             break;
           }
 
-          // IndexDO returns values with the page. Resolve missing values in
-          // bounded batches as a compatibility fallback for older/custom
-          // KV-like adapters instead of restoring serial per-key reads.
           const candidates: Array<{ key: string; metadata: RunIndexMetadata }> = [];
-          for (let offset = 0; offset < kvList.keys.length; offset += RUN_LIST_CONCURRENCY) {
-            const batch = kvList.keys.slice(offset, offset + RUN_LIST_CONCURRENCY);
-            const values = await Promise.all(
-              batch.map(async (key) => ({
-                key: key.name,
-                value: key.value ?? (await env.WORKFLOW_INDEX.get(key.name)),
-              })),
-            );
-            for (const { key, value } of values) {
-              if (!value) continue;
-              const metadata = JSON.parse(value) as RunIndexMetadata;
-              // Use monotonic status metadata as a conservative prefilter,
-              // then still verify every candidate against the authoritative
-              // RunDO below. Earlier metadata cannot exclude a later status.
-              if (indexStatusExcludes(metadata.status, params?.status)) {
-                continue;
-              }
-              candidates.push({ key, metadata });
+          for (const key of kvList.keys) {
+            const metadata = JSON.parse(key.value) as RunIndexMetadata;
+            // Use monotonic status metadata as a conservative prefilter,
+            // then still verify every candidate against the authoritative
+            // RunDO below. Earlier metadata cannot exclude a later status.
+            if (indexStatusExcludes(metadata.status, params?.status)) {
+              continue;
             }
+            candidates.push({ key: key.name, metadata });
           }
 
           // Fetch enough candidates to prove the requested page and hasMore,
@@ -348,22 +342,33 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         const stub = getRunDO(effectiveRunId);
 
         let tokenHolder: ApplyEventRequest['tokenHolder'];
-        let hookReservation: HookTokenOwner | undefined;
+        let hookAdmission:
+          | { owner: HookTokenOwner; reservation: HookReservation; token: string }
+          | undefined;
         if (data.eventType === 'hook_created') {
-          hookReservation = {
+          const owner = {
             runId: effectiveRunId,
             hookId: data.correlationId,
           };
-          const reservation = await env.WORKFLOW_INDEX.reserveHookToken(
-            data.eventData.token,
-            hookReservation,
-          );
-          tokenHolder = reservation.claimed ? null : reservation.holder;
+          const admission = await env.WORKFLOW_INDEX.reserveHook(data.eventData.token, owner);
+          if (admission.admitted) {
+            tokenHolder = null;
+            hookAdmission = {
+              owner,
+              reservation: admission.reservation,
+              token: data.eventData.token,
+            };
+          } else {
+            tokenHolder = admission.holder;
+          }
         }
 
         // Guards, event append, and entity mutation run in ONE DO storage
         // transaction (see apply-event.ts). The event is schema-validated
         // before anything is persisted.
+        // A thrown RPC is commit-ambiguous. Resolve it inside the authoritative
+        // RunDO: that transaction either observes the committed hook or fences
+        // this exact reservation before its token/ID claims are released.
         let outcome: ApplyEventOutcome;
         try {
           outcome = await stub.applyEvent({
@@ -371,18 +376,41 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             data,
             params,
             tokenHolder,
+            hookClaimId: hookAdmission?.reservation.claimId,
             cleanup,
           });
         } catch (error) {
-          if (hookReservation && data.eventType === 'hook_created') {
-            await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
+          if (hookAdmission) {
+            let resolution: { committed: boolean };
+            try {
+              resolution = await stub.resolveHookTokenClaim({
+                hookId: hookAdmission.owner.hookId,
+                token: hookAdmission.token,
+                claimId: hookAdmission.reservation.claimId,
+              });
+            } catch {
+              // Resolution is itself ambiguous, so fail closed and leave both
+              // claims for an exact same-reservation retry.
+              throw error;
+            }
+            if (!resolution.committed) {
+              await env.WORKFLOW_INDEX.releaseHookReservation(
+                hookAdmission.token,
+                hookAdmission.owner,
+                hookAdmission.reservation,
+              );
+            }
           }
           throw error;
         }
 
         if (!outcome.ok) {
-          if (hookReservation && data.eventType === 'hook_created') {
-            await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
+          if (hookAdmission) {
+            await env.WORKFLOW_INDEX.releaseHookReservation(
+              hookAdmission.token,
+              hookAdmission.owner,
+              hookAdmission.reservation,
+            );
           }
           throwOutcomeError(outcome, effectiveRunId, data);
         }
@@ -395,8 +423,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             createdAt: outcome.run.createdAt.toISOString(),
             status: outcome.run.status,
           });
-          await env.WORKFLOW_INDEX.putOwned(effectiveRunId, workflowRunIndexKey(outcome.run), meta);
-          await env.WORKFLOW_INDEX.putOwned(effectiveRunId, globalRunIndexKey(outcome.run), meta);
+          await env.WORKFLOW_INDEX.commitRun(outcome.run, meta);
         }
         if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
@@ -405,12 +432,17 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             outcome.hookToIndex.hookId,
             serialized,
             hookOwner(outcome.hookToIndex),
+            hookAdmission?.reservation,
           );
-        } else if (hookReservation && data.eventType === 'hook_created') {
-          await env.WORKFLOW_INDEX.releaseHookToken(data.eventData.token, hookReservation);
+        } else if (hookAdmission) {
+          await env.WORKFLOW_INDEX.releaseHookReservation(
+            hookAdmission.token,
+            hookAdmission.owner,
+            hookAdmission.reservation,
+          );
         }
         const terminal = Boolean(outcome.run && isTerminalWorkflowRunStatus(outcome.run.status));
-        if (terminal || outcome.releasedHooks.length > 0) {
+        if (outcome.releasedHooks.length > 0) {
           await env.WORKFLOW_INDEX.releaseHookIndexes({
             runId: effectiveRunId,
             hooks: outcome.releasedHooks,
@@ -556,7 +588,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
     hooks: {
       async get(hookId: string, params?: GetHookParams) {
-        const raw = await env.WORKFLOW_INDEX.get(`hookid:${hookId}`);
+        const raw = await env.WORKFLOW_INDEX.getHookById(hookId);
 
         if (!raw) {
           throw new HookNotFoundError(hookId);
@@ -567,7 +599,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       },
 
       async getByToken(token: string, params?: GetHookParams) {
-        const raw = await env.WORKFLOW_INDEX.get(`hook:${token}`);
+        const raw = await env.WORKFLOW_INDEX.getHookByToken(token);
 
         if (!raw) {
           throw new HookNotFoundError(token);

@@ -9,14 +9,25 @@
     "bindings": [
       { "name": "WORKFLOW_DB", "class_name": "WorkflowRunDO" },
       { "name": "WORKFLOW_STREAMS", "class_name": "StreamDO" },
-      { "name": "WORKFLOW_INDEX", "class_name": "IndexDO" },
+      { "name": "WORKFLOW_RUN_CATALOG", "class_name": "RunCatalogDO" },
+      { "name": "WORKFLOW_RUN_FENCES", "class_name": "RunFenceDO" },
+      { "name": "WORKFLOW_HOOK_TOKENS", "class_name": "HookTokenDO" },
+      { "name": "WORKFLOW_HOOK_IDS", "class_name": "HookIdDO" },
       { "name": "WORKFLOW_QUEUE", "class_name": "QueueDO" },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
-      "new_sqlite_classes": ["WorkflowRunDO", "StreamDO", "IndexDO", "QueueDO"],
+      "new_sqlite_classes": [
+        "WorkflowRunDO",
+        "StreamDO",
+        "RunCatalogDO",
+        "RunFenceDO",
+        "HookTokenDO",
+        "HookIdDO",
+        "QueueDO",
+      ],
     },
   ],
   "vars": {

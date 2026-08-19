@@ -4,11 +4,18 @@
  * whose method calls become `POST /v1/rpc/{binding}/{name}/{method}` against
  * the fleet — the celld stand-in for Cloudflare's `env` bindings.
  */
-import type { CelldWorldEnv, HookTokenOwner, IndexNamespace } from '../config.js';
+import type { CelldWorldEnv } from '../config.js';
+import {
+  createWorkflowIndex,
+  type HookIdShardStub,
+  type HookTokenShardStub,
+  type RunCatalogShardStub,
+  type RunFenceStub,
+} from '../indexes.js';
 import type { QueueCellStub } from '../queue.js';
 import type { WorkflowRunDOStub } from '../storage.js';
 import type { StreamDOStub } from '../streamer.js';
-import { callDO, type RpcTransport } from './rpc-client.js';
+import { callDO, callFleetRoute, type RpcTransport } from './rpc-client.js';
 import { readStreamChunks, writeStreamChunks } from './stream-client.js';
 
 interface MethodSpec {
@@ -29,6 +36,7 @@ const RUNS: MethodSpec = {
     'scheduleCleanup',
     'cleanupNow',
     'rearmCleanup',
+    'resolveHookTokenClaim',
   ],
   mutating: new Set(['applyEvent', 'scheduleCleanup', 'cleanupNow', 'rearmCleanup']),
 };
@@ -109,34 +117,67 @@ function makeNamespace<T>(transport: RpcTransport, binding: string, spec: Method
   };
 }
 
-/** The IndexDO is a single well-known cell. */
-const INDEX_CELL_NAME = 'index';
+const RUN_CATALOG: MethodSpec = {
+  methods: ['upsertRun', 'list', 'expireRun'],
+  // Every method is idempotent; transport retries cannot duplicate effects.
+  mutating: new Set(),
+};
 
-function makeIndexNamespace(transport: RpcTransport): IndexNamespace {
-  const call = <T>(method: string, args: unknown[], idempotent: boolean) =>
-    callDO<T>(transport, 'index', INDEX_CELL_NAME, method, args, { idempotent });
-  return {
-    get: (key) => call<string | null>('get', [key], true),
-    put: (key, value) => call<void>('put', [key, value], false),
-    delete: (key) => call<void>('delete', [key], false),
-    putOwned: (runId, key, value) =>
-      call<{ stored: boolean }>('putOwned', [runId, key, value], false),
-    expireRun: (request) => call('expireRun', [request], false),
-    list: (options) => call('list', [options], true),
-    reserveHookToken: (token: string, owner: HookTokenOwner) =>
-      call('reserveHookToken', [token, owner], false),
-    finalizeHookIndexes: (token, hookId, serializedHook, owner) =>
-      call<void>('finalizeHookIndexes', [token, hookId, serializedHook, owner], false),
-    releaseHookToken: (token, owner) => call<void>('releaseHookToken', [token, owner], false),
-    releaseHookIndexes: (request) => call('releaseHookIndexes', [request], false),
-  };
-}
+const RUN_FENCES: MethodSpec = {
+  methods: ['getStatus', 'fenceTerminal', 'fenceExpired'],
+  mutating: new Set(),
+};
+
+const HOOK_TOKENS: MethodSpec = {
+  methods: ['get', 'reserve', 'finalize', 'releaseClaim', 'releaseBatch'],
+  mutating: new Set(),
+};
+
+const HOOK_IDS: MethodSpec = {
+  methods: ['get', 'reserve', 'publish', 'releaseClaim', 'releaseBatch'],
+  mutating: new Set(),
+};
 
 export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
+  const runCatalog = makeNamespace<RunCatalogShardStub>(transport, 'run-catalog', RUN_CATALOG);
+  const runFences = makeNamespace<RunFenceStub>(transport, 'run-fences', RUN_FENCES);
+  const hookTokens = makeNamespace<HookTokenShardStub>(transport, 'hook-tokens', HOOK_TOKENS);
+  const hookIds = makeNamespace<HookIdShardStub>(transport, 'hook-ids', HOOK_IDS);
+  const workflowIndex = createWorkflowIndex({ runCatalog, runFences, hookTokens, hookIds });
   return {
     WORKFLOW_DB: makeNamespace<WorkflowRunDOStub>(transport, 'runs', RUNS),
     WORKFLOW_STREAMS: makeStreamNamespace(transport),
-    WORKFLOW_INDEX: makeIndexNamespace(transport),
+    WORKFLOW_INDEX: {
+      ...workflowIndex,
+      commitRun: (run, serializedMetadata) =>
+        callFleetRoute(transport, '/v1/index/runs/commit', [run, serializedMetadata], {
+          idempotent: true,
+        }),
+      listRuns: (options) =>
+        callFleetRoute(transport, '/v1/index/runs/list', [options], { idempotent: true }),
+      expireRun: (request) =>
+        callFleetRoute(transport, '/v1/index/runs/expire', [request], { idempotent: true }),
+      reserveHook: (token, owner) =>
+        callFleetRoute(transport, '/v1/index/hooks/reserve', [token, owner], {
+          idempotent: true,
+        }),
+      finalizeHookIndexes: (token, hookId, serializedHook, owner, reservation) =>
+        callFleetRoute(
+          transport,
+          '/v1/index/hooks/finalize',
+          [token, hookId, serializedHook, owner, reservation],
+          { idempotent: true },
+        ),
+      releaseHookReservation: (token, owner, reservation) =>
+        callFleetRoute(
+          transport,
+          '/v1/index/hooks/release-reservation',
+          [token, owner, reservation],
+          { idempotent: true },
+        ),
+      releaseHookIndexes: (request) =>
+        callFleetRoute(transport, '/v1/index/hooks/release', [request], { idempotent: true }),
+    },
     WORKFLOW_QUEUE: makeNamespace<QueueCellStub>(transport, 'queue', QUEUE),
   };
 }
