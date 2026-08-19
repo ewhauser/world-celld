@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.2 (2026-08-19)
+
+## What's Changed
+* fix: compact expired-run lifecycle fences by @ewhauser in https://github.com/ewhauser/world-celld/pull/29
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.3.1...v0.3.2
+
 ## 0.3.1 (2026-08-19)
 
 ## What's Changed
