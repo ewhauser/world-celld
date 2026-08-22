@@ -17,6 +17,8 @@ const HOOK_RELEASE_BATCH = 64;
 export interface IndexListOptions {
   prefix?: string;
   cursor?: string;
+  /** Exclusive upper bound for creation-time retention scans. */
+  end?: string;
   limit?: number;
   reverse?: boolean;
 }

@@ -76,8 +76,8 @@ export class RunCatalogDO extends DurableObject {
     const entries = await this.ctx.storage.list<string>({
       prefix: options.prefix ?? '',
       ...(options.reverse
-        ? { reverse: true, end: options.cursor }
-        : { startAfter: options.cursor }),
+        ? { reverse: true, end: options.cursor ?? options.end }
+        : { startAfter: options.cursor, end: options.end }),
       limit: limit + 1,
     });
     const page = Array.from(entries).slice(0, limit);

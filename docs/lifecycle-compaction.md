@@ -29,19 +29,19 @@ there is no cached non-expired proof which can outlive a retention boundary.
 
 ## Producer and consumer map
 
-| State                                          | Producers                                                                             | Consumers and replay behavior                                                                                                        | Terminal state                                                                          |
-| ---------------------------------------------- | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `retention:cleanup`                            | terminal `WorkflowRunDO.applyEvent`, `scheduleCleanup`, `cleanupNow`                  | `retentionState`, the RunDO alarm phase machine, status/rearm RPCs, generation checks after every cross-cell await, retry accounting | folded into and deleted beside the final tombstone                                      |
-| `retention:tombstone`                          | payload cleanup, before each bounded delete page and again on completion              | every RunDO read/write guard, `getLifecycleStatus`, queue fallback, hook read/finalize fallback                                      | one permanent record per expired run                                                    |
-| terminal cleanup marker                        | terminal `applyEvent`                                                                 | hook entity pages, durable hook-marker pages, wait pages, failure backoff                                                            | deleted when all terminal pages finish                                                  |
-| hook entity/marker                             | hook event transaction                                                                | terminal and retention cleanup replays; exact token and ID release batches                                                           | deleted in pages of at most 64 hooks                                                    |
-| exact hook claim plus deadline                 | token/ID `reserve`                                                                    | `finalize`/`publish`, exact cancellation release, hook cleanup, shard alarm                                                          | finalized/released immediately or alarm-deleted after its protocol lease                |
-| RunDO exact cancellation                       | ambiguous `applyEvent` resolution when the hook is absent and the run has not expired | replayed `hook_created` guard                                                                                                        | payload cleanup deletes it; resolvers never recreate it after the logical tombstone     |
-| catalog expiry marker plus GC deadline         | RunDO index cleanup calling `RunCatalogDO.expireRun`                                  | catalog `upsertRun`; catalog alarm                                                                                                   | deleted after the publication horizon                                                   |
-| queue run reference                            | enqueue, claim recovery, retry, DLQ transition, redrive                               | paged `expireRun`, ack, purge                                                                                                        | deleted with its message lifecycle                                                      |
-| queue exact expiry receipt                     | each queue shard's paged `expireRun`                                                  | enqueue, 503 reschedule, retry/DLQ, redrive; RunDO cumulative-count reconciliation and replay                                        | retained without a deadline until RunDO persists the final receipt                      |
-| queue receipt acknowledgement plus GC deadline | RunDO after persisting the final shard receipt                                        | idempotent `acknowledgeExpireRun`; bounded queue compaction alarm                                                                    | exact receipt and deadline are deleted; all later operations use RunDO authority        |
-| stream registry/stream expiry metadata         | RunDO stream cleanup                                                                  | stream read/write guards and bounded stream cleanup replay                                                                           | retained as the stream entity's terminal metadata, not a duplicated per-shard run fence |
+| State                                          | Producers                                                                                          | Consumers and replay behavior                                                                                                        | Terminal state                                                                          |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
+| `retention:cleanup`                            | terminal `WorkflowRunDO.applyEvent`, maximum-age cron enforcement, `scheduleCleanup`, `cleanupNow` | `retentionState`, the RunDO alarm phase machine, status/rearm RPCs, generation checks after every cross-cell await, retry accounting | folded into and deleted beside the final tombstone                                      |
+| `retention:tombstone`                          | payload cleanup, before each bounded delete page and again on completion                           | every RunDO read/write guard, `getLifecycleStatus`, queue fallback, hook read/finalize fallback                                      | one permanent record per expired run                                                    |
+| terminal cleanup marker                        | terminal `applyEvent`                                                                              | hook entity pages, durable hook-marker pages, wait pages, failure backoff                                                            | deleted when all terminal pages finish                                                  |
+| hook entity/marker                             | hook event transaction                                                                             | terminal and retention cleanup replays; exact token and ID release batches                                                           | deleted in pages of at most 64 hooks                                                    |
+| exact hook claim plus deadline                 | token/ID `reserve`                                                                                 | `finalize`/`publish`, exact cancellation release, hook cleanup, shard alarm                                                          | finalized/released immediately or alarm-deleted after its protocol lease                |
+| RunDO exact cancellation                       | ambiguous `applyEvent` resolution when the hook is absent and the run has not expired              | replayed `hook_created` guard                                                                                                        | payload cleanup deletes it; resolvers never recreate it after the logical tombstone     |
+| catalog expiry marker plus GC deadline         | RunDO index cleanup calling `RunCatalogDO.expireRun`                                               | catalog `upsertRun`; catalog alarm                                                                                                   | deleted after the publication horizon                                                   |
+| queue run reference                            | enqueue, claim recovery, retry, DLQ transition, redrive                                            | paged `expireRun`, ack, purge                                                                                                        | deleted with its message lifecycle                                                      |
+| queue exact expiry receipt                     | each queue shard's paged `expireRun`                                                               | enqueue, 503 reschedule, retry/DLQ, redrive; RunDO cumulative-count reconciliation and replay                                        | retained without a deadline until RunDO persists the final receipt                      |
+| queue receipt acknowledgement plus GC deadline | RunDO after persisting the final shard receipt                                                     | idempotent `acknowledgeExpireRun`; bounded queue compaction alarm                                                                    | exact receipt and deadline are deleted; all later operations use RunDO authority        |
+| stream registry/stream expiry metadata         | RunDO stream cleanup                                                                               | stream read/write guards and bounded stream cleanup replay                                                                           | retained as the stream entity's terminal metadata, not a duplicated per-shard run fence |
 
 `RunFenceDO`, `WORKFLOW_RUN_FENCES`, and hook-shard `runfence:<runId>` keys no
 longer exist. A hard cutover is intentional; there is no decoder, dual write,
@@ -68,8 +68,16 @@ replay to start a fresh request and be rejected by the tombstone.
 Every compaction alarm lists at most 129 entries, mutates at most 128 items,
 and re-arms for `now + 1` when a page remains. Storage failures schedule a new
 alarm edge before returning or throwing, rather than relying only on the
-platform's finite automatic retry ladder. There are no namespace-wide or
-cross-shard scans.
+platform's finite automatic retry ladder.
+
+Fleet-wide maximum-age discovery is the deliberate cross-shard exception. One
+celld cron occurrence performs a bounded creation-time merge across the 16 run
+catalog shards, admits at most `WORKFLOW_RETENTION_BATCH_SIZE` runs, then
+rechecks each candidate's authoritative `createdAt` in its RunDO. The RunDO
+removes its catalog entry before the enforcement RPC returns when possible;
+the remaining cleanup stays paged and alarm-driven. Repeated cron occurrences
+therefore advance through a backlog without turning one invocation into an
+unbounded namespace scan.
 
 ## Measured protocol and storage effects
 
@@ -113,4 +121,7 @@ concurrent expiry/compaction, lost final cleanup responses, unacknowledged
 receipt retention, and convergence of hundreds of exact queue receipts to no
 derivative state. Existing retention tests continue to cover cleanup
 generation races, paged hooks/streams/queues/payload, lost responses, and alarm
-backoff.
+backoff. Maximum-age tests additionally cover pending, running, and terminal
+runs, authoritative cutoff rechecks, bounded sweep progress, the earliest of
+terminal and fleet-wide deadlines, and cleanup across persisted queue-shard
+placement.

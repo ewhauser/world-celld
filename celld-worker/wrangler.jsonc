@@ -28,6 +28,10 @@
       ],
     },
   ],
+  // Fleet-wide maximum-age retention is discovered hourly. The handler is a
+  // no-op while WORKFLOW_RETENTION_MS is "0". Change this expression if a
+  // different sweep cadence is required; celld cron schedules are UTC.
+  "triggers": { "crons": ["0 * * * *"] },
   "vars": {
     // REQUIRED: bearer secret for the world's RPC and binary stream surface.
     // Authenticated routes fail closed with 503 while this is empty. Inject the real value
@@ -35,6 +39,14 @@
     "WORLD_SECRET": "",
     // Optional: forwarded as x-workflow-callback-secret on queue deliveries.
     "WORKFLOW_CALLBACK_SECRET": "",
+    // Optional fleet-wide maximum workflow age, measured from run creation.
+    // Applies to pending, running, and terminal runs. "0" disables it.
+    "WORKFLOW_RETENTION_MS": "0",
+    // Maximum runs admitted to cleanup by one hourly sweep (1..1000).
+    "WORKFLOW_RETENTION_BATCH_SIZE": "128",
+    // Must match createCelldWorld({ queueShards }) so every queue shard is
+    // included in cleanup for active runs discovered by the sweep.
+    "WORKFLOW_RETENTION_QUEUE_SHARDS": "1",
     // Optional queue tuning (strings): QUEUE_MAX_ATTEMPTS, QUEUE_MAX_INFLIGHT,
     // QUEUE_DELIVERY_TIMEOUT_MS.
   },

@@ -1,4 +1,4 @@
-import type { TerminalWorkflowRunStatus, WorkflowRun } from '@workflow/world';
+import type { TerminalWorkflowRunStatus, WorkflowRun, WorkflowRunStatus } from '@workflow/world';
 
 export const CLEANUP_RECORD_KEY = 'retention:cleanup';
 export const TOMBSTONE_KEY = 'retention:tombstone';
@@ -12,8 +12,13 @@ export interface CleanupRecord {
   runId: string;
   workflowName: string;
   createdAt: Date;
-  completedAt: Date;
-  terminalStatus: TerminalWorkflowRunStatus;
+  /** Last status observed when cleanup was scheduled. */
+  status?: WorkflowRunStatus;
+  /** Present when cleanup was scheduled for a terminal run. */
+  completedAt?: Date;
+  /** Retained for persisted terminal-retention records created before max-age cleanup. */
+  terminalStatus?: TerminalWorkflowRunStatus;
+  reason?: 'terminal-retention' | 'maximum-age' | 'manual';
   dueAt: Date;
   queueShards: number;
   phase: CleanupPhase;
@@ -31,8 +36,10 @@ export interface CleanupRecord {
 export interface RunTombstone {
   version: 1;
   runId: string;
-  terminalStatus: TerminalWorkflowRunStatus;
-  completedAt: Date;
+  /** Last status observed before the run expired. */
+  status?: WorkflowRunStatus;
+  completedAt?: Date;
+  terminalStatus?: TerminalWorkflowRunStatus;
   expiredAt: Date;
   tombstonedAt: Date;
   /** Final cleanup accounting retained inside the single authoritative record. */
@@ -126,6 +133,15 @@ export interface ScheduleCleanupRequest {
   queueShards: number;
 }
 
+export interface EnforceRetentionRequest extends ScheduleCleanupRequest {
+  /** Cron occurrence being enforced. A run is eligible only at/before this time. */
+  scheduledTime: number;
+}
+
+export type EnforceRetentionResult =
+  | { state: 'missing' | 'not-due'; cleanup: null }
+  | { state: 'scheduled' | 'expired'; cleanup: CleanupRecord };
+
 export function sortableTimestamp(date: Date): string {
   return date.getTime().toString().padStart(13, '0');
 }
@@ -153,6 +169,7 @@ export function cleanupTombstone(record: CleanupRecord, now: Date): RunTombstone
   return {
     version: 1,
     runId: record.runId,
+    status: record.status ?? record.terminalStatus,
     terminalStatus: record.terminalStatus,
     completedAt: record.completedAt,
     expiredAt: record.dueAt,

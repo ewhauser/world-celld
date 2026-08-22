@@ -30,6 +30,8 @@ import {
   type CleanupRecord,
   cleanupFromTombstone,
   cleanupTombstone,
+  type EnforceRetentionRequest,
+  type EnforceRetentionResult,
   type ExpireQueueRunResult,
   type ExpireRunStreamsResult,
   type ExpireStreamResult,
@@ -107,7 +109,35 @@ const STREAM_BYTES_PER_CLEANUP_PAGE = 16 * 1024 * 1024;
 const QUEUE_REFERENCES_PER_CLEANUP_PAGE = 64;
 const CLEANUP_RETRY_MAX_MS = 60 * 60 * 1000;
 const CLEANUP_PROGRESS_KEY = 'retention:progress';
+const RUN_QUEUE_SHARDS_KEY = 'retention:queue-shards';
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
+
+function cleanupRecord(
+  run: WorkflowRun,
+  dueAt: Date,
+  queueShards: number,
+  reason: NonNullable<CleanupRecord['reason']>,
+): CleanupRecord {
+  const terminal = isTerminalWorkflowRunStatus(run.status) ? (run as TerminalRun) : undefined;
+  return {
+    version: 1,
+    runId: run.runId,
+    workflowName: run.workflowName,
+    createdAt: run.createdAt,
+    status: run.status,
+    completedAt: terminal?.completedAt,
+    terminalStatus: terminal?.status,
+    reason,
+    dueAt,
+    queueShards,
+    phase: 'retained',
+    generation: 0,
+    attempts: 0,
+    deletedPayloadKeys: 0,
+    deletedStreams: 0,
+    deletedQueueMessages: 0,
+  };
+}
 
 interface CleanupProgress {
   queueShard: number;
@@ -240,6 +270,10 @@ export class WorkflowRunDO extends DurableObject {
       });
       if (!outcome.ok) return outcome;
 
+      if (outcome.runCreated && request.cleanup) {
+        await txn.put(RUN_QUEUE_SHARDS_KEY, request.cleanup.queueShards);
+      }
+
       await txn.put('event_sequence', eventSequence);
       const hookReferences: HookIndexReference[] = outcome.hookToIndex
         ? [
@@ -265,22 +299,12 @@ export class WorkflowRunDO extends DurableObject {
         const terminalRun = outcome.run as TerminalRun;
         const dueAt = new Date(terminalRun.completedAt.getTime() + retentionMs);
         const run = WorkflowRunSchema.parse({ ...terminalRun, expiredAt: dueAt }) as TerminalRun;
-        const cleanup: CleanupRecord = {
-          version: 1,
-          runId: run.runId,
-          workflowName: run.workflowName,
-          createdAt: run.createdAt,
-          completedAt: run.completedAt,
-          terminalStatus: run.status,
+        const cleanup = cleanupRecord(
+          run,
           dueAt,
-          queueShards: request.cleanup?.queueShards ?? 1,
-          phase: 'retained',
-          generation: 0,
-          attempts: 0,
-          deletedPayloadKeys: 0,
-          deletedStreams: 0,
-          deletedQueueMessages: 0,
-        };
+          request.cleanup?.queueShards ?? 1,
+          'terminal-retention',
+        );
         await txn.put('run', run);
         await txn.put(CLEANUP_RECORD_KEY, cleanup);
         await txn.setAlarm(dueAt);
@@ -435,22 +459,7 @@ export class WorkflowRunDO extends DurableObject {
       const terminalRun = current as TerminalRun;
       const dueAt = new Date(terminalRun.completedAt.getTime() + request.retentionMs);
       const run = WorkflowRunSchema.parse({ ...terminalRun, expiredAt: dueAt }) as TerminalRun;
-      const cleanup: CleanupRecord = {
-        version: 1,
-        runId: run.runId,
-        workflowName: run.workflowName,
-        createdAt: run.createdAt,
-        completedAt: run.completedAt,
-        terminalStatus: run.status,
-        dueAt,
-        queueShards: request.queueShards,
-        phase: 'retained',
-        generation: 0,
-        attempts: 0,
-        deletedPayloadKeys: 0,
-        deletedStreams: 0,
-        deletedQueueMessages: 0,
-      };
+      const cleanup = cleanupRecord(run, dueAt, request.queueShards, 'manual');
       await txn.put('run', run);
       await txn.put(CLEANUP_RECORD_KEY, cleanup);
       await txn.setAlarm(
@@ -458,6 +467,98 @@ export class WorkflowRunDO extends DurableObject {
       );
       return cleanup;
     });
+  }
+
+  /**
+   * Apply the fleet-wide maximum-age policy to one authoritative run.
+   *
+   * The catalog is only a discovery index: eligibility is rechecked from the
+   * RunDO's own createdAt. Once eligible, the cleanup deadline immediately
+   * becomes an authoritative write/read fence, including for active runs.
+   */
+  async enforceRetention(request: EnforceRetentionRequest): Promise<EnforceRetentionResult> {
+    if (!Number.isSafeInteger(request.retentionMs) || request.retentionMs <= 0) {
+      throw new Error('world-celld retentionMs must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(request.queueShards) || request.queueShards <= 0) {
+      throw new Error('world-celld retention queueShards must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(request.scheduledTime) || request.scheduledTime < 0) {
+      throw new Error('world-celld retention scheduledTime must be a non-negative safe integer');
+    }
+
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<CleanupRecord | RunTombstone | WorkflowRun | number>([
+        CLEANUP_RECORD_KEY,
+        TOMBSTONE_KEY,
+        RUN_QUEUE_SHARDS_KEY,
+        'run',
+      ]);
+      const tombstone = values.get(TOMBSTONE_KEY) as RunTombstone | undefined;
+      if (tombstone) {
+        return {
+          state: 'expired',
+          cleanup: cleanupFromTombstone(tombstone),
+        } satisfies EnforceRetentionResult;
+      }
+
+      const run = values.get('run') as WorkflowRun | undefined;
+      if (!run) return { state: 'missing', cleanup: null } satisfies EnforceRetentionResult;
+      const dueAtMs = run.createdAt.getTime() + request.retentionMs;
+      if (!Number.isSafeInteger(dueAtMs) || dueAtMs > 8_640_000_000_000_000) {
+        throw new Error(`world-celld retention deadline is out of range for ${run.runId}`);
+      }
+      if (dueAtMs > request.scheduledTime) {
+        return { state: 'not-due', cleanup: null } satisfies EnforceRetentionResult;
+      }
+
+      const dueAt = new Date(dueAtMs);
+      const existing = values.get(CLEANUP_RECORD_KEY) as CleanupRecord | undefined;
+      const storedQueueShards = values.get(RUN_QUEUE_SHARDS_KEY) as number | undefined;
+      const queueShards =
+        Number.isSafeInteger(storedQueueShards) && (storedQueueShards as number) > 0
+          ? (storedQueueShards as number)
+          : request.queueShards;
+      let cleanup = existing;
+      if (!cleanup) {
+        cleanup = cleanupRecord(run, dueAt, queueShards, 'maximum-age');
+        await txn.put('run', WorkflowRunSchema.parse({ ...run, expiredAt: dueAt }));
+        await txn.put(CLEANUP_RECORD_KEY, cleanup);
+      } else if (cleanup.phase === 'retained' && dueAtMs < cleanup.dueAt.getTime()) {
+        const terminal = isTerminalWorkflowRunStatus(run.status) ? (run as TerminalRun) : undefined;
+        cleanup = {
+          ...cleanup,
+          status: run.status,
+          completedAt: terminal?.completedAt,
+          terminalStatus: terminal?.status,
+          reason: 'maximum-age',
+          dueAt,
+          generation: cleanup.generation + 1,
+        };
+        await txn.put('run', WorkflowRunSchema.parse({ ...run, expiredAt: dueAt }));
+        await txn.put(CLEANUP_RECORD_KEY, cleanup);
+      }
+      await txn.setAlarm(this.now() + 1);
+      return {
+        state: cleanup.dueAt.getTime() <= this.now() ? 'expired' : 'scheduled',
+        cleanup,
+      } satisfies EnforceRetentionResult;
+    });
+
+    // Remove the discovery index before returning when possible. The
+    // remaining stream/queue/payload pages continue through the run's alarm.
+    if (result.state === 'scheduled' || result.state === 'expired') {
+      for (let page = 0; page < 2; page++) {
+        const cleanup = await this.ctx.storage.get<CleanupRecord>(CLEANUP_RECORD_KEY);
+        if (cleanup?.phase !== 'retained' && cleanup?.phase !== 'index') break;
+        await this.executeScheduledCleanupPage();
+      }
+      return {
+        ...result,
+        cleanup: (await this.getCleanupStatus()) ?? result.cleanup,
+      };
+    }
+    return result;
   }
 
   async cleanupNow(request: ScheduleCleanupRequest): Promise<CleanupRecord | null> {
@@ -546,7 +647,25 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   private async executeScheduledCleanupPage(): Promise<void> {
-    const terminalCleanup = await this.ctx.storage.get<TerminalCleanupRecord>(TERMINAL_CLEANUP_KEY);
+    const values = await this.ctx.storage.get<CleanupRecord | TerminalCleanupRecord>([
+      CLEANUP_RECORD_KEY,
+      TERMINAL_CLEANUP_KEY,
+    ]);
+    const cleanup = values.get(CLEANUP_RECORD_KEY) as CleanupRecord | undefined;
+    const terminalCleanup = values.get(TERMINAL_CLEANUP_KEY) as TerminalCleanupRecord | undefined;
+
+    // Once retention is due it is the lifecycle authority. Do not make an
+    // expired run wait behind terminal hook/wait disposal; payload cleanup
+    // removes that derivative state later in the same bounded state machine.
+    if (cleanup && cleanup.phase !== 'tombstoned' && cleanup.dueAt.getTime() <= this.now()) {
+      try {
+        await this.executeCleanup(cleanup);
+      } catch (error) {
+        await this.recordCleanupFailure(error, cleanup);
+      }
+      return;
+    }
+
     if (terminalCleanup) {
       try {
         await this.executeTerminalCleanup(terminalCleanup);
@@ -556,7 +675,6 @@ export class WorkflowRunDO extends DurableObject {
       return;
     }
 
-    const cleanup = await this.ctx.storage.get<CleanupRecord>(CLEANUP_RECORD_KEY);
     if (!cleanup || cleanup.phase === 'tombstoned') {
       await this.ctx.storage.deleteAlarm();
       return;

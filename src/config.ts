@@ -76,6 +76,11 @@ export interface ResolvedCelldConfig {
 }
 
 export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
+  const queueShards = config?.queueShards ?? 1;
+  if (!Number.isSafeInteger(queueShards) || queueShards < 1) {
+    throw new Error('world-celld: queueShards must be a positive safe integer');
+  }
+
   const retentionRaw = config?.runRetentionMs ?? process.env.CELLD_RUN_RETENTION_MS ?? 0;
   const runRetentionMs =
     typeof retentionRaw === 'number' ? retentionRaw : Number.parseInt(retentionRaw, 10);
@@ -117,7 +122,7 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
     env: config?.env,
     deploymentId: config?.deploymentId ?? process.env.CELLD_DEPLOYMENT_ID ?? 'celld-default',
     baseUrl: config?.baseUrl,
-    queueShards: config?.queueShards ?? 1,
+    queueShards,
     runRetentionMs,
     streamLongPollMs,
     streamFlushIntervalMs,
