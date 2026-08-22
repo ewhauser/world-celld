@@ -3,6 +3,7 @@ import {
   type CellNamespaceLike,
   type HookIdShardStub,
   type HookTokenShardStub,
+  runCatalogShardName,
   type RunCatalogShardStub,
 } from '../indexes.js';
 import {
@@ -130,7 +131,14 @@ export async function runRetentionSweep(
       candidates.map(async (entry) => {
         const runId = runIdFromCatalogValue(entry.value);
         const run = env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId));
-        return await run.enforceRetention({ retentionMs, queueShards, scheduledTime });
+        const outcome = await run.enforceRetention({ retentionMs, queueShards, scheduledTime });
+        if (outcome.state === 'missing' || outcome.state === 'not-due') {
+          const catalog = env.WORKFLOW_RUN_CATALOG.get(
+            env.WORKFLOW_RUN_CATALOG.idFromName(runCatalogShardName(runId)),
+          );
+          await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
+        }
+        return outcome;
       }),
     );
     for (const outcome of settled) {

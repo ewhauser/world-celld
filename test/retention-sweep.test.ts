@@ -223,12 +223,9 @@ describe('fleet-wide workflow retention sweep', () => {
     const runId = await createRun(world, 'authoritative-cutoff', 'pending');
     const run = await world.runs.get(runId);
     const falseCreatedAt = new Date(run.createdAt.getTime() - 10_000);
-    harness.fleet
-      .cell('run-catalog', runCatalogShardName(runId))
-      .storage.data.set(
-        `runall:${sortableTimestamp(falseCreatedAt)}:${runId}`,
-        JSON.stringify({ runId }),
-      );
+    const falseKey = `runall:${sortableTimestamp(falseCreatedAt)}:${runId}`;
+    const catalog = harness.fleet.cell('run-catalog', runCatalogShardName(runId)).storage.data;
+    catalog.set(falseKey, JSON.stringify({ runId }));
 
     await expect(
       runRetentionSweep(
@@ -241,6 +238,72 @@ describe('fleet-wide workflow retention sweep', () => {
     ).resolves.toMatchObject({ scanned: 1, notDue: 1, expired: 0 });
     await expect(world.runs.get(runId)).resolves.toMatchObject({ status: 'pending' });
     await expect(world.retention.getStatus(runId)).resolves.toBeNull();
+    expect(catalog.has(falseKey)).toBe(false);
+    await expect(
+      runRetentionSweep(
+        harness.fleet.now,
+        sweepEnv(harness, {
+          WORKFLOW_RETENTION_MS: 1_000,
+          WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
+        }),
+      ),
+    ).resolves.toMatchObject({ scanned: 0 });
+  });
+
+  it('advances past a full page of rejected catalog candidates', async () => {
+    harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-sweep-secret',
+      deploymentId: 'retention-sweep-tests',
+    });
+    const expiredRunId = await createRun(world, 'stale-page-expired', 'pending');
+    const expiredRun = await world.runs.get(expiredRunId);
+    harness.fleet.advance(2_000);
+    const youngRunId = await createRun(world, 'stale-page-young', 'pending');
+    const staleEntries = [
+      {
+        runId: youngRunId,
+        key: `runall:${sortableTimestamp(new Date(expiredRun.createdAt.getTime() - 20_000))}:${youngRunId}`,
+      },
+      {
+        runId: 'wrun_missing_retention_candidate',
+        key: `runall:${sortableTimestamp(new Date(expiredRun.createdAt.getTime() - 10_000))}:wrun_missing_retention_candidate`,
+      },
+    ];
+    for (const entry of staleEntries) {
+      harness.fleet
+        .cell('run-catalog', runCatalogShardName(entry.runId))
+        .storage.data.set(entry.key, JSON.stringify({ runId: entry.runId }));
+    }
+    const env = sweepEnv(harness, {
+      WORKFLOW_RETENTION_MS: 1_000,
+      WORKFLOW_RETENTION_BATCH_SIZE: 2,
+      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
+    });
+
+    await expect(runRetentionSweep(harness.fleet.now, env)).resolves.toMatchObject({
+      scanned: 2,
+      expired: 0,
+      missing: 1,
+      notDue: 1,
+    });
+    for (const entry of staleEntries) {
+      expect(
+        harness.fleet
+          .cell('run-catalog', runCatalogShardName(entry.runId))
+          .storage.data.has(entry.key),
+      ).toBe(false);
+    }
+    await expect(runRetentionSweep(harness.fleet.now, env)).resolves.toMatchObject({
+      scanned: 1,
+      expired: 1,
+      missing: 0,
+      notDue: 0,
+    });
+    await expect(world.runs.get(expiredRunId)).rejects.toSatisfy((error) =>
+      RunExpiredError.is(error),
+    );
   });
 
   it('keeps successful progress when one candidate is retried by cron', async () => {

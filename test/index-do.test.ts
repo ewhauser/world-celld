@@ -445,6 +445,33 @@ describe('sharded workflow indexes', () => {
     expect(page.keys).toEqual([]);
   });
 
+  it('compare-deletes a rejected global candidate without fencing later publication', async () => {
+    const value = run(997, 'stale-retention-candidate');
+    const key = globalRunIndexKey(value);
+    const staleMetadata = JSON.stringify({ runId: value.runId, status: 'pending' });
+    const currentMetadata = JSON.stringify({ runId: value.runId, status: 'running' });
+    const publicationExpiresAt = fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS;
+    await indexes.commitRun(value, staleMetadata, publicationExpiresAt);
+    await indexes.commitRun(value, currentMetadata, publicationExpiresAt);
+    const catalog = fleet.namespace('run-catalog').get({
+      toString: () => runCatalogShardName(value.runId),
+    }) as RunCatalogDO;
+
+    await expect(catalog.deleteStaleGlobalRun(value.runId, key, staleMetadata)).resolves.toEqual({
+      deleted: false,
+    });
+    expect(fleet.cell('run-catalog', runCatalogShardName(value.runId)).storage.data.get(key)).toBe(
+      currentMetadata,
+    );
+
+    await expect(catalog.deleteStaleGlobalRun(value.runId, key, currentMetadata)).resolves.toEqual({
+      deleted: true,
+    });
+    expect(await indexes.commitRun(value, currentMetadata, publicationExpiresAt)).toEqual({
+      stored: true,
+    });
+  });
+
   it('compacts abandoned exact claims after the protocol lease and survives restart', async () => {
     const owner = { runId: 'wrun_abandoned_claim', hookId: 'hook-abandoned-claim' };
     const token = 'token-abandoned-claim';
