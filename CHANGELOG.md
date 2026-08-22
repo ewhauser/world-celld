@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.4.0 (2026-08-22)
+
+## What's Changed
+* chore: test against celld v0.3.0 by @ewhauser in https://github.com/ewhauser/world-celld/pull/31
+* feat: add configurable workflow retention by @ewhauser in https://github.com/ewhauser/world-celld/pull/33
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.3.2...v0.4.0
+
 ## 0.3.2 (2026-08-19)
 
 ## What's Changed
