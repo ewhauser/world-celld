@@ -75,8 +75,9 @@ requests. It must be reachable from every celld node.
 
 ## Deploy the worker
 
-Before deploying, you need a celld fleet, `esbuild` on `PATH`, and an object
-store that meets celld's conditional-write requirements. Refer to the
+Before deploying, you need a celld v0.3.0 fleet, `esbuild` on `PATH`, and an
+object store that meets celld's conditional-write requirements. v0.3.0 is the
+currently tested runtime baseline. Refer to the
 [celld documentation](https://github.com/denoland/celld) for fleet and storage
 setup.
 
@@ -265,7 +266,7 @@ message reaches a successful callback, including forced `503` redeliveries. A
 second workload creates terminal runs with streams and delayed queue messages,
 then verifies complete payload cleanup without resurrection. Results include
 queue and cleanup throughput plus p50, p95, p99, and maximum latency and are
-saved under `.perf-results/`.
+saved under `.perf-results/`. The harness currently pins celld v0.3.0.
 
 > MinIO Community is **not a supported celld production store**. It does not
 > implement the conditional writes celld needs for ownership fencing. This
@@ -284,7 +285,7 @@ and force every twentieth message through one `503` redelivery.
 
 #### Reference result
 
-The following directional baseline was recorded on August 15, 2026. MinIO and
+The following directional baseline was recorded on August 21, 2026. MinIO and
 celld ran as native arm64 processes because Docker was unavailable on the test
 machine; container results will differ.
 
@@ -292,20 +293,24 @@ machine; container results will differ.
 | ----------- | -------------------------------------------------------------------------------------------------------- |
 | Machine     | MacBook Pro (Mac15,8), Apple M3 Max, 16 cores (12 performance, 4 efficiency), 64 GB RAM                  |
 | OS          | macOS 26.5.2 (25F84), arm64                                                                              |
-| Services    | celld v0.2.1; MinIO RELEASE.2025-09-07T16-13-09Z                                                         |
+| Services    | celld v0.3.0; MinIO RELEASE.2025-09-07T16-13-09Z                                                         |
 | Workload    | 1,000 messages; concurrency 32; 2 queue shards; 256-byte target payload; every 20th message retried once |
 
 | Metric                  |                                                                            Result |
 | ----------------------- | --------------------------------------------------------------------------------: |
 | Delivery integrity      | 1,000 accepted, 1,000 delivered, 0 missing, 0 duplicate successes, 0 dead letters |
 | Callback attempts       |                                           1,050, including 50 forced redeliveries |
-| Enqueue throughput      |                                                                 882.55 messages/s |
-| Delivery throughput     |                                                                 808.81 messages/s |
-| Enqueue latency         |                          p50 24.37 ms; p95 75.60 ms; p99 176.67 ms; max 200.36 ms |
-| All delivery latency    |                         p50 53.95 ms; p95 167.86 ms; p99 210.84 ms; max 312.03 ms |
-| First-attempt latency   |                         p50 52.55 ms; p95 166.35 ms; p99 209.80 ms; max 212.01 ms |
-| Retried-message latency |                         p50 82.52 ms; p95 262.63 ms; p99 312.03 ms; max 312.03 ms |
+| Enqueue throughput      |                                                                 865.66 messages/s |
+| Delivery throughput     |                                                                 794.60 messages/s |
+| Enqueue latency         |                          p50 26.06 ms; p95 70.72 ms; p99 146.59 ms; max 157.70 ms |
+| All delivery latency    |                         p50 65.05 ms; p95 184.47 ms; p99 225.10 ms; max 328.75 ms |
+| First-attempt latency   |                         p50 63.65 ms; p95 177.93 ms; p99 209.38 ms; max 226.86 ms |
+| Retried-message latency |                        p50 114.81 ms; p95 286.35 ms; p99 328.75 ms; max 328.75 ms |
 | Final queue state       |                         0 pending, 0 in flight, 0 dead letters across both shards |
+
+The retention workload in the same run tombstoned 100 of 100 terminal runs,
+expired all 100 reads, deleted 400 payload keys, 100 streams, and 100 delayed
+queue messages, and left both queue shards empty.
 
 Use these numbers as a smoke-test reference, not a portable performance
 guarantee. For regression tracking, compare repeated runs on the same machine

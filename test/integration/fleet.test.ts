@@ -180,9 +180,11 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     });
     const runId = created.run.runId;
     await w.events.create(runId, { eventType: 'run_started', eventData: {} });
+    const stepId = `step_${randomUUID().slice(0, 8)}#0`;
     await w.events.create(runId, {
       eventType: 'step_created',
-      eventData: { stepId: `step_${randomUUID().slice(0, 8)}#0`, stepName: 's', input: [] },
+      correlationId: stepId,
+      eventData: { stepName: 's', input: [] },
     });
 
     const page1 = await w.events.list({ runId, pagination: { limit: 2, sortOrder: 'asc' } });

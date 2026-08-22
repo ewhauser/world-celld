@@ -19,6 +19,7 @@ celld deploy ./workflow-world --bucket s3://my-cells-bucket
 
 Requirements:
 
+- celld v0.3.0 (the currently tested runtime baseline).
 - `esbuild` on PATH (celld shells out to it).
 - A bucket with conditional-write support (celld's fencing requirement).
 - `WORLD_SECRET` injected at the node level (`CELLD_VAR_WORLD_SECRET=...`) —
