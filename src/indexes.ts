@@ -17,6 +17,8 @@ const HOOK_RELEASE_BATCH = 64;
 export interface IndexListOptions {
   prefix?: string;
   cursor?: string;
+  /** Exclusive upper bound for creation-time retention scans. */
+  end?: string;
   limit?: number;
   reverse?: boolean;
 }
@@ -35,6 +37,11 @@ export interface RunCatalogShardStub {
     publicationExpiresAt: number,
   ): Promise<{ stored: boolean }>;
   list(options?: IndexListOptions): Promise<IndexListPage>;
+  deleteStaleGlobalRun(
+    runId: string,
+    key: string,
+    expectedValue: string,
+  ): Promise<{ deleted: boolean }>;
   expireRun(runId: string, keys: string[], expiredAt: number): Promise<ExpireRunIndexesResult>;
 }
 

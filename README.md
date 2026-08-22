@@ -99,6 +99,7 @@ the same secret to the fleet and the application:
 
 ```sh
 CELLD_VAR_WORLD_SECRET="$CELLD_WORLD_SECRET" \
+CELLD_VAR_WORKFLOW_RETENTION_MS=7776000000 \
 celld --bucket s3://my-cells-bucket \
   --listen 0.0.0.0:8080 \
   --internal-listen 10.0.0.12:8081 \
@@ -108,6 +109,9 @@ celld --bucket s3://my-cells-bucket \
 Use a secret manager rather than putting the value in `wrangler.jsonc`. Keep
 celld's internal listener on a trusted network; the World bearer token protects
 the worker RPC routes, not celld's administrative endpoints.
+
+The example sets a fleet-wide maximum workflow age of 90 days. Leave
+`WORKFLOW_RETENTION_MS` at `0` to disable that policy.
 
 More deployment detail is in [`celld-worker/README.md`](./celld-worker/README.md).
 
@@ -119,6 +123,7 @@ Workflow application
   | authenticated HTTP RPC + binary stream batches
   v
 celld worker router
+  |-- scheduled       hourly maximum-age retention discovery
   |-- WorkflowRunDO  one cell per workflow run
   |-- RunCatalogDO   16 stable run-id shards; merged ordered listing
   |-- HookTokenDO    32 stable token-ownership shards
@@ -175,18 +180,47 @@ variable is shown below.
 
 The deployed worker also accepts these celld variables:
 
-| Variable                    | Default  | Purpose                                              |
-| --------------------------- | -------- | ---------------------------------------------------- |
-| `WORLD_SECRET`              | none     | Required bearer secret for RPC routes                |
-| `WORKFLOW_CALLBACK_SECRET`  | none     | Sent with deliveries as `x-workflow-callback-secret` |
-| `QUEUE_MAX_ATTEMPTS`        | `5`      | Attempts before a message is dead-lettered           |
-| `QUEUE_MAX_INFLIGHT`        | `5`      | Concurrent deliveries per queue cell (maximum `128`) |
-| `QUEUE_DELIVERY_TIMEOUT_MS` | `300000` | Callback timeout (maximum `300000`)                  |
+| Variable                          | Default  | Purpose                                                  |
+| --------------------------------- | -------- | -------------------------------------------------------- |
+| `WORLD_SECRET`                    | none     | Required bearer secret for RPC routes                    |
+| `WORKFLOW_CALLBACK_SECRET`        | none     | Sent with deliveries as `x-workflow-callback-secret`     |
+| `QUEUE_MAX_ATTEMPTS`              | `5`      | Attempts before a message is dead-lettered               |
+| `QUEUE_MAX_INFLIGHT`              | `5`      | Concurrent deliveries per queue cell (maximum `128`)     |
+| `QUEUE_DELIVERY_TIMEOUT_MS`       | `300000` | Callback timeout (maximum `300000`)                      |
+| `WORKFLOW_RETENTION_MS`           | `0`      | Maximum run age from creation; includes active runs      |
+| `WORKFLOW_RETENTION_BATCH_SIZE`   | `128`    | Runs admitted by each cron sweep (maximum `1000`)        |
+| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for runs created before this policy |
 
 `queueShards` is part of queue placement and is pinned when a queue cell is
 first used. Drain pending work before changing it.
 
-## Terminal run retention
+## Workflow retention
+
+### Fleet-wide maximum age
+
+Set the deployed worker's `WORKFLOW_RETENTION_MS` variable to expire every
+workflow after a maximum age measured from `createdAt`. For example,
+`7776000000` is 90 days. This policy applies to pending, running, completed,
+failed, and cancelled runs.
+
+The packaged worker declares an hourly UTC celld cron trigger. Each occurrence
+scans one bounded creation-time catalog page and asks the authoritative run
+cells to enforce the cutoff. A run cell immediately fences reads, writes, stream
+activity, and queue work, removes its catalog entry, then finishes the existing
+bounded stream, queue, and payload cleanup phases through its durable alarm.
+Repeated cron invocations and alarm retries are idempotent.
+
+One occurrence admits at most `WORKFLOW_RETENTION_BATCH_SIZE` runs (default
+`128`, maximum `1000`). If the fleet was down or a shorter policy creates a
+backlog, later occurrences continue with the next oldest entries. Edit
+`triggers.crons` in the copied `celld-worker/wrangler.jsonc` if hourly discovery
+does not provide the desired expiration resolution or catch-up rate.
+
+New runs persist the application's `queueShards` value for complete queue
+cleanup. `WORKFLOW_RETENTION_QUEUE_SHARDS` is the fallback for runs created
+before that metadata existed and must match the placement used by those runs.
+
+### Terminal payload retention
 
 When `runRetentionMs` is greater than zero, a terminal transition atomically
 records the run's `expiredAt` and arms its cell alarm. The complete run, event,
@@ -220,7 +254,8 @@ await world.retention.rearm(runId); // recover a missed or abandoned alarm
 
 The retention deadline is pinned when the run becomes terminal. Changing the
 configuration affects newly terminal runs; call `schedule()` explicitly for
-an existing terminal run that has no cleanup record.
+an existing terminal run that has no cleanup record. If terminal retention and
+fleet-wide maximum age are both enabled, the earlier deadline wins.
 
 ## Operational notes
 

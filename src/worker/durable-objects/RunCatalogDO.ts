@@ -76,8 +76,8 @@ export class RunCatalogDO extends DurableObject {
     const entries = await this.ctx.storage.list<string>({
       prefix: options.prefix ?? '',
       ...(options.reverse
-        ? { reverse: true, end: options.cursor }
-        : { startAfter: options.cursor }),
+        ? { reverse: true, end: options.cursor ?? options.end }
+        : { startAfter: options.cursor, end: options.end }),
       limit: limit + 1,
     });
     const page = Array.from(entries).slice(0, limit);
@@ -87,6 +87,25 @@ export class RunCatalogDO extends DurableObject {
       list_complete: listComplete,
       cursor: listComplete ? undefined : page.at(-1)?.[0],
     };
+  }
+
+  /** Compare-and-delete one rejected retention discovery candidate. */
+  async deleteStaleGlobalRun(
+    runId: string,
+    key: string,
+    expectedValue: string,
+  ): Promise<{ deleted: boolean }> {
+    if (!key.startsWith('runall:') || !key.endsWith(`:${runId}`)) {
+      throw new Error('Stale run catalog deletion requires the exact global run key');
+    }
+    const metadata = JSON.parse(expectedValue) as { runId?: unknown };
+    if (metadata.runId !== runId) {
+      throw new Error('Stale run catalog deletion requires matching run metadata');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      if ((await txn.get<string>(key)) !== expectedValue) return { deleted: false };
+      return { deleted: await txn.delete(key) };
+    });
   }
 
   async expireRun(

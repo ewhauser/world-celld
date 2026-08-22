@@ -57,6 +57,9 @@ export interface WorkerEnv {
   WORKFLOW_HOOK_IDS: DONamespaceLike;
   WORKFLOW_QUEUE: DONamespaceLike;
   WORLD_SECRET?: string;
+  WORKFLOW_RETENTION_MS?: string | number;
+  WORKFLOW_RETENTION_BATCH_SIZE?: string | number;
+  WORKFLOW_RETENTION_QUEUE_SHARDS?: string | number;
 }
 
 function workflowIndex(env: WorkerEnv) {
