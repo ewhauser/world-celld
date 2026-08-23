@@ -10,21 +10,33 @@ import {
   type StreamWriteResult,
 } from '../stream-protocol.js';
 import { FleetTransportError, reconstructError, type WireError } from './errors.js';
-import type { RpcTransport } from './rpc-client.js';
+import { resolveFleetTimeoutMs, type RpcTransport } from './rpc-client.js';
 
 const RETRYABLE_STATUSES = new Set([502, 503, 504]);
 const READ_ATTEMPTS = 3;
-const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_WRITE_RESPONSE_BYTES = 64;
 const MAX_READ_RESPONSE_BYTES = MAX_STREAM_READ_BYTES + 64 * 1024;
 const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
 
-function delayMs(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function delayMs(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  if (signal.aborted) return Promise.reject(aborted(signal));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', onAbort);
+      reject(aborted(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 function requestSignal(timeoutMs: number, signal?: AbortSignal): AbortSignal {
-  const timeout = AbortSignal.timeout(Math.max(1, timeoutMs));
+  const timeout = AbortSignal.timeout(timeoutMs);
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
@@ -90,6 +102,7 @@ export async function writeStreamChunks(
   runId: string,
   chunks: Uint8Array[],
 ): Promise<StreamWriteResult> {
+  const timeoutMs = resolveFleetTimeoutMs(transport);
   const body = encodeStreamWriteBatch(chunks);
   if (body.byteLength > MAX_STREAM_BATCH_BYTES + 1024) {
     throw new Error('world-celld: encoded stream batch exceeds configured limit');
@@ -107,7 +120,7 @@ export async function writeStreamChunks(
         authorization: `Bearer ${transport.secret}`,
       },
       body,
-      signal: requestSignal(transport.timeoutMs ?? DEFAULT_TIMEOUT_MS),
+      signal: requestSignal(timeoutMs),
     });
   } catch (error) {
     throw new FleetTransportError(`world-celld: fleet unreachable at ${url.href}`, error);
@@ -128,6 +141,7 @@ export async function readStreamChunks(
   request: StreamReadRequest,
   signal?: AbortSignal,
 ): Promise<StreamReadResult> {
+  const timeoutMs = resolveFleetTimeoutMs(transport);
   const url = new URL(streamUrl(transport, name));
   url.searchParams.set('runId', request.runId);
   url.searchParams.set('startIndex', String(request.startIndex));
@@ -139,13 +153,13 @@ export async function readStreamChunks(
 
   for (let attempt = 1; attempt <= READ_ATTEMPTS; attempt++) {
     if (signal?.aborted) throw aborted(signal);
-    if (attempt > 1) await delayMs(100 * attempt + Math.random() * 200);
+    if (attempt > 1) await delayMs(100 * attempt + Math.random() * 200, signal);
     let response: Response;
     try {
       response = await doFetch(url, {
         method: 'GET',
         headers: { authorization: `Bearer ${transport.secret}` },
-        signal: requestSignal(transport.timeoutMs ?? DEFAULT_TIMEOUT_MS, signal),
+        signal: requestSignal(timeoutMs, signal),
       });
     } catch (error) {
       if (signal?.aborted) throw aborted(signal);
@@ -153,20 +167,41 @@ export async function readStreamChunks(
       continue;
     }
 
+    if (signal?.aborted) {
+      await response.body?.cancel(aborted(signal)).catch(() => undefined);
+      throw aborted(signal);
+    }
+
     if (response.ok) {
       try {
         return decodeStreamReadResult(await readBoundedResponse(response, MAX_READ_RESPONSE_BYTES));
       } catch (error) {
-        lastError = new FleetTransportError(
-          `world-celld: malformed stream response from ${url.href}`,
-          error,
-        );
+        if (signal?.aborted) throw aborted(signal);
+        lastError =
+          error instanceof FleetTransportError
+            ? error
+            : new FleetTransportError(
+                `world-celld: malformed stream response from ${url.href}`,
+                error,
+              );
         if (attempt < READ_ATTEMPTS) continue;
         throw lastError;
       }
     }
 
-    const error = await errorFromResponse(response);
+    let error: Error;
+    try {
+      error = await errorFromResponse(response);
+    } catch (cause) {
+      if (signal?.aborted) throw aborted(signal);
+      error =
+        cause instanceof FleetTransportError
+          ? cause
+          : new FleetTransportError(
+              `world-celld: malformed stream error response from ${url.href}`,
+              cause,
+            );
+    }
     if (RETRYABLE_STATUSES.has(response.status) && attempt < READ_ATTEMPTS) {
       lastError = error;
       continue;
