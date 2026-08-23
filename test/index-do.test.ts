@@ -13,7 +13,7 @@ import {
   type WorkflowIndex,
 } from '../src/indexes.js';
 import { globalRunIndexKey, workflowRunIndexKey } from '../src/retention.js';
-import { FakeFleet } from '../src/testing/fake-cell.js';
+import { FakeFleet, type FakeStorage } from '../src/testing/fake-cell.js';
 import { stringify } from '../src/vendor/shared/index.js';
 import { HookIdDO } from '../src/worker/durable-objects/HookIdDO.js';
 import { HookTokenDO } from '../src/worker/durable-objects/HookTokenDO.js';
@@ -33,6 +33,28 @@ class TestRunLifecycleDO {
   async getLifecycleStatus(): Promise<RunLifecycleStatus> {
     return (await this.ctx.storage.get<RunLifecycleStatus>('status')) ?? 'active';
   }
+}
+
+// Each live due record contributes two keys, so record 64 starts delete batch two.
+const SECOND_DELETE_CHUNK_RECORD = 64;
+
+function compactionDeleteCalls(storage: FakeStorage) {
+  return storage.operationCalls.filter(({ operation }) => operation === 'delete');
+}
+
+function expectFailedSecondDeleteChunk(storage: FakeStorage, failureKey: string) {
+  const failedDeleteCalls = compactionDeleteCalls(storage);
+  expect(failedDeleteCalls).toHaveLength(2);
+  expect(failedDeleteCalls.map(({ keys }) => keys.length)).toEqual([128, 128]);
+  expect(failedDeleteCalls[0]?.keys).not.toContain(failureKey);
+  expect(failedDeleteCalls[1]?.keys).toContain(failureKey);
+}
+
+function expectBoundedTransactionalCompactionDeletes(storage: FakeStorage) {
+  const deleteCalls = compactionDeleteCalls(storage);
+  expect(deleteCalls.length).toBeGreaterThan(0);
+  expect(deleteCalls.every(({ transactional }) => transactional)).toBe(true);
+  expect(deleteCalls.every(({ keys }) => keys.length <= 128)).toBe(true);
 }
 
 function run(sequence: number, workflowName = 'routing-workflow'): WorkflowRun {
@@ -530,10 +552,9 @@ describe('sharded workflow indexes', () => {
     fleet.advance(HOOK_CLAIM_LEASE_MS);
     cellStorage.resetOperationCounts();
     cellStorage.listCalls.length = 0;
+    const failureKey = `claim:${encodeURIComponent(tokens.toSorted()[SECOND_DELETE_CHUNK_RECORD])}`;
     cellStorage.failNextMutation(
-      (mutation) =>
-        mutation.operation === 'delete' &&
-        mutation.key === `claim:${encodeURIComponent(tokens[0])}`,
+      (mutation) => mutation.operation === 'delete' && mutation.key === failureKey,
       new Error('injected hook-token compaction failure'),
     );
 
@@ -543,6 +564,7 @@ describe('sharded workflow indexes', () => {
         (key) => key.startsWith('claim:') || key.startsWith('claim-deadline:'),
       ),
     ).toHaveLength(600);
+    expectFailedSecondDeleteChunk(cellStorage, failureKey);
     expect(cellStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
 
     fleet.restartCell('hook-tokens', shardName);
@@ -568,11 +590,7 @@ describe('sharded workflow indexes', () => {
         )
         .map(({ resultSize }) => resultSize),
     ).toEqual([129, 129, 129, 44]);
-    expect(
-      cellStorage.operationCalls
-        .filter(({ operation, transactional }) => operation === 'delete' && transactional)
-        .every(({ keys }) => keys.length <= LIFECYCLE_COMPACTION_BATCH),
-    ).toBe(true);
+    expectBoundedTransactionalCompactionDeletes(cellStorage);
   });
 
   it('rolls back hook-ID compaction and drains bounded pages from a persisted retry alarm', async () => {
@@ -593,10 +611,9 @@ describe('sharded workflow indexes', () => {
     fleet.advance(HOOK_CLAIM_LEASE_MS);
     cellStorage.resetOperationCounts();
     cellStorage.listCalls.length = 0;
+    const failureKey = `claim:${encodeURIComponent(hookIds.toSorted()[SECOND_DELETE_CHUNK_RECORD])}`;
     cellStorage.failNextMutation(
-      (mutation) =>
-        mutation.operation === 'delete' &&
-        mutation.key === `claim:${encodeURIComponent(hookIds[0])}`,
+      (mutation) => mutation.operation === 'delete' && mutation.key === failureKey,
       new Error('injected hook-ID compaction failure'),
     );
 
@@ -606,6 +623,7 @@ describe('sharded workflow indexes', () => {
         (key) => key.startsWith('claim:') || key.startsWith('claim-deadline:'),
       ),
     ).toHaveLength(600);
+    expectFailedSecondDeleteChunk(cellStorage, failureKey);
     expect(cellStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
 
     fleet.restartCell('hook-ids', shardName);
@@ -631,11 +649,7 @@ describe('sharded workflow indexes', () => {
         )
         .map(({ resultSize }) => resultSize),
     ).toEqual([129, 129, 129, 44]);
-    expect(
-      cellStorage.operationCalls
-        .filter(({ operation, transactional }) => operation === 'delete' && transactional)
-        .every(({ keys }) => keys.length <= LIFECYCLE_COMPACTION_BATCH),
-    ).toBe(true);
+    expectBoundedTransactionalCompactionDeletes(cellStorage);
   });
 
   it('removes an obsolete token deadline without deleting its newer same-key claim', async () => {
@@ -723,8 +737,8 @@ describe('sharded workflow indexes', () => {
     const catalog = fleet.namespace('run-catalog').get({
       toString: () => shardName,
     }) as RunCatalogDO;
-    for (let index = 0; index < 300; index++) {
-      const runId = `wrun_catalog_compaction_${index}`;
+    const runIds = Array.from({ length: 300 }, (_, index) => `wrun_catalog_compaction_${index}`);
+    for (const runId of runIds) {
       await catalog.expireRun(runId, [`run:${runId}`, `runall:${runId}`], fleet.now);
     }
 
@@ -735,9 +749,9 @@ describe('sharded workflow indexes', () => {
     fleet.advance(CATALOG_FENCE_GRACE_MS);
     catalogStorage.resetOperationCounts();
     catalogStorage.listCalls.length = 0;
+    const failureKey = `expired:${runIds.toSorted()[SECOND_DELETE_CHUNK_RECORD]}`;
     catalogStorage.failNextMutation(
-      (mutation) =>
-        mutation.operation === 'delete' && mutation.key === 'expired:wrun_catalog_compaction_0',
+      (mutation) => mutation.operation === 'delete' && mutation.key === failureKey,
       new Error('injected catalog compaction failure'),
     );
 
@@ -747,6 +761,7 @@ describe('sharded workflow indexes', () => {
         (key) => key.startsWith('expired:') || key.startsWith('expiry-gc:'),
       ),
     ).toHaveLength(600);
+    expectFailedSecondDeleteChunk(catalogStorage, failureKey);
     expect(catalogStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
 
     fleet.restartCell('run-catalog', shardName);
@@ -770,11 +785,7 @@ describe('sharded workflow indexes', () => {
         )
         .map(({ resultSize }) => resultSize),
     ).toEqual([129, 129, 129, 44]);
-    expect(
-      catalogStorage.operationCalls
-        .filter(({ operation, transactional }) => operation === 'delete' && transactional)
-        .every(({ keys }) => keys.length <= LIFECYCLE_COMPACTION_BATCH),
-    ).toBe(true);
+    expectBoundedTransactionalCompactionDeletes(catalogStorage);
   });
 
   it('removes an obsolete catalog GC record without deleting its newer same-key fence', async () => {
