@@ -20,6 +20,12 @@ export interface FakeStorageMutation {
   value?: unknown;
 }
 
+export interface FakeStorageRead {
+  operation: 'get' | 'list';
+  keys?: string[];
+  options?: FakeListOptions;
+}
+
 export interface FakeStorageOperationCounts {
   get: number;
   getMany: number;
@@ -99,6 +105,10 @@ export class FakeStorage {
     predicate: (mutation: FakeStorageMutation) => boolean;
     error: Error;
   };
+  private readFailure?: {
+    predicate: (read: FakeStorageRead) => boolean;
+    error: Error;
+  };
 
   constructor(private clock: () => number = () => Date.now()) {}
 
@@ -109,12 +119,14 @@ export class FakeStorage {
       this.operationCounts.getMany += 1;
       this.getManyCalls.push([...keyOrKeys]);
       this.recordStorageCall('get', keyOrKeys, false);
+      this.maybeFailRead({ operation: 'get', keys: keyOrKeys });
       return new Map(
         keyOrKeys.filter((key) => this.data.has(key)).map((key) => [key, this.data.get(key) as T]),
       );
     }
     this.operationCounts.get += 1;
     this.recordStorageCall('get', [keyOrKeys], false);
+    this.maybeFailRead({ operation: 'get', keys: [keyOrKeys] });
     return this.data.get(keyOrKeys) as T | undefined;
   }
 
@@ -161,6 +173,7 @@ export class FakeStorage {
 
   async list<T>(options: FakeListOptions = {}): Promise<Map<string, T>> {
     this.operationCounts.list += 1;
+    this.maybeFailRead({ operation: 'list', options });
     const keys = applyListOptions(Array.from(this.data.keys()), options);
     this.recordList(options, keys.length, false);
     return new Map(keys.map((k) => [k, this.data.get(k) as T]));
@@ -239,11 +252,27 @@ export class FakeStorage {
     this.mutationFailure = { predicate, error };
   }
 
+  /** Inject one matching storage read failure, including reads inside transactions. */
+  failNextRead(
+    predicate: (read: FakeStorageRead) => boolean,
+    error = new Error('injected fake storage read failure'),
+  ): void {
+    this.readFailure = { predicate, error };
+  }
+
   /** @internal Shared with FakeTransaction so failure injection survives a transaction fix. */
   maybeFailMutation(mutation: FakeStorageMutation): void {
     if (!this.mutationFailure?.predicate(mutation)) return;
     const { error } = this.mutationFailure;
     this.mutationFailure = undefined;
+    throw error;
+  }
+
+  /** @internal Shared with FakeTransaction so read failures model transactional reads too. */
+  maybeFailRead(read: FakeStorageRead): void {
+    if (!this.readFailure?.predicate(read)) return;
+    const { error } = this.readFailure;
+    this.readFailure = undefined;
     throw error;
   }
 
@@ -267,6 +296,7 @@ class FakeTransaction {
       this.storage.recordOperation('getMany');
       this.storage.getManyCalls.push([...keyOrKeys]);
       this.storage.recordStorageCall('get', keyOrKeys, true);
+      this.storage.maybeFailRead({ operation: 'get', keys: keyOrKeys });
       const result = new Map<string, T>();
       for (const key of keyOrKeys) {
         if (this.deleted.has(key)) continue;
@@ -278,6 +308,7 @@ class FakeTransaction {
     this.storage.recordOperation('get');
     const key = keyOrKeys;
     this.storage.recordStorageCall('get', [key], true);
+    this.storage.maybeFailRead({ operation: 'get', keys: [key] });
     if (this.deleted.has(key)) return undefined;
     if (this.staged.has(key)) return this.staged.get(key) as T;
     return this.storage.data.get(key) as T | undefined;
@@ -330,6 +361,7 @@ class FakeTransaction {
 
   async list<T>(options: FakeListOptions = {}): Promise<Map<string, T>> {
     this.storage.recordOperation('list');
+    this.storage.maybeFailRead({ operation: 'list', options });
     const merged = new Map(this.storage.data);
     for (const key of this.deleted) merged.delete(key);
     for (const [key, value] of this.staged) merged.set(key, value);

@@ -75,16 +75,23 @@ describe('StreamDO paged KV cleanup', () => {
       chunks: [],
     });
 
-    expect(storage.listCalls).toHaveLength(5);
+    expect(storage.listCalls).toHaveLength(6);
     expect(
-      storage.listCalls.every(
-        (call) =>
-          call.transactional &&
-          call.options.prefix === 'chunk-size:' &&
-          call.options.limit === 65 &&
-          call.resultSize <= 65,
-      ),
+      storage.listCalls
+        .slice(0, 5)
+        .every(
+          (call) =>
+            call.transactional &&
+            call.options.prefix === 'chunk-size:' &&
+            call.options.limit === 65 &&
+            call.resultSize <= 65,
+        ),
     ).toBe(true);
+    expect(storage.listCalls[5]).toEqual({
+      options: { prefix: 'chunk:', limit: 1 },
+      resultSize: 0,
+      transactional: true,
+    });
     expect(storage.operationCounts.deleteMany).toBe(5);
   });
 
