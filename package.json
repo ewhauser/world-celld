@@ -58,6 +58,7 @@
     "lint": "oxlint --type-aware --deny-warnings --report-unused-disable-directives .",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:integration:celld-smoke": "bash test/integration/celld-smoke/run.sh",
     "test:perf:index": "vitest run --config vitest.index-perf.config.ts",
     "test:perf:index:baseline": "node scripts/measure-index-main-baseline.mjs",
     "test:perf:minio": "bash test/perf/minio/run.sh",

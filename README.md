@@ -293,6 +293,33 @@ CELLD_WORLD_SECRET=replace-with-a-secret \
 pnpm test:integration
 ```
 
+### Real celld restart smoke
+
+The required CI smoke owns native celld v0.3.0 and MinIO processes on loopback,
+uses fresh temporary bucket and runtime state, and kills celld with `SIGKILL`
+before deleting its local working state and starting a new process against the
+bucket-backed state. It checks that:
+
+- acknowledged run and stream state survives the process restart;
+- an accepted delayed queue message that becomes due while celld is down is
+  delivered once after the alarm is restored;
+- multi-page retention cleanup continues from a persisted nonterminal phase;
+- cancelling an in-flight HTTP long poll leaves the stream writable and
+  readable.
+
+Run the same bounded smoke locally on Linux x86-64 or macOS arm64:
+
+```sh
+pnpm test:integration:celld-smoke
+```
+
+The runner downloads celld and MinIO artifacts at pinned versions and verifies
+their SHA-256 digests before use. MinIO does not implement the conditional-write
+contract celld requires for production ownership fencing, so the smoke disables
+the storage probe and runs exactly one celld process at a time. It proves the
+single-process restart boundaries above, not multi-node ownership, handoff, or
+failover correctness.
+
 ### Local MinIO performance and loss test
 
 The opt-in performance harness starts a fresh MinIO bucket and a single celld
