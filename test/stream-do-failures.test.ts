@@ -61,6 +61,7 @@ describe('StreamDO persisted-state failure handling', () => {
       ['overflowed count', { count: 0x80000000, state: 'open' }],
       ['invalid state', { count: 0, state: 'unknown' }],
       ['invalid owner', { count: 0, state: 'open', ownerRunId: 42 }],
+      ['non-boolean payloadDeleted', { count: 0, state: 'expired', payloadDeleted: 'true' }],
     ];
 
     for (const [label, invalid] of invalidMetadata) {
@@ -80,20 +81,26 @@ describe('StreamDO persisted-state failure handling', () => {
     }
   });
 
-  it('rejects errored metadata with a missing or malformed error payload', async () => {
-    const invalidErrors: Array<[string, unknown]> = [
-      ['missing error', undefined],
-      ['empty error', {}],
-      ['non-string error name', { name: 42, message: 'failure' }],
-      ['non-string error message', { name: 'Error', message: null }],
+  it('rejects missing, malformed, and state-inconsistent error payloads', async () => {
+    const invalidErrors: Array<[string, string, unknown]> = [
+      ['missing errored-state error', 'errored', undefined],
+      ['empty errored-state error', 'errored', {}],
+      ['non-string errored-state name', 'errored', { name: 42, message: 'failure' }],
+      ['non-string errored-state message', 'errored', { name: 'Error', message: null }],
+      ['non-string closed-state name', 'closed', { name: 42, message: 'failure' }],
+      ['non-string closed-state message', 'closed', { name: 'Error', message: null }],
+      ['unexpected valid closed-state error', 'closed', { name: 'Error', message: 'failure' }],
+      ['unexpected valid open-state error', 'open', { name: 'Error', message: 'failure' }],
+      ['unexpected valid expired-state error', 'expired', { name: 'Error', message: 'failure' }],
     ];
 
-    for (const [label, error] of invalidErrors) {
+    for (const [label, state, error] of invalidErrors) {
       const { get, storage } = setup(`stream:invalid-error:${label}`);
       storage.data.set(META_KEY, {
         count: 0,
-        state: 'errored',
+        state,
         ownerRunId: RUN_ID,
+        ...(state === 'expired' ? { payloadDeleted: true } : {}),
         ...(error === undefined ? {} : { error }),
       });
 
@@ -243,6 +250,59 @@ describe('StreamDO persisted-state failure handling', () => {
       state: 'expired',
       payloadDeleted: true,
     });
+  });
+
+  it('resumes historically completed cleanup when payloadDeleted still has orphan payloads', async () => {
+    const { fleet, get, name, storage } = setup('stream:historical-orphans');
+    storage.data.set(META_KEY, {
+      count: 0,
+      state: 'expired',
+      ownerRunId: RUN_ID,
+      expiredAt: 123,
+      expiredChunkCount: 2,
+      payloadDeleted: true,
+    });
+    storage.data.set(CHUNK_KEY, Uint8Array.of(1));
+    storage.data.set('chunk:000000000001', Uint8Array.of(2, 3));
+    fleet.restartCell('streams', name);
+
+    await expect(get().expireStream(RUN_ID, 123)).resolves.toEqual({
+      deleted: false,
+      chunks: 1,
+      bytes: 1,
+      done: false,
+    });
+    expect(storage.data.get(META_KEY)).toMatchObject({ payloadDeleted: false });
+    expect(Array.from(storage.data.keys()).filter((key) => key.startsWith('chunk:'))).toEqual([
+      'chunk:000000000001',
+    ]);
+
+    fleet.restartCell('streams', name);
+    await expect(get().expireStream(RUN_ID, 123)).resolves.toEqual({
+      deleted: false,
+      chunks: 1,
+      bytes: 2,
+      done: true,
+    });
+    expect(Array.from(storage.data.keys())).toEqual([META_KEY]);
+    expect(
+      storage.operationCalls
+        .filter((call) => call.operation === 'delete')
+        .map((call) => call.keys.length),
+    ).toEqual([2, 2]);
+
+    const completed = snapshot(storage);
+    storage.resetOperationCounts();
+    fleet.restartCell('streams', name);
+    await expect(get().expireStream(RUN_ID, 123)).resolves.toEqual({
+      deleted: false,
+      chunks: 0,
+      bytes: 0,
+      done: true,
+    });
+    expect(storage.data).toEqual(completed);
+    expect(storage.operationCounts).toMatchObject({ put: 0, putMany: 0, delete: 0, deleteMany: 0 });
+    expect(storage.operationCounts.list).toBe(2);
   });
 
   it('rejects owner mismatches on every stream path without mutation', async () => {

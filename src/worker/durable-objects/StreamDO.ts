@@ -73,16 +73,19 @@ function validateMeta(meta: unknown): StreamMeta {
     candidate.count! < 0 ||
     candidate.count! > MAX_STREAM_INDEX ||
     !['open', 'closed', 'errored', 'expired'].includes(candidate.state as StreamTerminalState) ||
-    (candidate.ownerRunId !== undefined && typeof candidate.ownerRunId !== 'string')
+    (candidate.ownerRunId !== undefined && typeof candidate.ownerRunId !== 'string') ||
+    (candidate.payloadDeleted !== undefined && typeof candidate.payloadDeleted !== 'boolean')
   ) {
     throw new Error('Invalid persisted stream metadata');
   }
+  const error = candidate.error;
   if (
-    candidate.state === 'errored' &&
-    (!candidate.error ||
-      typeof candidate.error !== 'object' ||
-      typeof candidate.error.name !== 'string' ||
-      typeof candidate.error.message !== 'string')
+    (error !== undefined &&
+      (!error ||
+        typeof error !== 'object' ||
+        typeof error.name !== 'string' ||
+        typeof error.message !== 'string')) ||
+    (candidate.state === 'errored') !== (error !== undefined)
   ) {
     throw new Error('Invalid persisted stream error metadata');
   }
@@ -497,12 +500,6 @@ export class StreamDO extends DurableObject {
         const meta = stored === undefined ? emptyMeta() : validateMeta(stored);
         this.assertOwner(meta, runId);
         const firstFence = meta.state !== 'expired';
-        if (meta.state === 'expired' && meta.payloadDeleted) {
-          return {
-            meta,
-            result: { deleted: false, chunks: 0, bytes: 0, done: true },
-          };
-        }
 
         const candidates = await txn.list<number>({
           prefix: CHUNK_SIZE_KEY_PREFIX,
@@ -545,6 +542,12 @@ export class StreamDO extends DurableObject {
           // final staged size-index page; healthy pages return an empty list.
           const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
           done = remaining.size === 0;
+        }
+        if (done && page.length === 0 && meta.state === 'expired' && meta.payloadDeleted) {
+          return {
+            meta,
+            result: { deleted: false, chunks: 0, bytes: 0, done: true },
+          };
         }
         const nextMeta: StreamMeta = {
           ...meta,
