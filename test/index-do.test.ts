@@ -21,6 +21,8 @@ import { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
 import {
   CATALOG_FENCE_GRACE_MS,
   HOOK_CLAIM_LEASE_MS,
+  LIFECYCLE_COMPACTION_BATCH,
+  LIFECYCLE_COMPACTION_RETRY_MS,
   MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
 } from '../src/lifecycle.js';
 import type { RunLifecycleStatus } from '../src/retention.js';
@@ -510,7 +512,213 @@ describe('sharded workflow indexes', () => {
     await expect(indexes.getHookByToken(token)).resolves.toBeNull();
   });
 
-  it('pages catalog compaction so many expired runs leave no derivative markers', async () => {
+  it('rolls back hook-token compaction and drains bounded pages from a persisted retry alarm', async () => {
+    const shardName = 'hook-token:v1:compaction-retry-test';
+    const tokenIndex = fleet.namespace('hook-tokens').get({
+      toString: () => shardName,
+    }) as HookTokenDO;
+    const tokens = Array.from({ length: 300 }, (_, index) => `token-compaction-retry-${index}`);
+    for (const [index, token] of tokens.entries()) {
+      await tokenIndex.reserve(
+        token,
+        { runId: `wrun_token_compaction_${index}`, hookId: `hook-token-compaction-${index}` },
+        `token-claim-${index}`,
+      );
+    }
+
+    const cellStorage = fleet.cell('hook-tokens', shardName).storage;
+    fleet.advance(HOOK_CLAIM_LEASE_MS);
+    cellStorage.resetOperationCounts();
+    cellStorage.listCalls.length = 0;
+    cellStorage.failNextMutation(
+      (mutation) =>
+        mutation.operation === 'delete' &&
+        mutation.key === `claim:${encodeURIComponent(tokens[0])}`,
+      new Error('injected hook-token compaction failure'),
+    );
+
+    await fleet.fireDueAlarms();
+    expect(
+      Array.from(cellStorage.data.keys()).filter(
+        (key) => key.startsWith('claim:') || key.startsWith('claim-deadline:'),
+      ),
+    ).toHaveLength(600);
+    expect(cellStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
+
+    fleet.restartCell('hook-tokens', shardName);
+    expect(cellStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
+    fleet.advance(LIFECYCLE_COMPACTION_RETRY_MS);
+    for (let page = 0; page < 3; page++) {
+      await fleet.fireDueAlarms();
+      fleet.advance(1);
+    }
+
+    expect(
+      Array.from(cellStorage.data.keys()).filter(
+        (key) => key.startsWith('claim:') || key.startsWith('claim-deadline:'),
+      ),
+    ).toEqual([]);
+    expect(cellStorage.alarmAt).toBeNull();
+    expect(
+      cellStorage.listCalls
+        .filter(
+          ({ options }) =>
+            options.prefix === 'claim-deadline:' &&
+            options.limit === LIFECYCLE_COMPACTION_BATCH + 1,
+        )
+        .map(({ resultSize }) => resultSize),
+    ).toEqual([129, 129, 129, 44]);
+    expect(
+      cellStorage.operationCalls
+        .filter(({ operation, transactional }) => operation === 'delete' && transactional)
+        .every(({ keys }) => keys.length <= LIFECYCLE_COMPACTION_BATCH),
+    ).toBe(true);
+  });
+
+  it('rolls back hook-ID compaction and drains bounded pages from a persisted retry alarm', async () => {
+    const shardName = 'hook-id:v1:compaction-retry-test';
+    const hookIdIndex = fleet.namespace('hook-ids').get({
+      toString: () => shardName,
+    }) as HookIdDO;
+    const hookIds = Array.from({ length: 300 }, (_, index) => `hook-compaction-retry-${index}`);
+    for (const [index, hookId] of hookIds.entries()) {
+      await hookIdIndex.reserve(
+        hookId,
+        { runId: `wrun_id_compaction_${index}`, hookId },
+        `id-claim-${index}`,
+      );
+    }
+
+    const cellStorage = fleet.cell('hook-ids', shardName).storage;
+    fleet.advance(HOOK_CLAIM_LEASE_MS);
+    cellStorage.resetOperationCounts();
+    cellStorage.listCalls.length = 0;
+    cellStorage.failNextMutation(
+      (mutation) =>
+        mutation.operation === 'delete' &&
+        mutation.key === `claim:${encodeURIComponent(hookIds[0])}`,
+      new Error('injected hook-ID compaction failure'),
+    );
+
+    await fleet.fireDueAlarms();
+    expect(
+      Array.from(cellStorage.data.keys()).filter(
+        (key) => key.startsWith('claim:') || key.startsWith('claim-deadline:'),
+      ),
+    ).toHaveLength(600);
+    expect(cellStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
+
+    fleet.restartCell('hook-ids', shardName);
+    expect(cellStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
+    fleet.advance(LIFECYCLE_COMPACTION_RETRY_MS);
+    for (let page = 0; page < 3; page++) {
+      await fleet.fireDueAlarms();
+      fleet.advance(1);
+    }
+
+    expect(
+      Array.from(cellStorage.data.keys()).filter(
+        (key) => key.startsWith('claim:') || key.startsWith('claim-deadline:'),
+      ),
+    ).toEqual([]);
+    expect(cellStorage.alarmAt).toBeNull();
+    expect(
+      cellStorage.listCalls
+        .filter(
+          ({ options }) =>
+            options.prefix === 'claim-deadline:' &&
+            options.limit === LIFECYCLE_COMPACTION_BATCH + 1,
+        )
+        .map(({ resultSize }) => resultSize),
+    ).toEqual([129, 129, 129, 44]);
+    expect(
+      cellStorage.operationCalls
+        .filter(({ operation, transactional }) => operation === 'delete' && transactional)
+        .every(({ keys }) => keys.length <= LIFECYCLE_COMPACTION_BATCH),
+    ).toBe(true);
+  });
+
+  it('removes an obsolete token deadline without deleting its newer same-key claim', async () => {
+    const shardName = 'hook-token:v1:stale-deadline-test';
+    const tokenIndex = fleet.namespace('hook-tokens').get({
+      toString: () => shardName,
+    }) as HookTokenDO;
+    const token = 'reused-token-generation';
+    const owner = { runId: 'wrun_reused_token_generation', hookId: 'reused-token-hook' };
+    const claimId = 'reused-token-claim-id';
+    await tokenIndex.reserve(token, owner, claimId);
+
+    const cellStorage = fleet.cell('hook-tokens', shardName).storage;
+    const oldDeadlineKey = Array.from(cellStorage.data.keys()).find((key) =>
+      key.startsWith('claim-deadline:'),
+    );
+    if (!oldDeadlineKey) throw new Error('expected the first token claim deadline');
+    const oldDeadline = cellStorage.data.get(oldDeadlineKey);
+    await tokenIndex.releaseClaim(token, owner, claimId);
+    fleet.advance(1);
+    await tokenIndex.reserve(token, owner, claimId);
+    cellStorage.data.set(oldDeadlineKey, oldDeadline);
+
+    const claimKey = `claim:${encodeURIComponent(token)}`;
+    const currentClaim = cellStorage.data.get(claimKey) as {
+      deadlineKey: string;
+      expiresAt: number;
+    };
+    expect(currentClaim.deadlineKey).not.toBe(oldDeadlineKey);
+    fleet.advance(HOOK_CLAIM_LEASE_MS - 1);
+    await fleet.fireDueAlarms();
+
+    expect(cellStorage.data.has(oldDeadlineKey)).toBe(false);
+    expect(cellStorage.data.get(claimKey)).toEqual(currentClaim);
+    expect(cellStorage.data.has(currentClaim.deadlineKey)).toBe(true);
+    expect(cellStorage.alarmAt).toBe(currentClaim.expiresAt);
+    fleet.advance(1);
+    await fleet.fireDueAlarms();
+    expect(cellStorage.data.has(claimKey)).toBe(false);
+    expect(cellStorage.data.has(currentClaim.deadlineKey)).toBe(false);
+  });
+
+  it('removes an obsolete hook-ID deadline without deleting its newer same-key claim', async () => {
+    const shardName = 'hook-id:v1:stale-deadline-test';
+    const hookIdIndex = fleet.namespace('hook-ids').get({
+      toString: () => shardName,
+    }) as HookIdDO;
+    const hookId = 'reused-hook-id-generation';
+    const owner = { runId: 'wrun_reused_id_generation', hookId };
+    const claimId = 'reused-id-claim-id';
+    await hookIdIndex.reserve(hookId, owner, claimId);
+
+    const cellStorage = fleet.cell('hook-ids', shardName).storage;
+    const oldDeadlineKey = Array.from(cellStorage.data.keys()).find((key) =>
+      key.startsWith('claim-deadline:'),
+    );
+    if (!oldDeadlineKey) throw new Error('expected the first hook-ID claim deadline');
+    const oldDeadline = cellStorage.data.get(oldDeadlineKey);
+    await hookIdIndex.releaseClaim(hookId, owner, claimId);
+    fleet.advance(1);
+    await hookIdIndex.reserve(hookId, owner, claimId);
+    cellStorage.data.set(oldDeadlineKey, oldDeadline);
+
+    const claimKey = `claim:${encodeURIComponent(hookId)}`;
+    const currentClaim = cellStorage.data.get(claimKey) as {
+      deadlineKey: string;
+      expiresAt: number;
+    };
+    expect(currentClaim.deadlineKey).not.toBe(oldDeadlineKey);
+    fleet.advance(HOOK_CLAIM_LEASE_MS - 1);
+    await fleet.fireDueAlarms();
+
+    expect(cellStorage.data.has(oldDeadlineKey)).toBe(false);
+    expect(cellStorage.data.get(claimKey)).toEqual(currentClaim);
+    expect(cellStorage.data.has(currentClaim.deadlineKey)).toBe(true);
+    expect(cellStorage.alarmAt).toBe(currentClaim.expiresAt);
+    fleet.advance(1);
+    await fleet.fireDueAlarms();
+    expect(cellStorage.data.has(claimKey)).toBe(false);
+    expect(cellStorage.data.has(currentClaim.deadlineKey)).toBe(false);
+  });
+
+  it('rolls back catalog compaction and drains bounded pages from a persisted retry alarm', async () => {
     const shardName = 'run-catalog:v1:compaction-test';
     const catalog = fleet.namespace('run-catalog').get({
       toString: () => shardName,
@@ -525,6 +733,25 @@ describe('sharded workflow indexes', () => {
       Array.from(catalogStorage.data.keys()).filter((key) => key.startsWith('expired:')),
     ).toHaveLength(300);
     fleet.advance(CATALOG_FENCE_GRACE_MS);
+    catalogStorage.resetOperationCounts();
+    catalogStorage.listCalls.length = 0;
+    catalogStorage.failNextMutation(
+      (mutation) =>
+        mutation.operation === 'delete' && mutation.key === 'expired:wrun_catalog_compaction_0',
+      new Error('injected catalog compaction failure'),
+    );
+
+    await fleet.fireDueAlarms();
+    expect(
+      Array.from(catalogStorage.data.keys()).filter(
+        (key) => key.startsWith('expired:') || key.startsWith('expiry-gc:'),
+      ),
+    ).toHaveLength(600);
+    expect(catalogStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
+
+    fleet.restartCell('run-catalog', shardName);
+    expect(catalogStorage.alarmAt).toBe(fleet.now + LIFECYCLE_COMPACTION_RETRY_MS);
+    fleet.advance(LIFECYCLE_COMPACTION_RETRY_MS);
     for (let page = 0; page < 3; page++) {
       await fleet.fireDueAlarms();
       fleet.advance(1);
@@ -534,5 +761,57 @@ describe('sharded workflow indexes', () => {
         (key) => key.startsWith('expired:') || key.startsWith('expiry-gc:'),
       ),
     ).toEqual([]);
+    expect(catalogStorage.alarmAt).toBeNull();
+    expect(
+      catalogStorage.listCalls
+        .filter(
+          ({ options }) =>
+            options.prefix === 'expiry-gc:' && options.limit === LIFECYCLE_COMPACTION_BATCH + 1,
+        )
+        .map(({ resultSize }) => resultSize),
+    ).toEqual([129, 129, 129, 44]);
+    expect(
+      catalogStorage.operationCalls
+        .filter(({ operation, transactional }) => operation === 'delete' && transactional)
+        .every(({ keys }) => keys.length <= LIFECYCLE_COMPACTION_BATCH),
+    ).toBe(true);
+  });
+
+  it('removes an obsolete catalog GC record without deleting its newer same-key fence', async () => {
+    const shardName = 'run-catalog:v1:stale-gc-test';
+    const catalog = fleet.namespace('run-catalog').get({
+      toString: () => shardName,
+    }) as RunCatalogDO;
+    const runId = 'wrun_reused_catalog_generation';
+    await catalog.expireRun(runId, [`run:${runId}`, `runall:${runId}`], fleet.now);
+
+    const catalogStorage = fleet.cell('run-catalog', shardName).storage;
+    const markerKey = `expired:${runId}`;
+    const oldGcKey = Array.from(catalogStorage.data.keys()).find((key) =>
+      key.startsWith('expiry-gc:'),
+    );
+    if (!oldGcKey) throw new Error('expected the first catalog GC record');
+    const oldGc = catalogStorage.data.get(oldGcKey);
+    catalogStorage.data.delete(markerKey);
+    fleet.advance(1);
+    await catalog.expireRun(runId, [`run:${runId}`, `runall:${runId}`], fleet.now);
+    catalogStorage.data.set(oldGcKey, oldGc);
+
+    const currentFence = catalogStorage.data.get(markerKey) as { compactAt: number };
+    const currentGcKey = Array.from(catalogStorage.data.keys()).find(
+      (key) => key.startsWith('expiry-gc:') && key !== oldGcKey,
+    );
+    if (!currentGcKey) throw new Error('expected the newer catalog GC record');
+    fleet.advance(CATALOG_FENCE_GRACE_MS - 1);
+    await fleet.fireDueAlarms();
+
+    expect(catalogStorage.data.has(oldGcKey)).toBe(false);
+    expect(catalogStorage.data.get(markerKey)).toEqual(currentFence);
+    expect(catalogStorage.data.has(currentGcKey)).toBe(true);
+    expect(catalogStorage.alarmAt).toBe(currentFence.compactAt);
+    fleet.advance(1);
+    await fleet.fireDueAlarms();
+    expect(catalogStorage.data.has(markerKey)).toBe(false);
+    expect(catalogStorage.data.has(currentGcKey)).toBe(false);
   });
 });
