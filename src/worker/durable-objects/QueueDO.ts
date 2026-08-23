@@ -6,6 +6,17 @@ import type {
   QueueExpiryReceipt,
 } from '../../retention.js';
 import type { RunLifecycleStatus } from '../../retention.js';
+import { parse } from '../../vendor/shared/index.js';
+import {
+  boundedIntegerOption,
+  isNonNegativeSafeInteger,
+  isPositiveSafeInteger,
+  isRecord,
+  isValidQueueDelaySeconds,
+  MAX_QUEUE_SHARDS,
+  queueDelayDeadline,
+  strictIntegerSetting,
+} from '../../validation.js';
 import {
   LIFECYCLE_COMPACTION_BATCH,
   LIFECYCLE_COMPACTION_RETRY_MS,
@@ -116,6 +127,7 @@ const EXPIRED_INFLIGHT_BATCH = 128;
 const STORAGE_BATCH_SIZE = 128;
 const EXPIRE_RUN_REFERENCE_BATCH = 64;
 const PURGE_DEAD_LETTER_BATCH = 128;
+const MAX_DEAD_LETTER_LIST_SIZE = 1000;
 
 const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
 const EXPIRED_RUN_GC_PREFIX = 'expired-run-gc:';
@@ -153,9 +165,51 @@ function expiredRunGcKey(runId: string, compactAt: number): string {
   return `${EXPIRED_RUN_GC_PREFIX}${pad(compactAt)}:${encodeURIComponent(runId)}`;
 }
 
-function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
-  if (value === undefined || !Number.isFinite(value)) return fallback;
-  return Math.max(1, Math.min(maximum, Math.floor(value)));
+function validateEnqueueRequest(request: unknown): asserts request is EnqueueRequest {
+  if (!isRecord(request)) throw new Error('world-celld queue enqueue request must be an object');
+  for (const field of ['messageId', 'queueName', 'body'] as const) {
+    if (typeof request[field] !== 'string' || request[field].length === 0) {
+      throw new Error(`world-celld queue enqueue ${field} must be a non-empty string`);
+    }
+  }
+  if (request.pathname !== 'flow') {
+    throw new Error('world-celld queue enqueue pathname must be flow');
+  }
+  if (
+    !isRecord(request.config) ||
+    typeof request.config.targetBaseUrl !== 'string' ||
+    request.config.targetBaseUrl.length === 0
+  ) {
+    throw new Error('world-celld queue enqueue config is invalid');
+  }
+  if (
+    !isPositiveSafeInteger(request.config.queueShards) ||
+    request.config.queueShards > MAX_QUEUE_SHARDS
+  ) {
+    throw new Error(
+      `world-celld queue enqueue queueShards must be between 1 and ${MAX_QUEUE_SHARDS}`,
+    );
+  }
+  if (request.delaySeconds !== undefined && !isValidQueueDelaySeconds(request.delaySeconds)) {
+    throw new Error('world-celld queue enqueue delaySeconds is out of range');
+  }
+  if (
+    request.runId !== undefined &&
+    (typeof request.runId !== 'string' || request.runId.length === 0)
+  ) {
+    throw new Error('world-celld queue enqueue runId must be a non-empty string');
+  }
+  if (
+    request.idempotencyKey !== undefined &&
+    (typeof request.idempotencyKey !== 'string' || request.idempotencyKey.length === 0)
+  ) {
+    throw new Error('world-celld queue enqueue idempotencyKey must be a non-empty string');
+  }
+  try {
+    if (!isRecord(parse(request.body as string))) throw new SyntaxError('payload is not an object');
+  } catch {
+    throw new Error('world-celld queue enqueue body must be valid tagged JSON');
+  }
 }
 
 async function getMany<T>(
@@ -234,8 +288,11 @@ export class QueueDO extends DurableObject {
     fallback: number,
   ): number {
     const raw = (this.env as QueueCellEnv)?.[name];
-    const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    return strictIntegerSetting(name, raw, fallback, 1);
+  }
+
+  #maxAttempts(): number {
+    return this.#intVar('QUEUE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS);
   }
 
   #maxInflight(): number {
@@ -252,6 +309,12 @@ export class QueueDO extends DurableObject {
       throw new Error(`QUEUE_DELIVERY_TIMEOUT_MS must be at most ${MAX_QUEUE_DELIVERY_TIMEOUT_MS}`);
     }
     return configured;
+  }
+
+  #validateRuntimeConfig(): void {
+    this.#maxAttempts();
+    this.#maxInflight();
+    this.#deliveryTimeoutMs();
   }
 
   async #authoritativeRunExpired(runId: string): Promise<boolean> {
@@ -280,10 +343,14 @@ export class QueueDO extends DurableObject {
   }
 
   async enqueue(request: EnqueueRequest): Promise<EnqueueOutcome> {
-    this.#maxInflight();
-    this.#deliveryTimeoutMs();
+    this.#validateRuntimeConfig();
+    validateEnqueueRequest(request);
     const storage = this.ctx.storage;
     const now = this.#now();
+    const dueAt = queueDelayDeadline(now, request.delaySeconds ?? 0);
+    if (dueAt === null) {
+      throw new Error('world-celld queue enqueue delaySeconds produces an invalid deadline');
+    }
 
     const persist = async (txn: DurableObjectTransaction): Promise<EnqueueOutcome> => {
       // Pin the shard count from the first enqueue and reject drift loudly:
@@ -330,7 +397,6 @@ export class QueueDO extends DurableObject {
         attempt: 0,
         enqueuedAt: now,
       };
-      const dueAt = now + Math.max(0, request.delaySeconds ?? 0) * 1000;
       const scheduleKey = dueKey(dueAt, row.messageId);
       await txn.put(`msg:${row.messageId}`, row);
       await txn.put(scheduleKey, row.messageId);
@@ -362,6 +428,7 @@ export class QueueDO extends DurableObject {
   }
 
   async alarm(): Promise<void> {
+    this.#validateRuntimeConfig();
     // celld#144: alarm handlers can overlap while awaiting. The storage-only
     // claim phase runs under the input gate; a failure is carried out and
     // rethrown outside so a failed critical section cannot reset the cell.
@@ -544,12 +611,13 @@ export class QueueDO extends DurableObject {
       } catch {
         timeoutSeconds = undefined;
       }
-      if (typeof timeoutSeconds === 'number') {
+      const redeliveryAt = queueDelayDeadline(now, timeoutSeconds, 1);
+      if (redeliveryAt !== null) {
         const reschedule = async (txn: DurableObjectTransaction) => {
           // Deleting the exact deadline key doubles as a lease-token check. A
           // late response from an expired claim must not mutate a newer claim.
           if (!(await txn.delete(claimKey))) return;
-          const scheduleKey = dueKey(now + timeoutSeconds * 1000, row.messageId);
+          const scheduleKey = dueKey(redeliveryAt, row.messageId);
           await txn.put(scheduleKey, row.messageId);
           if (row.runId) {
             await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
@@ -623,7 +691,7 @@ export class QueueDO extends DurableObject {
   async #retry(row: MessageRow, claimKey: string, reason: string): Promise<void> {
     const storage = this.ctx.storage;
     const now = this.#now();
-    const maxAttempts = this.#intVar('QUEUE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS);
+    const maxAttempts = this.#maxAttempts();
     const attempt = row.attempt + 1;
 
     const persistRetry = async (txn: DurableObjectTransaction) => {
@@ -768,7 +836,19 @@ export class QueueDO extends DurableObject {
     limit?: number;
     cursor?: string;
   }): Promise<{ data: DeadLetterRow[]; cursor: string | null; hasMore: boolean }> {
-    const limit = params?.limit ?? 100;
+    if (params !== undefined && !isRecord(params)) {
+      throw new Error('world-celld queue dead-letter list options must be an object');
+    }
+    const limit = boundedIntegerOption(
+      'world-celld queue dead-letter limit',
+      params?.limit,
+      100,
+      1,
+      MAX_DEAD_LETTER_LIST_SIZE,
+    );
+    if (params?.cursor !== undefined && typeof params.cursor !== 'string') {
+      throw new Error('world-celld queue dead-letter cursor must be a string');
+    }
     const entries = await this.ctx.storage.list<DeadLetterRow>({
       prefix: 'dlq:',
       startAfter: params?.cursor,
@@ -786,6 +866,9 @@ export class QueueDO extends DurableObject {
 
   /** Move a dead letter back to the live queue (attempt count reset). */
   async redriveDeadLetter(messageId: string): Promise<{ ok: boolean }> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new Error('world-celld queue redrive messageId must be a non-empty string');
+    }
     const storage = this.ctx.storage;
     const now = this.#now();
     const found = Array.from(await storage.list<DeadLetterRow>({ prefix: 'dlq:' })).find(
@@ -872,10 +955,21 @@ export class QueueDO extends DurableObject {
     expiredAt: number,
     options?: { limit?: number },
   ): Promise<ExpireQueueRunResult> {
+    if (typeof runId !== 'string' || runId.length === 0) {
+      throw new Error('world-celld queue expiry runId must be a non-empty string');
+    }
+    if (!isNonNegativeSafeInteger(expiredAt)) {
+      throw new Error('world-celld queue expiry expiredAt must be a non-negative safe integer');
+    }
+    if (options !== undefined && !isRecord(options)) {
+      throw new Error('world-celld queue expiry options must be an object');
+    }
     const storage = this.ctx.storage;
-    const limit = boundedLimit(
+    const limit = boundedIntegerOption(
+      'world-celld queue expiry limit',
       options?.limit,
       EXPIRE_RUN_REFERENCE_BATCH,
+      1,
       EXPIRE_RUN_REFERENCE_BATCH,
     );
     return await storage.transaction(async (txn) => {
@@ -924,6 +1018,16 @@ export class QueueDO extends DurableObject {
     runId: string,
     receipt: QueueExpiryReceipt,
   ): Promise<AcknowledgeQueueExpiryResult> {
+    if (typeof runId !== 'string' || runId.length === 0) {
+      throw new Error('world-celld queue expiry runId must be a non-empty string');
+    }
+    if (
+      !isRecord(receipt) ||
+      !isNonNegativeSafeInteger(receipt.expiredAt) ||
+      !isNonNegativeSafeInteger(receipt.deleted)
+    ) {
+      throw new Error('world-celld queue expiry receipt is invalid');
+    }
     return await this.ctx.storage.transaction(async (txn) => {
       const key = expiredRunKey(runId);
       const marker = await txn.get<ExpiredRunFence>(key);

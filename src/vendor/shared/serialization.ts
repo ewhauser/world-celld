@@ -68,12 +68,23 @@ export function uint8ArrayReviver(key: string, value: unknown): unknown {
   if (value && typeof value === 'object') {
     const obj = value as Record<string, unknown>;
     // New format: base64-encoded
-    if (obj.__type === 'Uint8Array' && typeof obj.data === 'string') {
-      return b64decode(obj.data);
+    if (obj.__type === 'Uint8Array') {
+      if (typeof obj.data !== 'string') throw new SyntaxError('Malformed Uint8Array tag');
+      try {
+        return b64decode(obj.data);
+      } catch {
+        throw new SyntaxError('Malformed Uint8Array tag');
+      }
     }
     // Legacy format: number array (backwards compat with NATS JetStream data)
-    if (obj.__uint8array === true && Array.isArray(obj.data)) {
-      return new Uint8Array(obj.data as number[]);
+    if (obj.__uint8array === true) {
+      if (
+        !Array.isArray(obj.data) ||
+        !obj.data.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255)
+      ) {
+        throw new SyntaxError('Malformed legacy Uint8Array tag');
+      }
+      return new Uint8Array(obj.data);
     }
   }
   return dateReviver(key, value);

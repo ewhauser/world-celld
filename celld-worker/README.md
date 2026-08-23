@@ -42,9 +42,10 @@ well as terminal ones. Each cron occurrence admits at most
 state machine finishes bounded index, stream, queue, and payload cleanup.
 
 New runs persist the application's `queueShards` placement. Set
-`WORKFLOW_RETENTION_QUEUE_SHARDS` to the historical queue-shard count when
-cleaning runs created before this worker version. Edit `triggers.crons` in the
-copied config if hourly discovery is not the desired resolution.
+`WORKFLOW_RETENTION_QUEUE_SHARDS` (maximum `128`) to the historical queue-shard
+count when cleaning runs created before this worker version. Edit
+`triggers.crons` in the copied config if hourly discovery is not the desired
+resolution.
 
 Point the app at any node's public listener:
 

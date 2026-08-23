@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createQueue, shardFor } from '../src/queue.js';
 import { parse, stringify } from '../src/vendor/shared/index.js';
 import { clearMockData, createMockEnv, recordedEnqueues } from '../src/test-mocks.js';
+import { MAX_QUEUE_DELAY_SECONDS, MAX_QUEUE_SHARDS } from '../src/validation.js';
 
 function vqsRequest(
   message: unknown,
@@ -21,7 +22,7 @@ function vqsRequest(
 ): Request {
   return new Request('http://localhost', {
     method: 'POST',
-    headers,
+    headers: { 'content-type': 'application/json', ...headers },
     body: stringify(message),
   });
 }
@@ -45,6 +46,34 @@ describe('Queue (celld QueueDO integration)', () => {
     process.env.NODE_ENV = originalNodeEnv;
     vi.unstubAllGlobals();
     vi.clearAllMocks();
+  });
+
+  it.each([
+    ['queueShards', 0],
+    ['queueShards', MAX_QUEUE_SHARDS + 1],
+    ['httpTimeoutMs', 0],
+    ['httpTimeoutMs', 300_001],
+    ['maxAttempts', 0],
+    ['backoffDelayMs', -1],
+    ['backoffDelayMs', 1.5],
+    ['backoffDelayMs', 60_001],
+  ] as const)('rejects invalid queue option %s=%s', (name, value) => {
+    expect(() =>
+      createQueue({
+        env: { WORKFLOW_QUEUE: mockEnv.WORKFLOW_QUEUE },
+        deploymentId: 'test-deployment',
+        [name]: value,
+      }),
+    ).toThrow(name);
+  });
+
+  it('requires the queue binding before constructing the queue', () => {
+    expect(() =>
+      createQueue({
+        env: {} as { WORKFLOW_QUEUE: typeof mockEnv.WORKFLOW_QUEUE },
+        deploymentId: 'test-deployment',
+      }),
+    ).toThrow(/missing WORKFLOW_QUEUE/);
   });
 
   describe('queue() - Production Mode', () => {
@@ -94,6 +123,16 @@ describe('Queue (celld QueueDO integration)', () => {
       await queue.queue('__wkf_workflow_test', {}, { delaySeconds: 42 });
       expect(recordedEnqueues[0].delaySeconds).toBe(42);
     });
+
+    it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_QUEUE_DELAY_SECONDS + 1])(
+      'rejects invalid delaySeconds %s before enqueue',
+      async (delaySeconds) => {
+        await expect(queue.queue('__wkf_workflow_test', {}, { delaySeconds })).rejects.toThrow(
+          /delaySeconds/,
+        );
+        expect(recordedEnqueues).toHaveLength(0);
+      },
+    );
 
     it('should generate unique monotonic message IDs', async () => {
       const first = await queue.queue('__wkf_workflow_test', {});
@@ -284,6 +323,52 @@ describe('Queue (celld QueueDO integration)', () => {
       );
     });
 
+    it.each(['0', '-1', '1.5', '5junk', 'Infinity', '9007199254740992'])(
+      'rejects malformed attempt header %j without invoking the handler',
+      async (attempt) => {
+        const handler = vi.fn<QueueMessageHandler>();
+        const queueHandler = queue.createQueueHandler('workflow:', handler);
+        const response = await queueHandler(
+          vqsRequest(
+            { data: 'test' },
+            {
+              'x-vqs-queue-name': 'workflow:test-queue',
+              'x-vqs-message-id': 'msg_test',
+              'x-vqs-message-attempt': attempt,
+            },
+          ),
+        );
+        expect(response.status).toBe(400);
+        expect(handler).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      '{',
+      'null',
+      '[]',
+      '{"data":{"__type":"Uint8Array"}}',
+      '{"data":{"__type":"Uint8Array","data":"not base64!"}}',
+      '{"data":{"__uint8array":true,"data":[0,256]}}',
+    ])('rejects malformed tagged JSON without invoking the handler', async (body) => {
+      const handler = vi.fn<QueueMessageHandler>();
+      const queueHandler = queue.createQueueHandler('workflow:', handler);
+      const response = await queueHandler(
+        new Request('http://localhost', {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'x-vqs-queue-name': 'workflow:test-queue',
+            'x-vqs-message-id': 'msg_test',
+            'x-vqs-message-attempt': '1',
+          },
+          body,
+        }),
+      );
+      expect(response.status).toBe(422);
+      expect(handler).not.toHaveBeenCalled();
+    });
+
     it('should signal redelivery when the handler returns timeoutSeconds', async () => {
       const handler = vi.fn<QueueMessageHandler>().mockResolvedValue({ timeoutSeconds: 30 });
       const queueHandler = queue.createQueueHandler('workflow:', handler);
@@ -294,6 +379,38 @@ describe('Queue (celld QueueDO integration)', () => {
       expect(response.headers.get('Retry-After')).toBe('30');
       const body = await response.json();
       expect(body.timeoutSeconds).toBe(30);
+    });
+
+    it.each([-1, 0, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_QUEUE_DELAY_SECONDS + 1])(
+      'rejects invalid handler timeoutSeconds %s as a transient failure',
+      async (timeoutSeconds) => {
+        const handler = vi.fn<QueueMessageHandler>().mockResolvedValue({ timeoutSeconds });
+        const queueHandler = queue.createQueueHandler('workflow:', handler);
+        const response = await queueHandler(vqsRequest({ data: 'test' }));
+        expect(response.status).toBe(500);
+        expect(response.headers.get('Retry-After')).toBe('2');
+      },
+    );
+
+    it('rejects the wrong method and content type before invoking the handler', async () => {
+      const handler = vi.fn<QueueMessageHandler>();
+      const queueHandler = queue.createQueueHandler('workflow:', handler);
+      const getResponse = await queueHandler(
+        new Request('http://localhost', {
+          method: 'GET',
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+      expect(getResponse.status).toBe(405);
+      const contentTypeResponse = await queueHandler(
+        new Request('http://localhost', {
+          method: 'POST',
+          headers: { 'content-type': 'text/plain' },
+          body: '{}',
+        }),
+      );
+      expect(contentTypeResponse.status).toBe(415);
+      expect(handler).not.toHaveBeenCalled();
     });
 
     it('should surface permanent errors with their own status', async () => {
@@ -345,7 +462,11 @@ describe('Queue (celld QueueDO integration)', () => {
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const response = await queueHandler(
-        new Request('http://localhost', { method: 'POST', body: stringify({ data: 'x' }) }),
+        new Request('http://localhost', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: stringify({ data: 'x' }),
+        }),
       );
 
       expect(response.status).toBe(400);
@@ -383,6 +504,10 @@ describe('Queue (celld QueueDO integration)', () => {
         expect(shard).toBeLessThan(8);
       }
       expect(shardFor('anything', 1)).toBe(0);
+    });
+
+    it.each([0, 1.5, MAX_QUEUE_SHARDS + 1])('rejects an invalid shard count %s', (shards) => {
+      expect(() => shardFor('anything', shards)).toThrow(/queueShards/);
     });
   });
 });

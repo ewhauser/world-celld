@@ -11,6 +11,7 @@ import {
   type EnforceRetentionRequest,
   type EnforceRetentionResult,
 } from '../retention.js';
+import { isRecord, MAX_QUEUE_SHARDS, strictIntegerSetting } from '../validation.js';
 
 export const DEFAULT_RETENTION_SWEEP_BATCH_SIZE = 128;
 export const MAX_RETENTION_SWEEP_BATCH_SIZE = 1000;
@@ -43,28 +44,38 @@ export interface RetentionSweepResult {
   expired: number;
   missing: number;
   notDue: number;
+  invalid: number;
 }
 
-function integerSetting(
-  name: string,
-  raw: string | number | undefined,
-  fallback: number,
-  minimum: number,
-  maximum = Number.MAX_SAFE_INTEGER,
-): number {
-  const value = raw === undefined || raw === '' ? fallback : Number(raw);
-  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
-    throw new Error(`world-celld: ${name} must be an integer between ${minimum} and ${maximum}`);
+function requireNamespace<T>(
+  name: keyof Pick<
+    RetentionSweepEnv,
+    'WORKFLOW_DB' | 'WORKFLOW_RUN_CATALOG' | 'WORKFLOW_HOOK_TOKENS' | 'WORKFLOW_HOOK_IDS'
+  >,
+  namespace: RetentionNamespace<T> | undefined,
+): RetentionNamespace<T> {
+  if (
+    !namespace ||
+    typeof namespace.idFromName !== 'function' ||
+    typeof namespace.get !== 'function'
+  ) {
+    throw new Error(`world-celld retention sweep missing binding ${name}`);
   }
-  return value;
+  return namespace;
 }
 
-function runIdFromCatalogValue(value: string): string {
-  const parsed = JSON.parse(value) as { runId?: unknown };
-  if (typeof parsed.runId !== 'string' || parsed.runId.length === 0) {
-    throw new Error('world-celld: run catalog entry has no runId');
+function catalogCandidate(name: string, value: string): { runId: string; invalid: boolean } {
+  const keyMatch = /^runall:\d{13}:(.+)$/.exec(name);
+  if (!keyMatch?.[1]) {
+    throw new Error('world-celld: run catalog entry has an invalid global key');
   }
-  return parsed.runId;
+  const runId = keyMatch[1];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return { runId, invalid: !isRecord(parsed) || parsed.runId !== runId };
+  } catch {
+    return { runId, invalid: true };
+  }
 }
 
 /**
@@ -78,7 +89,12 @@ export async function runRetentionSweep(
   if (!Number.isSafeInteger(scheduledTime) || scheduledTime < 0) {
     throw new Error('world-celld: scheduledTime must be a non-negative safe integer');
   }
-  const retentionMs = integerSetting('WORKFLOW_RETENTION_MS', env.WORKFLOW_RETENTION_MS, 0, 0);
+  const retentionMs = strictIntegerSetting(
+    'world-celld: WORKFLOW_RETENTION_MS',
+    env.WORKFLOW_RETENTION_MS,
+    0,
+    0,
+  );
   if (retentionMs === 0 || scheduledTime < retentionMs) {
     return {
       disabled: retentionMs === 0,
@@ -88,26 +104,30 @@ export async function runRetentionSweep(
       expired: 0,
       missing: 0,
       notDue: 0,
+      invalid: 0,
     };
   }
-  const batchSize = integerSetting(
-    'WORKFLOW_RETENTION_BATCH_SIZE',
+  const batchSize = strictIntegerSetting(
+    'world-celld: WORKFLOW_RETENTION_BATCH_SIZE',
     env.WORKFLOW_RETENTION_BATCH_SIZE,
     DEFAULT_RETENTION_SWEEP_BATCH_SIZE,
     1,
     MAX_RETENTION_SWEEP_BATCH_SIZE,
   );
-  const queueShards = integerSetting(
-    'WORKFLOW_RETENTION_QUEUE_SHARDS',
+  const queueShards = strictIntegerSetting(
+    'world-celld: WORKFLOW_RETENTION_QUEUE_SHARDS',
     env.WORKFLOW_RETENTION_QUEUE_SHARDS,
     1,
     1,
+    MAX_QUEUE_SHARDS,
   );
   const cutoff = scheduledTime - retentionMs;
+  const runNamespace = requireNamespace('WORKFLOW_DB', env.WORKFLOW_DB);
+  const catalogNamespace = requireNamespace('WORKFLOW_RUN_CATALOG', env.WORKFLOW_RUN_CATALOG);
   const index = createWorkflowIndex({
-    runCatalog: env.WORKFLOW_RUN_CATALOG,
-    hookTokens: env.WORKFLOW_HOOK_TOKENS,
-    hookIds: env.WORKFLOW_HOOK_IDS,
+    runCatalog: catalogNamespace,
+    hookTokens: requireNamespace('WORKFLOW_HOOK_TOKENS', env.WORKFLOW_HOOK_TOKENS),
+    hookIds: requireNamespace('WORKFLOW_HOOK_IDS', env.WORKFLOW_HOOK_IDS),
   });
   const page = await index.listRuns({
     prefix: 'runall:',
@@ -123,19 +143,24 @@ export async function runRetentionSweep(
     expired: 0,
     missing: 0,
     notDue: 0,
+    invalid: 0,
   };
   const failures: unknown[] = [];
   for (let offset = 0; offset < page.keys.length; offset += RETENTION_SWEEP_CONCURRENCY) {
     const candidates = page.keys.slice(offset, offset + RETENTION_SWEEP_CONCURRENCY);
     const settled = await Promise.allSettled(
       candidates.map(async (entry) => {
-        const runId = runIdFromCatalogValue(entry.value);
-        const run = env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId));
+        const { runId, invalid } = catalogCandidate(entry.name, entry.value);
+        const catalog = catalogNamespace.get(
+          catalogNamespace.idFromName(runCatalogShardName(runId)),
+        );
+        if (invalid) {
+          await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
+          return { state: 'invalid' } as const;
+        }
+        const run = runNamespace.get(runNamespace.idFromName(runId));
         const outcome = await run.enforceRetention({ retentionMs, queueShards, scheduledTime });
         if (outcome.state === 'missing' || outcome.state === 'not-due') {
-          const catalog = env.WORKFLOW_RUN_CATALOG.get(
-            env.WORKFLOW_RUN_CATALOG.idFromName(runCatalogShardName(runId)),
-          );
           await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
         }
         return outcome;

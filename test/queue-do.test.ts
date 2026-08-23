@@ -8,6 +8,7 @@ import { QueueDO, type MessageRow } from '../src/worker/durable-objects/QueueDO.
 import { FakeFleet } from '../src/testing/fake-cell.js';
 import { LIFECYCLE_COMPACTION_RETRY_MS, QUEUE_FENCE_GRACE_MS } from '../src/lifecycle.js';
 import type { RunLifecycleStatus } from '../src/retention.js';
+import { MAX_QUEUE_DELAY_SECONDS } from '../src/validation.js';
 
 class TestRunLifecycleDO {
   constructor(private ctx: { storage: DurableObjectStorage }) {}
@@ -123,6 +124,69 @@ describe('QueueDO', () => {
     await expect(invalidQueue.enqueue(enqueueReq())).rejects.toThrow(
       'QUEUE_MAX_INFLIGHT must be at most 128',
     );
+  });
+
+  it.each([
+    ['QUEUE_MAX_ATTEMPTS', '5junk'],
+    ['QUEUE_MAX_ATTEMPTS', '0'],
+    ['QUEUE_MAX_ATTEMPTS', '1.5'],
+    ['QUEUE_MAX_ATTEMPTS', ''],
+    ['QUEUE_MAX_INFLIGHT', '5junk'],
+    ['QUEUE_MAX_INFLIGHT', '0'],
+    ['QUEUE_DELIVERY_TIMEOUT_MS', '5junk'],
+    ['QUEUE_DELIVERY_TIMEOUT_MS', '0'],
+    ['QUEUE_DELIVERY_TIMEOUT_MS', '300001'],
+  ] as const)(
+    'rejects malformed runtime setting %s=%j before queue mutation',
+    async (name, value) => {
+      const invalidFleet = new FakeFleet(
+        { queue: QueueDO },
+        { [name]: value, clock: () => invalidFleet.now, fetch: fetchStub },
+      );
+      const invalidQueue = invalidFleet
+        .namespace('queue')
+        .get({ toString: () => 'q:0' }) as QueueDO;
+
+      await expect(invalidQueue.enqueue(enqueueReq())).rejects.toThrow(name);
+      const invalidStorage = invalidFleet.cell('queue', 'q:0').storage;
+      expect(invalidStorage.data.size).toBe(0);
+      expect(invalidStorage.alarmAt).toBeNull();
+      expect(fetchStub).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 0 } },
+    { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1.5 } },
+    { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 129 } },
+    { delaySeconds: -1 },
+    { delaySeconds: MAX_QUEUE_DELAY_SECONDS },
+    { delaySeconds: Number.MAX_SAFE_INTEGER },
+    { body: 'null' },
+    { body: '{"payload":{"__type":"Uint8Array"}}' },
+  ])('rejects malformed enqueue envelope before queue mutation: %j', async (over) => {
+    await expect(queue.enqueue(enqueueReq(over as Partial<EnqueueRequest>))).rejects.toThrow(
+      /world-celld queue enqueue/,
+    );
+    expect(storage().size).toBe(0);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBeNull();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('rejects a run-owned enqueue when WORKFLOW_DB is missing without persisting it', async () => {
+    const missingBindingFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => missingBindingFleet.now, fetch: fetchStub },
+    );
+    const missingBindingQueue = missingBindingFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+
+    await expect(
+      missingBindingQueue.enqueue(enqueueReq({ runId: 'wrun_missing_binding' })),
+    ).rejects.toThrow(/missing WORKFLOW_DB/);
+    expect(missingBindingFleet.cell('queue', 'q:0').storage.data.size).toBe(0);
+    expect(fetchStub).not.toHaveBeenCalled();
   });
 
   it('dedups on idempotencyKey while active and releases after ack', async () => {
@@ -292,6 +356,22 @@ describe('QueueDO', () => {
     // Same message, attempt header unchanged (503-redeliver is not a retry).
     expect(fetchStub.mock.calls[1][1].headers['x-vqs-message-attempt']).toBe('1');
   });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER])(
+    'treats invalid 503 timeoutSeconds %s as a normal retry rather than ack or immediate redelivery',
+    async (timeoutSeconds) => {
+      fetchStub.mockResolvedValue(jsonResponse(503, { timeoutSeconds }));
+      await queue.enqueue(enqueueReq({ messageId: 'msg_invalid_timeout' }));
+
+      await tick();
+
+      expect(fetchStub).toHaveBeenCalledOnce();
+      expect(storage().get('msg:msg_invalid_timeout')).toMatchObject({ attempt: 1 });
+      const dueKeys = Array.from(storage().keys()).filter((key) => key.startsWith('due:'));
+      expect(dueKeys).toEqual([`due:${padded(fleet.now + 2_000)}:msg_invalid_timeout`]);
+      expect(Array.from(storage().keys()).some((key) => key.startsWith('dlq:'))).toBe(false);
+    },
+  );
 
   it('drops permanently on 404/409/410/422 without retrying', async () => {
     fetchStub.mockResolvedValue(jsonResponse(410, { error: 'gone', permanent: true }));
@@ -627,6 +707,27 @@ describe('QueueDO', () => {
     }
     expect((await queue.purgeDeadLetters()).purged).toBe(1);
     expect((await queue.stats()).deadLetters).toBe(0);
+  });
+
+  it('rejects malformed queue admin input before storage mutation', async () => {
+    const queueStorage = fleet.cell('queue', 'q:0').storage;
+    queueStorage.resetOperationCounts();
+    await expect(queue.listDeadLetters({ limit: 0 })).rejects.toThrow(/dead-letter limit/);
+    await expect(queue.listDeadLetters({ limit: '5' as unknown as number })).rejects.toThrow(
+      /dead-letter limit/,
+    );
+    await expect(queue.redriveDeadLetter('')).rejects.toThrow(/messageId/);
+    await expect(queue.expireRun('', fleet.now)).rejects.toThrow(/runId/);
+    await expect(queue.expireRun('wrun_admin', -1)).rejects.toThrow(/expiredAt/);
+    await expect(queue.expireRun('wrun_admin', fleet.now, { limit: 65 })).rejects.toThrow(/limit/);
+    await expect(
+      queue.expireRun('wrun_admin', fleet.now, { limit: '5' as unknown as number }),
+    ).rejects.toThrow(/limit/);
+    await expect(
+      queue.acknowledgeExpireRun('wrun_admin', { expiredAt: -1, deleted: 0 }),
+    ).rejects.toThrow(/receipt/);
+    expect(queueStorage.operationCounts.transaction).toBe(0);
+    expect(queueStorage.data.size).toBe(0);
   });
 
   it('purges every message state for an expired run and fences late enqueue', async () => {

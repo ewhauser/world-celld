@@ -1,0 +1,70 @@
+/** Largest queue deadline representable by JavaScript's Date and alarm APIs. */
+export const MAX_QUEUE_TIMESTAMP_MS = 8_640_000_000_000_000;
+export const MAX_QUEUE_DELAY_SECONDS = Math.floor(MAX_QUEUE_TIMESTAMP_MS / 1000);
+/** Bounds queue-cell fanout and the per-run retention cleanup state machine. */
+export const MAX_QUEUE_SHARDS = 128;
+
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+export function isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
+}
+
+export function boundedIntegerOption(
+  name: string,
+  value: unknown,
+  fallback: number,
+  minimum: number,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value as number;
+}
+
+/**
+ * Parse a deployment/runtime integer setting without accepting whitespace,
+ * exponents, fractions, or numeric prefixes such as `5junk`.
+ */
+export function strictIntegerSetting(
+  name: string,
+  raw: string | number | undefined,
+  fallback: number,
+  minimum: number,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
+  if (raw === undefined) return fallback;
+  const value = typeof raw === 'number' ? raw : /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
+  }
+  return value;
+}
+
+export function isValidQueueDelaySeconds(value: unknown, minimum: 0 | 1 = 0): value is number {
+  return (
+    Number.isSafeInteger(value) &&
+    (value as number) >= minimum &&
+    (value as number) <= MAX_QUEUE_DELAY_SECONDS
+  );
+}
+
+export function queueDelayDeadline(
+  now: number,
+  delaySeconds: unknown,
+  minimum: 0 | 1 = 0,
+): number | null {
+  if (!isNonNegativeSafeInteger(now) || !isValidQueueDelaySeconds(delaySeconds, minimum)) {
+    return null;
+  }
+  const deadline = now + delaySeconds * 1000;
+  return Number.isSafeInteger(deadline) && deadline <= MAX_QUEUE_TIMESTAMP_MS ? deadline : null;
+}

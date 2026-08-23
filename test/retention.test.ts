@@ -105,6 +105,61 @@ describe('terminal workflow retention', () => {
     harness = undefined;
   });
 
+  it('rejects malformed retention admin requests before state mutation', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+    });
+    const runId = await createCompletedRun(world, 'invalid-admin');
+    await finishRun(world, runId);
+    const run = harness.fleet.cell('runs', runId).instance as WorkflowRunDO;
+    const storage = harness.fleet.cell('runs', runId).storage;
+    await driveTerminalCleanup(harness, runId);
+    const before = structuredClone(Array.from(storage.data.entries()));
+    storage.resetOperationCounts();
+
+    for (const request of [
+      { retentionMs: 0, queueShards: 1 },
+      { retentionMs: -1, queueShards: 1 },
+      { retentionMs: 1.5, queueShards: 1 },
+      { retentionMs: Number.NaN, queueShards: 1 },
+      { retentionMs: 1, queueShards: 0 },
+      { retentionMs: 1, queueShards: 1.5 },
+      { retentionMs: 1, queueShards: 129 },
+    ]) {
+      await expect(run.scheduleCleanup(request)).rejects.toThrow(/retention/);
+      await expect(run.cleanupNow(request)).rejects.toThrow(/retention/);
+    }
+
+    expect(Array.from(storage.data.entries())).toEqual(before);
+    expect(storage.operationCounts.transaction).toBe(0);
+  });
+
+  it('rejects invalid event cleanup metadata before creating a run', async () => {
+    const fleet = new FakeFleet({ runs: WorkflowRunDO });
+    const runId = 'wrun_invalid_cleanup_metadata';
+    const run = fleet.namespace('runs').get({ toString: () => runId }) as WorkflowRunDO;
+    await expect(
+      run.applyEvent({
+        runId,
+        data: {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'retention-tests',
+            workflowName: 'invalid-cleanup',
+            input: [],
+          },
+        },
+        cleanup: { retentionMs: 0, queueShards: 0 },
+      }),
+    ).rejects.toThrow(/queueShards/);
+    const storage = fleet.cell('runs', runId).storage;
+    expect(storage.data.size).toBe(0);
+    expect(storage.operationCounts.transaction).toBe(0);
+  });
+
   it('purges payloads, indexes, streams, and queued work without allowing resurrection', async () => {
     process.env.CELLD_QUEUE_MODE = 'cells';
     harness = await startHarness({ secret: 'retention-secret', virtualClock: true });

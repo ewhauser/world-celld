@@ -172,7 +172,7 @@ variable is shown below.
 | `secret`                | `CELLD_WORLD_SECRET`     | required with `fleetUrl` |
 | `baseUrl`               | `WORKFLOW_BASE_URL`      | `http://localhost:$PORT` |
 | `deploymentId`          | `CELLD_DEPLOYMENT_ID`    | `celld-default`          |
-| `queueShards`           | —                        | `1`                      |
+| `queueShards`           | —                        | `1` (maximum `128`)      |
 | `runRetentionMs`        | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
 | `streamLongPollMs`      | —                        | `20000`                  |
 | `streamFlushIntervalMs` | —                        | `0`                      |
@@ -180,16 +180,16 @@ variable is shown below.
 
 The deployed worker also accepts these celld variables:
 
-| Variable                          | Default  | Purpose                                                  |
-| --------------------------------- | -------- | -------------------------------------------------------- |
-| `WORLD_SECRET`                    | none     | Required bearer secret for RPC routes                    |
-| `WORKFLOW_CALLBACK_SECRET`        | none     | Sent with deliveries as `x-workflow-callback-secret`     |
-| `QUEUE_MAX_ATTEMPTS`              | `5`      | Attempts before a message is dead-lettered               |
-| `QUEUE_MAX_INFLIGHT`              | `5`      | Concurrent deliveries per queue cell (maximum `128`)     |
-| `QUEUE_DELIVERY_TIMEOUT_MS`       | `300000` | Callback timeout (maximum `300000`)                      |
-| `WORKFLOW_RETENTION_MS`           | `0`      | Maximum run age from creation; includes active runs      |
-| `WORKFLOW_RETENTION_BATCH_SIZE`   | `128`    | Runs admitted by each cron sweep (maximum `1000`)        |
-| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for runs created before this policy |
+| Variable                          | Default  | Purpose                                              |
+| --------------------------------- | -------- | ---------------------------------------------------- |
+| `WORLD_SECRET`                    | none     | Required bearer secret for RPC routes                |
+| `WORKFLOW_CALLBACK_SECRET`        | none     | Sent with deliveries as `x-workflow-callback-secret` |
+| `QUEUE_MAX_ATTEMPTS`              | `5`      | Attempts before a message is dead-lettered           |
+| `QUEUE_MAX_INFLIGHT`              | `5`      | Concurrent deliveries per queue cell (maximum `128`) |
+| `QUEUE_DELIVERY_TIMEOUT_MS`       | `300000` | Callback timeout (maximum `300000`)                  |
+| `WORKFLOW_RETENTION_MS`           | `0`      | Maximum run age from creation; includes active runs  |
+| `WORKFLOW_RETENTION_BATCH_SIZE`   | `128`    | Runs admitted by each cron sweep (maximum `1000`)    |
+| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for older runs (maximum `128`)  |
 
 `queueShards` is part of queue placement and is pinned when a queue cell is
 first used. Drain pending work before changing it.
@@ -218,7 +218,8 @@ does not provide the desired expiration resolution or catch-up rate.
 
 New runs persist the application's `queueShards` value for complete queue
 cleanup. `WORKFLOW_RETENTION_QUEUE_SHARDS` is the fallback for runs created
-before that metadata existed and must match the placement used by those runs.
+before that metadata existed and must match the placement used by those runs;
+both shard settings have a maximum of `128`.
 
 ### Terminal payload retention
 
