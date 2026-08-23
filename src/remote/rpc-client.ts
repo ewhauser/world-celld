@@ -19,6 +19,16 @@ function delayMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export function resolveFleetTimeoutMs(transport: RpcTransport): number {
+  const timeoutMs = transport.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_FLEET_RPC_TIMEOUT_MS) {
+    throw new Error(
+      `world-celld: fleet RPC timeout must be between 1 and ${MAX_FLEET_RPC_TIMEOUT_MS}`,
+    );
+  }
+  return timeoutMs;
+}
+
 /**
  * Invoke one DO method through the worker router.
  *
@@ -53,12 +63,7 @@ export async function callFleetRoute<T>(
   const doFetch = transport.fetchImpl ?? fetch;
   const url = `${transport.fleetUrl.replace(/\/$/, '')}${path}`;
   const attempts = opts?.idempotent ? FLEET_IDEMPOTENT_ATTEMPTS : 1;
-  const timeoutMs = transport.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_FLEET_RPC_TIMEOUT_MS) {
-    throw new Error(
-      `world-celld: fleet RPC timeout must be between 1 and ${MAX_FLEET_RPC_TIMEOUT_MS}`,
-    );
-  }
+  const timeoutMs = resolveFleetTimeoutMs(transport);
 
   let lastError: unknown;
   for (let attempt = 1; attempt <= attempts; attempt++) {
