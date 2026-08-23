@@ -52,6 +52,7 @@ const MAX_EXPIRE_CHUNK_LIMIT = 64;
 /** Bound storage deletion work as well as item count; one oversized chunk still makes progress. */
 const DEFAULT_EXPIRE_BYTE_LIMIT = 16 * 1024 * 1024;
 const MAX_EXPIRE_BYTE_LIMIT = DEFAULT_EXPIRE_BYTE_LIMIT;
+const MAX_STREAM_INDEX = 0x7fffffff;
 
 function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback;
@@ -62,19 +63,33 @@ function emptyMeta(): StreamMeta {
   return { count: 0, state: 'open' };
 }
 
-function validateMeta(meta: StreamMeta): StreamMeta {
+function validateMeta(meta: unknown): StreamMeta {
+  if (!meta || typeof meta !== 'object' || Array.isArray(meta)) {
+    throw new Error('Invalid persisted stream metadata');
+  }
+  const candidate = meta as Partial<StreamMeta>;
   if (
-    !Number.isSafeInteger(meta.count) ||
-    meta.count < 0 ||
-    meta.count > 0x7fffffff ||
-    !['open', 'closed', 'errored', 'expired'].includes(meta.state)
+    !Number.isSafeInteger(candidate.count) ||
+    candidate.count! < 0 ||
+    candidate.count! > MAX_STREAM_INDEX ||
+    !['open', 'closed', 'errored', 'expired'].includes(candidate.state as StreamTerminalState) ||
+    (candidate.ownerRunId !== undefined && typeof candidate.ownerRunId !== 'string') ||
+    (candidate.payloadDeleted !== undefined && typeof candidate.payloadDeleted !== 'boolean')
   ) {
     throw new Error('Invalid persisted stream metadata');
   }
-  if (meta.state === 'errored' && !meta.error) {
+  const error = candidate.error;
+  if (
+    (error !== undefined &&
+      (!error ||
+        typeof error !== 'object' ||
+        typeof error.name !== 'string' ||
+        typeof error.message !== 'string')) ||
+    (candidate.state === 'errored') !== (error !== undefined)
+  ) {
     throw new Error('Invalid persisted stream error metadata');
   }
-  return meta;
+  return candidate as StreamMeta;
 }
 
 /** Zero-padding keeps storage.list() results in stream offset order. */
@@ -89,8 +104,27 @@ function chunkSizeKey(index: number): string {
 function indexFromChunkSizeKey(key: string): number {
   const suffix = key.slice(CHUNK_SIZE_KEY_PREFIX.length);
   const index = Number(suffix);
-  if (!/^\d{12}$/.test(suffix) || !Number.isSafeInteger(index) || index < 0) {
+  if (
+    !/^\d{12}$/.test(suffix) ||
+    !Number.isSafeInteger(index) ||
+    index < 0 ||
+    index > MAX_STREAM_INDEX
+  ) {
     throw new Error(`Invalid persisted stream chunk size key "${key}"`);
+  }
+  return index;
+}
+
+function indexFromChunkKey(key: string): number {
+  const suffix = key.slice(CHUNK_KEY_PREFIX.length);
+  const index = Number(suffix);
+  if (
+    !/^\d{12}$/.test(suffix) ||
+    !Number.isSafeInteger(index) ||
+    index < 0 ||
+    index > MAX_STREAM_INDEX
+  ) {
+    throw new Error(`Invalid persisted stream chunk key "${key}"`);
   }
   return index;
 }
@@ -134,7 +168,7 @@ export class StreamDO extends DurableObject {
   private async getMeta(): Promise<StreamMeta> {
     if (this.meta) return this.meta;
     this.metaLoad ??= this.ctx.storage.get<StreamMeta>(META_KEY).then((meta) => {
-      const loaded = meta ? validateMeta(meta) : emptyMeta();
+      const loaded = meta === undefined ? emptyMeta() : validateMeta(meta);
       this.meta = loaded;
       return loaded;
     });
@@ -274,10 +308,10 @@ export class StreamDO extends DurableObject {
     return await this.runMutation(async () => {
       const committed = await this.ctx.storage.transaction(async (txn) => {
         const stored = await txn.get<StreamMeta>(META_KEY);
-        const meta = stored ? validateMeta(stored) : emptyMeta();
+        const meta = stored === undefined ? emptyMeta() : validateMeta(stored);
         this.assertWritable(meta, runId);
         const startIndex = meta.count;
-        if (startIndex + chunks.length > 0x7fffffff) {
+        if (startIndex + chunks.length > MAX_STREAM_INDEX) {
           throw new Error('Stream offset limit exceeded');
         }
         const nextMeta: StreamMeta = {
@@ -334,7 +368,7 @@ export class StreamDO extends DurableObject {
     await this.runMutation(async () => {
       const nextMeta = await this.ctx.storage.transaction(async (txn) => {
         const stored = await txn.get<StreamMeta>(META_KEY);
-        const meta = stored ? validateMeta(stored) : emptyMeta();
+        const meta = stored === undefined ? emptyMeta() : validateMeta(stored);
         this.assertOwner(meta, runId);
         if (meta.state === 'expired') throw new Error(`Workflow run "${runId}" has expired`);
         if (meta.state !== 'open') return meta;
@@ -354,7 +388,7 @@ export class StreamDO extends DurableObject {
     await this.runMutation(async () => {
       const nextMeta = await this.ctx.storage.transaction(async (txn) => {
         const stored = await txn.get<StreamMeta>(META_KEY);
-        const meta = stored ? validateMeta(stored) : emptyMeta();
+        const meta = stored === undefined ? emptyMeta() : validateMeta(stored);
         this.assertOwner(meta, runId);
         if (meta.state === 'expired') throw new Error(`Workflow run "${runId}" has expired`);
         if (meta.state !== 'open') return meta;
@@ -463,15 +497,9 @@ export class StreamDO extends DurableObject {
     return await this.runMutation(async () => {
       const result = await this.ctx.storage.transaction(async (txn) => {
         const stored = await txn.get<StreamMeta>(META_KEY);
-        const meta = stored ? validateMeta(stored) : emptyMeta();
+        const meta = stored === undefined ? emptyMeta() : validateMeta(stored);
         this.assertOwner(meta, runId);
         const firstFence = meta.state !== 'expired';
-        if (meta.state === 'expired' && meta.payloadDeleted) {
-          return {
-            meta,
-            result: { deleted: false, chunks: 0, bytes: 0, done: true },
-          };
-        }
 
         const candidates = await txn.list<number>({
           prefix: CHUNK_SIZE_KEY_PREFIX,
@@ -486,9 +514,41 @@ export class StreamDO extends DurableObject {
           page.push({ index, size });
           bytes += size;
         }
+
+        let payloadFallback = false;
+        if (candidates.size === 0) {
+          const payloads = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
+          const first = payloads.entries().next().value;
+          if (first) {
+            const [key, payload] = first;
+            page.push({
+              index: indexFromChunkKey(key),
+              size: payload instanceof Uint8Array ? payload.byteLength : 0,
+            });
+            bytes = page[0].size;
+            payloadFallback = true;
+          }
+        }
+
         const keys = page.flatMap(({ index }) => [chunkKey(index), chunkSizeKey(index)]);
         if (keys.length > 0) await txn.delete(keys);
-        const done = candidates.size === page.length;
+        let done = candidates.size === page.length;
+        if (payloadFallback) {
+          const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
+          done = remaining.size === 0;
+        } else if (done && candidates.size > 0) {
+          // A corrupt/missing size index can otherwise make cleanup report
+          // completion while leaving an orphan payload. Verify once after the
+          // final staged size-index page; healthy pages return an empty list.
+          const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
+          done = remaining.size === 0;
+        }
+        if (done && page.length === 0 && meta.state === 'expired' && meta.payloadDeleted) {
+          return {
+            meta,
+            result: { deleted: false, chunks: 0, bytes: 0, done: true },
+          };
+        }
         const nextMeta: StreamMeta = {
           ...meta,
           count: done ? 0 : meta.count,

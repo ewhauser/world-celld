@@ -99,8 +99,12 @@ export function validateStreamWriteChunks(chunks: readonly Uint8Array[]): number
 
 export function validateStreamReadRequest(request: StreamReadRequest): void {
   if (!request.runId) throw protocolError('runId is required');
-  if (!Number.isSafeInteger(request.startIndex) || request.startIndex < 0) {
-    throw protocolError('startIndex must be a non-negative safe integer');
+  if (
+    !Number.isSafeInteger(request.startIndex) ||
+    request.startIndex < 0 ||
+    request.startIndex > 0x7fffffff
+  ) {
+    throw protocolError('startIndex must be between 0 and 2147483647');
   }
   if (
     !Number.isSafeInteger(request.maxChunks) ||
