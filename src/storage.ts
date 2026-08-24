@@ -31,6 +31,7 @@ import type {
   WorkflowRunWithoutData,
 } from '@workflow/world';
 import {
+  CreateEventSchema,
   EventSchema,
   HookSchema,
   isTerminalWorkflowRunStatus,
@@ -152,25 +153,30 @@ function throwOutcomeError(
   runId: string,
   data: CreateEventRequest | RunCreatedEventRequest,
 ): never {
+  const withCode = <T extends Error>(error: T): T => {
+    Object.assign(error, { code: outcome.code });
+    return error;
+  };
+
   switch (outcome.code) {
     case 'RUN_NOT_FOUND':
-      throw new WorkflowRunNotFoundError(runId);
+      throw withCode(new WorkflowRunNotFoundError(runId));
     case 'STEP_NOT_FOUND':
-      throw new WorkflowWorldError(outcome.message, { status: 404 });
+      throw new WorkflowWorldError(outcome.message, { status: 404, code: outcome.code });
     case 'HOOK_NOT_FOUND':
-      throw new HookNotFoundError(data.correlationId ?? runId);
+      throw withCode(new HookNotFoundError(data.correlationId ?? runId));
     case 'WAIT_NOT_FOUND':
-      throw new WorkflowWorldError(outcome.message, { status: 404 });
+      throw new WorkflowWorldError(outcome.message, { status: 404, code: outcome.code });
     case 'ENTITY_CONFLICT':
-      throw new EntityConflictError(outcome.message);
+      throw withCode(new EntityConflictError(outcome.message));
     case 'HOOK_CLAIM_CANCELLED':
-      throw new WorkflowWorldError(outcome.message, { status: 503 });
+      throw new WorkflowWorldError(outcome.message, { status: 503, code: outcome.code });
     case 'RUN_EXPIRED':
-      throw new RunExpiredError(outcome.message);
+      throw withCode(new RunExpiredError(outcome.message));
     case 'TOO_EARLY':
-      throw new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds });
+      throw withCode(new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds }));
     case 'RUN_NOT_SUPPORTED':
-      throw new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT);
+      throw withCode(new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT));
   }
 }
 
@@ -328,6 +334,15 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         data: RunCreatedEventRequest | CreateEventRequest,
         params?: CreateEventParams,
       ): Promise<EventResult> {
+        // Parse the public runtime value before run routing or hook admission.
+        // The canonical Workflow schema strips unknown fields and rejects bad
+        // discriminants/missing/wrong-typed fields without any external side
+        // effects.
+        data = CreateEventSchema.parse(compact(data));
+        if (runId !== null && typeof runId !== 'string') {
+          throw new WorkflowWorldError('runId must be a string or null', { status: 400 });
+        }
+
         // For run_created events, generate a runId server-side if absent.
         let effectiveRunId: string;
         if (data.eventType === 'run_created' && (!runId || runId === '')) {

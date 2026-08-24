@@ -20,6 +20,7 @@ import {
   HOOK_KEY_PREFIX,
   listByCreationTime,
   listByPrefix,
+  parseApplyEventRequest,
   STEP_CREATED_KEY_PREFIX,
   STEP_KEY_PREFIX,
   WAIT_KEY_PREFIX,
@@ -276,6 +277,12 @@ export class WorkflowRunDO extends DurableObject {
 
   /** Apply an event and capture all retention metadata in the same transaction. */
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
+    request = parseApplyEventRequest(request);
+    if (this.ctx.id.name !== undefined && request.runId !== this.ctx.id.name) {
+      throw new TypeError(
+        `applyEvent runId "${request.runId}" does not match durable object "${this.ctx.id.name}"`,
+      );
+    }
     if (request.cleanup !== undefined) validateCleanupRequest(request.cleanup, true);
     return await this.ctx.storage.transaction(async (txn) => {
       const now = new Date(this.now());
