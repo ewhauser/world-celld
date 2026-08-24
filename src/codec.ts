@@ -30,11 +30,19 @@ function rpcReplacer(this: unknown, key: string, value: unknown): unknown {
 function rpcReviver(key: string, value: unknown): unknown {
   if (value && typeof value === 'object') {
     const obj = value as Record<string, unknown>;
-    if (obj.__type === 'Date' && typeof obj.iso === 'string') {
-      return new Date(obj.iso);
+    if (obj.__type === 'Date') {
+      if (typeof obj.iso !== 'string') throw new SyntaxError('Malformed Date tag');
+      const date = new Date(obj.iso);
+      if (Number.isNaN(date.getTime())) throw new SyntaxError('Malformed Date tag');
+      return date;
     }
-    if (obj.__type === 'Uint8Array' && typeof obj.data === 'string') {
-      return b64decode(obj.data);
+    if (obj.__type === 'Uint8Array') {
+      if (typeof obj.data !== 'string') throw new SyntaxError('Malformed Uint8Array tag');
+      try {
+        return b64decode(obj.data);
+      } catch {
+        throw new SyntaxError('Malformed Uint8Array tag');
+      }
     }
   }
   // Fallback shared-codec semantics for untagged ISO strings in DATE_FIELDS.

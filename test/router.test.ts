@@ -7,8 +7,15 @@ import { createConnection } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { rpcParse, rpcStringify } from '../src/codec.js';
 import { createRemoteEnv } from '../src/remote/namespaces.js';
-import { allRunCatalogShardNames, hookIdShardName, runCatalogShardName } from '../src/indexes.js';
 import {
+  allRunCatalogShardNames,
+  hookIdShardName,
+  hookTokenShardName,
+  runCatalogShardName,
+} from '../src/indexes.js';
+import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../src/lifecycle.js';
+import {
+  MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_READ_BYTES,
   MAX_STREAM_WRITE_CHUNKS,
@@ -19,6 +26,8 @@ import { createStorage } from '../src/storage.js';
 import { createStreamer } from '../src/streamer.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import { createRouter } from '../src/worker/router.js';
+import type { DONamespaceLike, WorkerEnv } from '../src/worker/router.js';
+import { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
 
 const SECRET = 'test-secret';
 
@@ -84,6 +93,11 @@ describe('router auth and shape', () => {
     expect(body.specVersion).toBeTypeOf('number');
   });
 
+  it('rejects the wrong health method deterministically', async () => {
+    const response = await fetch(`${harness.url}/v1/health`, { method: 'POST' });
+    expect(response.status).toBe(405);
+  });
+
   it('rejects rpc without a token', async () => {
     const res = await rpc('/v1/rpc/runs/wrun_x/getRun', []);
     expect(res.status).toBe(401);
@@ -147,6 +161,356 @@ describe('router auth and shape', () => {
     const res = await rpc('/v1/rpc/runs/wrun_x/getRun', { not: 'an array' }, SECRET);
     expect(res.status).toBe(400);
     expect((await rpc('/v1/index/runs/list', { not: 'an array' }, SECRET)).status).toBe(400);
+  });
+
+  it.each([
+    ['/v1/index/runs/list', [{ limit: '5junk' }]],
+    ['/v1/index/runs/commit', [{ runId: 'wrun_only' }, '{}', 1]],
+    ['/v1/index/runs/expire', [{ runId: 'wrun_expire', expiredAt: 1 }]],
+    [
+      '/v1/index/runs/expire',
+      [
+        {
+          runId: 'wrun_expire',
+          keys: ['run:workflow:1767225600000:wrun_expire', 'runall:1767225600000:wrun_expire'],
+          hooks: [],
+          expiredAt: 1,
+        },
+      ],
+    ],
+    ['/v1/index/hooks/reserve', ['', { runId: 'wrun_reserve', hookId: 'hook_reserve' }]],
+    ['/v1/index/hooks/reserve', ['token', { hookId: 'hook_missing_run' }]],
+    ['/v1/index/hooks/reserve', ['victim-token', { runId: 'wrun_missing_hook_id' }]],
+    [
+      '/v1/index/hooks/finalize',
+      ['token', 'hook', '{}', { runId: 'wrun_finalize', hookId: 'hook' }],
+    ],
+    [
+      '/v1/index/hooks/release-reservation',
+      ['token', { runId: 'wrun_release', hookId: 'hook' }, { claimId: '' }],
+    ],
+    [
+      '/v1/index/hooks/release',
+      [{ runId: 'wrun_release', hooks: [{ hookId: '', token: 'token' }] }],
+    ],
+  ])(
+    'rejects invalid operation arguments before resolving an index stub: %s',
+    async (path, body) => {
+      const idFromName = vi.fn<(name: string) => { toString(): string }>((name) => ({
+        toString: () => name,
+      }));
+      const get = vi.fn<(id: { toString(): string }) => unknown>();
+      const namespace = { idFromName, get };
+      const router = createRouter({
+        WORKFLOW_RUN_CATALOG: namespace,
+        WORKFLOW_HOOK_TOKENS: namespace,
+        WORKFLOW_HOOK_IDS: namespace,
+        WORLD_SECRET: SECRET,
+      } as unknown as WorkerEnv);
+      const response = await router(
+        new Request(`http://world.test${path}`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${SECRET}`,
+            'content-type': 'application/json',
+          },
+          body: rpcStringify(body),
+        }),
+      );
+
+      expect(response.status).toBe(400);
+      expect(idFromName).not.toHaveBeenCalled();
+      expect(get).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects every caller-supplied run expiry key shape without catalog mutation', async () => {
+    const runId = 'wrun_marker_probe';
+    const timestamp = '1767225600000';
+    const canonical = [`run:workflow:${timestamp}:${runId}`, `runall:${timestamp}:${runId}`];
+    const suppliedKeyPairs = [
+      [`arbitrary:workflow:${timestamp}:${runId}`, canonical[1]],
+      [canonical[1], canonical[0]],
+      [canonical[0], canonical[0]],
+      [canonical[0], `runall:1767225600001:${runId}`],
+      [`expired:${runId}`, `expiry-gc:${timestamp}:${runId}`],
+      [`run%3Aworkflow%3A${timestamp}%3A${runId}`, canonical[1]],
+      [canonical[0], `runall:${timestamp}:wrun_wrong`],
+    ];
+    const before = allRunCatalogShardNames().map(
+      (shard) => new Map(harness.fleet.cell('run-catalog', shard).storage.data),
+    );
+
+    for (const keys of suppliedKeyPairs) {
+      const response = await rpc(
+        '/v1/index/runs/expire',
+        [{ runId, keys, hooks: [], expiredAt: 1 }],
+        SECRET,
+      );
+      expect(response.status).toBe(400);
+    }
+
+    for (const [index, shard] of allRunCatalogShardNames().entries()) {
+      expect(harness.fleet.cell('run-catalog', shard).storage.data).toEqual(before[index]);
+    }
+  });
+
+  it('expires only the catalog key pair retained by the authoritative commit', async () => {
+    const runId = 'wrun_canonical_expiry_wire';
+    const timestamp = String(harness.fleet.now).padStart(13, '0');
+    const keys = [`run:canonical-wire:${timestamp}:${runId}`, `runall:${timestamp}:${runId}`];
+    const shard = runCatalogShardName(runId);
+    const catalog = harness.fleet.namespace('run-catalog').get({
+      toString: () => shard,
+    }) as RunCatalogDO;
+    await catalog.upsertRun(
+      runId,
+      keys,
+      JSON.stringify({ runId }),
+      harness.fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+    );
+
+    const response = await rpc(
+      '/v1/index/runs/expire',
+      [{ runId, hooks: [], expiredAt: harness.fleet.now }],
+      SECRET,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ deleted: 2 });
+    const data = harness.fleet.cell('run-catalog', shard).storage.data;
+    expect(keys.every((key) => !data.has(key))).toBe(true);
+    expect(data.has(`expired:${runId}`)).toBe(true);
+    expect(Array.from(data.keys()).some((key) => key.startsWith('catalog-keys:'))).toBe(false);
+  });
+
+  it('does not persist token or undefined-hook claims for a malformed reservation', async () => {
+    const token = 'victim-token';
+    const response = await rpc(
+      '/v1/index/hooks/reserve',
+      [token, { runId: 'wrun_missing_hook_id' }],
+      SECRET,
+    );
+    expect(response.status).toBe(400);
+    expect(
+      harness.fleet
+        .cell('hook-tokens', hookTokenShardName(token))
+        .storage.data.has(`claim:${token}`),
+    ).toBe(false);
+    for (const shard of Array.from(
+      { length: 32 },
+      (_, index) => `hook-id:v1:${index.toString(16).padStart(2, '0')}`,
+    )) {
+      expect(harness.fleet.cell('hook-ids', shard).storage.data.has('claim:undefined')).toBe(false);
+    }
+  });
+
+  it.each([
+    '[{"__type":"Date"}]',
+    '[{"__type":"Date","iso":"not-a-date"}]',
+    '[{"__type":"Uint8Array"}]',
+    '[{"__type":"Uint8Array","data":"not base64!"}]',
+  ])('400s malformed tagged RPC JSON without dispatch: %s', async (body) => {
+    const get = vi.fn<(id: { toString(): string }) => unknown>();
+    const namespace: DONamespaceLike = {
+      idFromName: (name) => ({ toString: () => name }),
+      get,
+    };
+    const router = createRouter({
+      WORKFLOW_DB: namespace,
+      WORLD_SECRET: SECRET,
+    } as WorkerEnv);
+    const response = await router(
+      new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${SECRET}`,
+          'content-type': 'application/json',
+        },
+        body,
+      }),
+    );
+    expect(response.status).toBe(400);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('maps RPC method, content type, path encoding, and missing bindings before dispatch', async () => {
+    const get = vi.fn<(id: { toString(): string }) => unknown>();
+    const namespace: DONamespaceLike = {
+      idFromName: (name) => ({ toString: () => name }),
+      get,
+    };
+    const router = createRouter({ WORKFLOW_DB: namespace, WORLD_SECRET: SECRET } as WorkerEnv);
+    const headers = { authorization: `Bearer ${SECRET}`, 'content-type': 'application/json' };
+
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
+            method: 'GET',
+            headers,
+          }),
+        )
+      ).status,
+    ).toBe(405);
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
+            method: 'POST',
+            headers: { authorization: `Bearer ${SECRET}`, 'content-type': 'text/plain' },
+            body: '[]',
+          }),
+        )
+      ).status,
+    ).toBe(415);
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
+            method: 'POST',
+            headers: { ...headers, 'content-length': '2junk' },
+            body: '[]',
+          }),
+        )
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/rpc/runs/%ZZ/getRun', {
+            method: 'POST',
+            headers,
+            body: '[]',
+          }),
+        )
+      ).status,
+    ).toBe(400);
+    const missing = createRouter({ WORLD_SECRET: SECRET } as WorkerEnv);
+    expect(
+      (
+        await missing(
+          new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
+            method: 'POST',
+            headers,
+            body: '[]',
+          }),
+        )
+      ).status,
+    ).toBe(500);
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed stream requests before resolving a Durable Object', async () => {
+    const get = vi.fn<(id: { toString(): string }) => unknown>();
+    const namespace: DONamespaceLike = {
+      idFromName: (name) => ({ toString: () => name }),
+      get,
+    };
+    const router = createRouter({
+      WORKFLOW_STREAMS: namespace,
+      WORLD_SECRET: SECRET,
+    } as WorkerEnv);
+    const authorization = { authorization: `Bearer ${SECRET}` };
+    const validQuery = `runId=wrun_x&startIndex=0&maxChunks=1&maxBytes=${MAX_STREAM_CHUNK_BYTES}&waitMs=0`;
+
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/streams/stream%3Ax/chunks', {
+            headers: authorization,
+          }),
+        )
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await router(
+          new Request(`http://world.test/v1/streams/stream%3Ax/chunks?${validQuery}`, {
+            method: 'PUT',
+            headers: authorization,
+          }),
+        )
+      ).status,
+    ).toBe(405);
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/streams/stream%3Ax/chunks?runId=wrun_x', {
+            method: 'POST',
+            headers: { ...authorization, 'content-type': 'application/json' },
+            body: 'x',
+          }),
+        )
+      ).status,
+    ).toBe(415);
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/streams/stream%3Ax/chunks?runId=wrun_x', {
+            method: 'POST',
+            headers: {
+              ...authorization,
+              'content-type': STREAM_BATCH_CONTENT_TYPE,
+              'content-length': String(MAX_STREAM_BATCH_BYTES + 1025),
+            },
+            body: new Uint8Array(),
+          }),
+        )
+      ).status,
+    ).toBe(413);
+    expect(
+      (
+        await router(
+          new Request('http://world.test/v1/streams/stream%3Ax/chunks?runId=wrun_x', {
+            method: 'POST',
+            headers: { ...authorization, 'content-type': STREAM_BATCH_CONTENT_TYPE },
+            body: new Uint8Array(),
+          }),
+        )
+      ).status,
+    ).toBe(400);
+    for (const [name, value] of [
+      ['startIndex', ''],
+      ['startIndex', ' 0'],
+      ['maxChunks', '1junk'],
+      ['maxBytes', '1e6'],
+      ['waitMs', '0.5'],
+    ]) {
+      const url = new URL('http://world.test/v1/streams/stream%3Ax/chunks');
+      url.searchParams.set('runId', 'wrun_x');
+      url.searchParams.set('startIndex', '0');
+      url.searchParams.set('maxChunks', '1');
+      url.searchParams.set('maxBytes', String(MAX_STREAM_CHUNK_BYTES));
+      url.searchParams.set('waitMs', '0');
+      url.searchParams.set(name, value);
+      const response = await router(new Request(url, { headers: authorization }));
+      expect(response.status, `${name}=${JSON.stringify(value)}`).toBe(400);
+    }
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('413s an oversized stream body without content-length before resolving a cell', async () => {
+    const get = vi.fn<(id: { toString(): string }) => unknown>();
+    const namespace: DONamespaceLike = {
+      idFromName: (name) => ({ toString: () => name }),
+      get,
+    };
+    const router = createRouter({
+      WORKFLOW_STREAMS: namespace,
+      WORLD_SECRET: SECRET,
+    } as WorkerEnv);
+    const request = new Request('http://world.test/v1/streams/stream%3Ax/chunks?runId=wrun_x', {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${SECRET}`,
+        'content-type': STREAM_BATCH_CONTENT_TYPE,
+      },
+      body: new Uint8Array(MAX_STREAM_BATCH_BYTES + 1025),
+    });
+    expect(request.headers.has('content-length')).toBe(false);
+    expect((await router(request)).status).toBe(413);
+    expect(get).not.toHaveBeenCalled();
   });
 
   it('413s an oversized RPC body even when content-length is absent', async () => {

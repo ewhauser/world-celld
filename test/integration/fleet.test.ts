@@ -224,7 +224,10 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     const marker = randomUUID();
     const before = deliveries.length;
 
-    await w.queue(`__wkf_workflow_it_${marker.slice(0, 8)}`, { marker });
+    await w.queue(`__wkf_workflow_it_${marker.slice(0, 8)}`, {
+      __healthCheck: true,
+      correlationId: marker,
+    });
 
     const delivered = await waitFor(
       async () => deliveries.slice(before).find((d) => d.body.includes(marker)),
@@ -243,7 +246,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
 
     await w.queue(
       `__wkf_workflow_delay_${marker.slice(0, 8)}`,
-      { marker },
+      { __healthCheck: true, correlationId: marker },
       {
         delaySeconds: 3,
       },
@@ -264,7 +267,10 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     const before = deliveries.length;
     responseQueue.push({ status: 503, body: { timeoutSeconds: 2 } });
 
-    await w.queue(`__wkf_workflow_retry_${marker.slice(0, 8)}`, { marker });
+    await w.queue(`__wkf_workflow_retry_${marker.slice(0, 8)}`, {
+      __healthCheck: true,
+      correlationId: marker,
+    });
 
     await waitFor(
       async () => deliveries.slice(before).filter((d) => d.body.includes(marker)).length >= 2,
@@ -283,7 +289,8 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     for (let i = 0; i < 5; i++) responseQueue.push({ status: 500, body: { error: 'down' } });
 
     const { messageId } = await w.queue(`__wkf_workflow_dlq_${marker.slice(0, 8)}`, {
-      marker,
+      __healthCheck: true,
+      correlationId: marker,
     });
 
     const stats = await waitFor(

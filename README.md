@@ -180,19 +180,30 @@ variable is shown below.
 
 The deployed worker also accepts these celld variables:
 
-| Variable                          | Default  | Purpose                                                  |
-| --------------------------------- | -------- | -------------------------------------------------------- |
-| `WORLD_SECRET`                    | none     | Required bearer secret for RPC routes                    |
-| `WORKFLOW_CALLBACK_SECRET`        | none     | Sent with deliveries as `x-workflow-callback-secret`     |
-| `QUEUE_MAX_ATTEMPTS`              | `5`      | Attempts before a message is dead-lettered               |
-| `QUEUE_MAX_INFLIGHT`              | `5`      | Concurrent deliveries per queue cell (maximum `128`)     |
-| `QUEUE_DELIVERY_TIMEOUT_MS`       | `300000` | Callback timeout (maximum `300000`)                      |
-| `WORKFLOW_RETENTION_MS`           | `0`      | Maximum run age from creation; includes active runs      |
-| `WORKFLOW_RETENTION_BATCH_SIZE`   | `128`    | Runs admitted by each cron sweep (maximum `1000`)        |
-| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for runs created before this policy |
+| Variable                          | Default  | Purpose                                              |
+| --------------------------------- | -------- | ---------------------------------------------------- |
+| `WORLD_SECRET`                    | none     | Required bearer secret for RPC routes                |
+| `WORKFLOW_CALLBACK_SECRET`        | none     | Sent with deliveries as `x-workflow-callback-secret` |
+| `QUEUE_MAX_ATTEMPTS`              | `5`      | Attempts before a message is dead-lettered           |
+| `QUEUE_MAX_INFLIGHT`              | `5`      | Concurrent deliveries per queue cell (maximum `128`) |
+| `QUEUE_DELIVERY_TIMEOUT_MS`       | `300000` | Callback timeout (maximum `300000`)                  |
+| `WORKFLOW_RETENTION_MS`           | `0`      | Maximum run age from creation; includes active runs  |
+| `WORKFLOW_RETENTION_BATCH_SIZE`   | `128`    | Runs admitted by each cron sweep (maximum `1000`)    |
+| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for older runs                  |
 
 `queueShards` is part of queue placement and is pinned when a queue cell is
-first used. Drain pending work before changing it.
+first used. It may be any positive safe integer; the `128` storage-operation
+batch limit does not cap the fleet's total shard count. Drain pending work
+before changing it.
+
+Queue deadlines use fixed-width 13-digit epoch-millisecond keys. A requested
+`delaySeconds` or handler redelivery timeout is accepted only when its deadline
+is at most `9999999669998`, leaving 330,001 ms for a fresh alarm edge and the
+maximum delivery lease. Every derived due, retry, inflight, and GC deadline is
+checked against the absolute `9999999999999` limit. A production retry which
+cannot preserve that headroom is dead-lettered instead of clamped or rescheduled;
+the test pump terminates the equivalent in-memory message. Long test-mode waits
+are chunked at the host timer limit without changing this deadline contract.
 
 ## Workflow retention
 
@@ -219,6 +230,7 @@ does not provide the desired expiration resolution or catch-up rate.
 New runs persist the application's `queueShards` value for complete queue
 cleanup. `WORKFLOW_RETENTION_QUEUE_SHARDS` is the fallback for runs created
 before that metadata existed and must match the placement used by those runs.
+Both values may be any positive safe integer.
 
 ### Terminal payload retention
 

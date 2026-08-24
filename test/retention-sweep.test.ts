@@ -1,11 +1,12 @@
 import { RunExpiredError } from '@workflow/errors';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../src/index.js';
-import { runCatalogShardName } from '../src/indexes.js';
+import { allRunCatalogShardNames, runCatalogShardName } from '../src/indexes.js';
 import { sortableTimestamp } from '../src/retention.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import type { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
 import type { WorkflowRunDO } from '../src/worker/durable-objects/WorkflowRunDO.js';
+import type { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
 import { runRetentionSweep, type RetentionSweepEnv } from '../src/worker/retention-sweep.js';
 
 function sweepEnv(
@@ -79,6 +80,70 @@ describe('fleet-wide workflow retention sweep', () => {
     delete process.env.CELLD_QUEUE_MODE;
     await harness?.close();
     harness = undefined;
+  });
+
+  it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid scheduledTime %s before reading bindings',
+    async (scheduledTime) => {
+      await expect(runRetentionSweep(scheduledTime, {} as RetentionSweepEnv)).rejects.toThrow(
+        /scheduledTime/,
+      );
+    },
+  );
+
+  it.each([
+    ['WORKFLOW_RETENTION_MS', ''],
+    ['WORKFLOW_RETENTION_MS', ' '],
+    ['WORKFLOW_RETENTION_MS', '5junk'],
+    ['WORKFLOW_RETENTION_MS', '1.5'],
+    ['WORKFLOW_RETENTION_MS', 'Infinity'],
+    ['WORKFLOW_RETENTION_BATCH_SIZE', ''],
+    ['WORKFLOW_RETENTION_BATCH_SIZE', '2junk'],
+    ['WORKFLOW_RETENTION_BATCH_SIZE', 0],
+    ['WORKFLOW_RETENTION_BATCH_SIZE', 1001],
+    ['WORKFLOW_RETENTION_QUEUE_SHARDS', ''],
+    ['WORKFLOW_RETENTION_QUEUE_SHARDS', '2junk'],
+    ['WORKFLOW_RETENTION_QUEUE_SHARDS', 0],
+    ['WORKFLOW_RETENTION_QUEUE_SHARDS', 1.5],
+    ['WORKFLOW_RETENTION_QUEUE_SHARDS', Number.MAX_SAFE_INTEGER + 1],
+  ] as const)('rejects malformed retention setting %s=%j', async (name, value) => {
+    harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
+    const env = sweepEnv(harness, {
+      WORKFLOW_RETENTION_MS: 1,
+      WORKFLOW_RETENTION_BATCH_SIZE: 1,
+      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
+      [name]: value,
+    });
+    harness.fleet.advance(10);
+    await expect(runRetentionSweep(harness.fleet.now, env)).rejects.toThrow(name);
+  });
+
+  it.each([129, Number.MAX_SAFE_INTEGER])(
+    'accepts WORKFLOW_RETENTION_QUEUE_SHARDS=%s',
+    async (queueShards) => {
+      harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
+      harness.fleet.advance(10);
+      await expect(
+        runRetentionSweep(
+          harness.fleet.now,
+          sweepEnv(harness, {
+            WORKFLOW_RETENTION_MS: 1,
+            WORKFLOW_RETENTION_BATCH_SIZE: 1,
+            WORKFLOW_RETENTION_QUEUE_SHARDS: queueShards,
+          }),
+        ),
+      ).resolves.toMatchObject({ scanned: 0 });
+    },
+  );
+
+  it('fails deterministically when an enabled sweep is missing a required binding', async () => {
+    harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
+    harness.fleet.advance(10);
+    const env = sweepEnv(harness, { WORKFLOW_RETENTION_MS: 1 });
+    (env as Partial<RetentionSweepEnv>).WORKFLOW_DB = undefined;
+    await expect(runRetentionSweep(harness.fleet.now, env)).rejects.toThrow(
+      /missing binding WORKFLOW_DB/,
+    );
   });
 
   it('expires pending, running, and terminal workflows by creation age', async () => {
@@ -346,6 +411,138 @@ describe('fleet-wide workflow retention sweep', () => {
     );
   });
 
+  it('removes malformed catalog values while preserving valid cleanup in the same page', async () => {
+    harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-sweep-secret',
+      deploymentId: 'retention-sweep-tests',
+    });
+    const validRunId = await createRun(world, 'valid-with-corrupt-neighbors', 'pending');
+    const validRun = await world.runs.get(validRunId);
+    const corruptEntries = [
+      { runId: 'wrun_corrupt_json', value: '{' },
+      { runId: 'wrun_corrupt_null', value: 'null' },
+      { runId: 'wrun_corrupt_mismatch', value: JSON.stringify({ runId: 'wrun_other' }) },
+    ].map((entry, index) =>
+      Object.assign(entry, {
+        key: `runall:${sortableTimestamp(new Date(validRun.createdAt.getTime() - 10_000 + index))}:${entry.runId}`,
+      }),
+    );
+    for (const entry of corruptEntries) {
+      harness.fleet
+        .cell('run-catalog', runCatalogShardName(entry.runId))
+        .storage.data.set(entry.key, entry.value);
+    }
+    harness.fleet.advance(1_000);
+
+    await expect(
+      runRetentionSweep(
+        harness.fleet.now,
+        sweepEnv(harness, {
+          WORKFLOW_RETENTION_MS: 100,
+          WORKFLOW_RETENTION_BATCH_SIZE: 4,
+          WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
+        }),
+      ),
+    ).resolves.toMatchObject({ scanned: 4, invalid: 3, expired: 1 });
+    for (const entry of corruptEntries) {
+      expect(
+        harness.fleet
+          .cell('run-catalog', runCatalogShardName(entry.runId))
+          .storage.data.has(entry.key),
+      ).toBe(false);
+    }
+    await expect(world.runs.get(validRunId)).rejects.toSatisfy((error) =>
+      RunExpiredError.is(error),
+    );
+  });
+
+  it('uses source-shard provenance so a wrong-shard poison cannot starve batch-one sweeps', async () => {
+    harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-sweep-secret',
+      deploymentId: 'retention-sweep-tests',
+    });
+    const validRunId = await createRun(world, 'after-wrong-shard-poison', 'pending');
+    const validRun = await world.runs.get(validRunId);
+    const poisonRunId = 'wrun_wrong_shard_poison';
+    const wrongShard = allRunCatalogShardNames().find(
+      (name) => name !== runCatalogShardName(poisonRunId),
+    );
+    if (!wrongShard) throw new Error('expected an alternate catalog shard');
+    const poisonKey = `runall:${sortableTimestamp(new Date(validRun.createdAt.getTime() - 10_000))}:${poisonRunId}`;
+    const poisonStorage = harness.fleet.cell('run-catalog', wrongShard).storage.data;
+    poisonStorage.set(poisonKey, '{');
+    harness.fleet.advance(1_000);
+    const env = sweepEnv(harness, {
+      WORKFLOW_RETENTION_MS: 100,
+      WORKFLOW_RETENTION_BATCH_SIZE: 1,
+      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
+    });
+
+    await expect(runRetentionSweep(harness.fleet.now, env)).resolves.toMatchObject({
+      scanned: 1,
+      invalid: 1,
+      expired: 0,
+      preserved: 0,
+    });
+    expect(poisonStorage.has(poisonKey)).toBe(false);
+    await expect(runRetentionSweep(harness.fleet.now, env)).resolves.toMatchObject({
+      scanned: 1,
+      invalid: 0,
+      expired: 1,
+    });
+    await expect(world.runs.get(validRunId)).rejects.toSatisfy((error) =>
+      RunExpiredError.is(error),
+    );
+  });
+
+  it('preserves a concurrently repaired catalog value and still cleans another candidate', async () => {
+    harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-sweep-secret',
+      deploymentId: 'retention-sweep-tests',
+    });
+    const validRunId = await createRun(world, 'alongside-catalog-repair', 'pending');
+    const validRun = await world.runs.get(validRunId);
+    const repairedRunId = 'wrun_concurrently_repaired';
+    const repairedKey = `runall:${sortableTimestamp(new Date(validRun.createdAt.getTime() - 10_000))}:${repairedRunId}`;
+    const repairedValue = JSON.stringify({ runId: repairedRunId });
+    const shard = runCatalogShardName(repairedRunId);
+    const catalogCell = harness.fleet.cell('run-catalog', shard);
+    catalogCell.storage.data.set(repairedKey, '{');
+    const catalog = catalogCell.instance as RunCatalogDO;
+    const originalDelete = catalog.deleteStaleGlobalRun.bind(catalog);
+    catalog.deleteStaleGlobalRun = async (runId, key, expectedValue) => {
+      if (key === repairedKey) catalogCell.storage.data.set(repairedKey, repairedValue);
+      return await originalDelete(runId, key, expectedValue);
+    };
+    harness.fleet.advance(1_000);
+
+    await expect(
+      runRetentionSweep(
+        harness.fleet.now,
+        sweepEnv(harness, {
+          WORKFLOW_RETENTION_MS: 100,
+          WORKFLOW_RETENTION_BATCH_SIZE: 2,
+          WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
+        }),
+      ),
+    ).resolves.toMatchObject({
+      scanned: 2,
+      invalid: 1,
+      preserved: 1,
+      expired: 1,
+    });
+    expect(catalogCell.storage.data.get(repairedKey)).toBe(repairedValue);
+    await expect(world.runs.get(validRunId)).rejects.toSatisfy((error) =>
+      RunExpiredError.is(error),
+    );
+  });
+
   it('does no catalog work while the policy is disabled', async () => {
     harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
     const result = await runRetentionSweep(
@@ -360,6 +557,8 @@ describe('fleet-wide workflow retention sweep', () => {
       expired: 0,
       missing: 0,
       notDue: 0,
+      invalid: 0,
+      preserved: 0,
     });
   });
 });

@@ -4,6 +4,7 @@ import type { QueueCellNamespace } from './queue.js';
 import { MAX_STREAM_LONG_POLL_MS } from './stream-protocol.js';
 import type { WorkflowIndex } from './indexes.js';
 import { MAX_FLEET_RPC_TIMEOUT_MS } from './lifecycle.js';
+import { boundedIntegerOption, strictIntegerSetting } from './validation.js';
 
 /** Public alias retained for custom in-process environments. */
 export type IndexNamespace = WorkflowIndex;
@@ -76,17 +77,17 @@ export interface ResolvedCelldConfig {
 }
 
 export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
-  const queueShards = config?.queueShards ?? 1;
-  if (!Number.isSafeInteger(queueShards) || queueShards < 1) {
-    throw new Error('world-celld: queueShards must be a positive safe integer');
-  }
+  const queueShards = boundedIntegerOption('world-celld: queueShards', config?.queueShards, 1, 1);
 
-  const retentionRaw = config?.runRetentionMs ?? process.env.CELLD_RUN_RETENTION_MS ?? 0;
   const runRetentionMs =
-    typeof retentionRaw === 'number' ? retentionRaw : Number.parseInt(retentionRaw, 10);
-  if (!Number.isSafeInteger(runRetentionMs) || runRetentionMs < 0) {
-    throw new Error('world-celld: runRetentionMs must be a non-negative safe integer');
-  }
+    config?.runRetentionMs !== undefined
+      ? boundedIntegerOption('world-celld: runRetentionMs', config.runRetentionMs, 0, 0)
+      : strictIntegerSetting(
+          'world-celld: runRetentionMs',
+          process.env.CELLD_RUN_RETENTION_MS,
+          0,
+          0,
+        );
 
   const rpcTimeoutMs = config?.rpcTimeoutMs ?? 30_000;
   if (

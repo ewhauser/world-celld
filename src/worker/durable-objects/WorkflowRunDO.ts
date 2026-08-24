@@ -37,7 +37,6 @@ import {
   type ExpireStreamResult,
   type FinalizeRunStreamsResult,
   expiredRead,
-  globalRunIndexKey,
   HOOK_MARKER_PREFIX,
   type HookIndexReference,
   hookMarkerKey,
@@ -49,9 +48,9 @@ import {
   TERMINAL_CLEANUP_KEY,
   type TerminalCleanupRecord,
   TOMBSTONE_KEY,
-  workflowRunIndexKey,
 } from '../../retention.js';
 import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../../lifecycle.js';
+import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../validation.js';
 
 interface CellId {
   toString(): string;
@@ -110,7 +109,34 @@ const QUEUE_REFERENCES_PER_CLEANUP_PAGE = 64;
 const CLEANUP_RETRY_MAX_MS = 60 * 60 * 1000;
 const CLEANUP_PROGRESS_KEY = 'retention:progress';
 const RUN_QUEUE_SHARDS_KEY = 'retention:queue-shards';
+const MAX_DATE_MS = 8_640_000_000_000_000;
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
+
+function validateCleanupRequest(request: unknown, allowDisabled: boolean): ScheduleCleanupRequest {
+  if (!isRecord(request)) {
+    throw new Error('world-celld retention request must be an object');
+  }
+  const validRetention = allowDisabled
+    ? isNonNegativeSafeInteger(request.retentionMs)
+    : isPositiveSafeInteger(request.retentionMs);
+  if (!validRetention) {
+    throw new Error(
+      `world-celld retentionMs must be a ${allowDisabled ? 'non-negative' : 'positive'} safe integer`,
+    );
+  }
+  if (!isPositiveSafeInteger(request.queueShards)) {
+    throw new Error('world-celld retention queueShards must be a positive safe integer');
+  }
+  return request as unknown as ScheduleCleanupRequest;
+}
+
+function retentionDeadline(baseMs: number, retentionMs: number, runId: string): number {
+  const dueAtMs = baseMs + retentionMs;
+  if (!Number.isSafeInteger(dueAtMs) || dueAtMs > MAX_DATE_MS) {
+    throw new Error(`world-celld retention deadline is out of range for ${runId}`);
+  }
+  return dueAtMs;
+}
 
 function cleanupRecord(
   run: WorkflowRun,
@@ -250,6 +276,7 @@ export class WorkflowRunDO extends DurableObject {
 
   /** Apply an event and capture all retention metadata in the same transaction. */
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
+    if (request.cleanup !== undefined) validateCleanupRequest(request.cleanup, true);
     return await this.ctx.storage.transaction(async (txn) => {
       const now = new Date(this.now());
       const retention = await this.retentionState(txn, now.getTime());
@@ -297,7 +324,9 @@ export class WorkflowRunDO extends DurableObject {
         !retention.cleanup
       ) {
         const terminalRun = outcome.run as TerminalRun;
-        const dueAt = new Date(terminalRun.completedAt.getTime() + retentionMs);
+        const dueAt = new Date(
+          retentionDeadline(terminalRun.completedAt.getTime(), retentionMs, terminalRun.runId),
+        );
         const run = WorkflowRunSchema.parse({ ...terminalRun, expiredAt: dueAt }) as TerminalRun;
         const cleanup = cleanupRecord(
           run,
@@ -446,7 +475,7 @@ export class WorkflowRunDO extends DurableObject {
 
   /** Explicitly schedule an existing terminal run, used for opt-in backfills. */
   async scheduleCleanup(request: ScheduleCleanupRequest): Promise<CleanupRecord | null> {
-    if (request.retentionMs <= 0) return this.getCleanupStatus();
+    request = validateCleanupRequest(request, false);
     return await this.ctx.storage.transaction(async (txn) => {
       const values = await txn.get<
         CleanupRecord | RunTombstone | TerminalCleanupRecord | WorkflowRun
@@ -457,7 +486,13 @@ export class WorkflowRunDO extends DurableObject {
       const current = values.get('run') as WorkflowRun | undefined;
       if (!current || !isTerminalWorkflowRunStatus(current.status)) return null;
       const terminalRun = current as TerminalRun;
-      const dueAt = new Date(terminalRun.completedAt.getTime() + request.retentionMs);
+      const dueAt = new Date(
+        retentionDeadline(
+          terminalRun.completedAt.getTime(),
+          request.retentionMs,
+          terminalRun.runId,
+        ),
+      );
       const run = WorkflowRunSchema.parse({ ...terminalRun, expiredAt: dueAt }) as TerminalRun;
       const cleanup = cleanupRecord(run, dueAt, request.queueShards, 'manual');
       await txn.put('run', run);
@@ -477,12 +512,7 @@ export class WorkflowRunDO extends DurableObject {
    * becomes an authoritative write/read fence, including for active runs.
    */
   async enforceRetention(request: EnforceRetentionRequest): Promise<EnforceRetentionResult> {
-    if (!Number.isSafeInteger(request.retentionMs) || request.retentionMs <= 0) {
-      throw new Error('world-celld retentionMs must be a positive safe integer');
-    }
-    if (!Number.isSafeInteger(request.queueShards) || request.queueShards <= 0) {
-      throw new Error('world-celld retention queueShards must be a positive safe integer');
-    }
+    validateCleanupRequest(request, false);
     if (!Number.isSafeInteger(request.scheduledTime) || request.scheduledTime < 0) {
       throw new Error('world-celld retention scheduledTime must be a non-negative safe integer');
     }
@@ -504,10 +534,7 @@ export class WorkflowRunDO extends DurableObject {
 
       const run = values.get('run') as WorkflowRun | undefined;
       if (!run) return { state: 'missing', cleanup: null } satisfies EnforceRetentionResult;
-      const dueAtMs = run.createdAt.getTime() + request.retentionMs;
-      if (!Number.isSafeInteger(dueAtMs) || dueAtMs > 8_640_000_000_000_000) {
-        throw new Error(`world-celld retention deadline is out of range for ${run.runId}`);
-      }
+      const dueAtMs = retentionDeadline(run.createdAt.getTime(), request.retentionMs, run.runId);
       if (dueAtMs > request.scheduledTime) {
         return { state: 'not-due', cleanup: null } satisfies EnforceRetentionResult;
       }
@@ -562,8 +589,9 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async cleanupNow(request: ScheduleCleanupRequest): Promise<CleanupRecord | null> {
+    request = validateCleanupRequest(request, false);
     if (!(await this.ctx.storage.get<CleanupRecord>(CLEANUP_RECORD_KEY))) {
-      await this.scheduleCleanup({ ...request, retentionMs: Math.max(1, request.retentionMs) });
+      await this.scheduleCleanup(request);
     }
     await this.ctx.storage.transaction(async (txn) => {
       const cleanup = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
@@ -841,7 +869,6 @@ export class WorkflowRunDO extends DurableObject {
     const hookMarkers = Array.from(hookEntries).slice(0, HOOK_MARKER_PAGE_SIZE);
     await this.workflowIndex().expireRun({
       runId: cleanup.runId,
-      keys: [workflowRunIndexKey(cleanup), globalRunIndexKey(cleanup)],
       hooks: hookMarkers.map(([, value]) => value),
       expiredAt: cleanup.dueAt.getTime(),
     });

@@ -24,7 +24,7 @@ function queueRequest(messageId: string, runId: string): EnqueueRequest {
     runId,
     queueName: '__wkf_workflow_lifecycle_evidence',
     pathname: 'flow',
-    body: '{}',
+    body: JSON.stringify({ runId }),
     delaySeconds: 3_600,
     config: { targetBaseUrl: 'http://app.invalid', queueShards: 1 },
   };
@@ -696,8 +696,9 @@ describe('sharded index scalability evidence', () => {
     expect(internalCatalogExpireCalls).toBe(1);
     expect(report.indexStorage.runCatalog).toEqual({
       ...emptyCounts(),
-      get: 1,
+      get: 2,
       put: 2,
+      delete: 1,
       deleteMany: 1,
       transaction: 1,
     });

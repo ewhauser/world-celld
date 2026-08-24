@@ -16,12 +16,12 @@
  *   HTTP statuses. QueueDO deliveries and the in-process test pump hit the
  *   exact same handler path.
  */
-import { setTimeout as delay } from 'node:timers/promises';
 import { WorkflowWorldError } from '@workflow/errors';
 import { RunExpiredError } from '@workflow/errors';
 import {
   MessageId,
   parseQueueName,
+  QueuePayloadSchema,
   type Queue,
   type QueuePayload,
   type ValidQueueName,
@@ -29,6 +29,32 @@ import {
 import { parse, stringify } from './vendor/shared/index.js';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
+import {
+  MAX_QUEUE_DELIVERY_TIMEOUT_MS,
+  MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+} from './lifecycle.js';
+import {
+  boundedIntegerOption,
+  checkedQueueTimestampAdd,
+  queueDelayDeadline,
+  strictIntegerSetting,
+} from './validation.js';
+
+const MAX_TIMER_DELAY_MS = 0x7fffffff;
+const MAX_TEST_PUMP_BACKOFF_MS = 60_000;
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function delayFor(milliseconds: number): Promise<void> {
+  let remaining = milliseconds;
+  while (remaining > MAX_TIMER_DELAY_MS) {
+    await delay(MAX_TIMER_DELAY_MS);
+    remaining -= MAX_TIMER_DELAY_MS;
+  }
+  await delay(remaining);
+}
 
 /**
  * HTTP status codes that indicate permanent (non-retryable) failures.
@@ -130,11 +156,11 @@ export interface CelldQueueConfig {
   baseUrl?: string;
   /** Number of `q:<shard>` cells to spread enqueues over. Default: 1 */
   queueShards?: number;
-  /** Per-job HTTP request timeout (ms) for the test pump. Default: 300_000 */
+  /** Per-job HTTP request timeout (ms) for the test pump. Default/max: 300_000 */
   httpTimeoutMs?: number;
   /** Maximum retry attempts in the test pump before dropping a job. Default: 5 */
   maxAttempts?: number;
-  /** Base backoff delay (ms) for test pump retries. Default: 1000 */
+  /** Base backoff delay (ms) for test pump retries. Default: 1000; maximum: 60_000 */
   backoffDelayMs?: number;
 }
 
@@ -158,6 +184,9 @@ function resolveBaseUrl(config: CelldQueueConfig): string {
  * land on the same cell so dedup stays strictly consistent.
  */
 export function shardFor(key: string, shards: number): number {
+  if (!Number.isSafeInteger(shards) || shards < 1) {
+    throw new Error('world-celld queueShards must be a positive safe integer');
+  }
   if (shards <= 1) return 0;
   let hash = 0x811c9dc5;
   for (let i = 0; i < key.length; i++) {
@@ -180,9 +209,26 @@ export function shardFor(key: string, shards: number): number {
  * matching QueueDO's production semantics.
  */
 function createTestPump(config: CelldQueueConfig) {
-  const httpTimeoutMs = config.httpTimeoutMs ?? 300_000;
-  const maxAttempts = config.maxAttempts ?? 5;
-  const baseBackoffMs = config.backoffDelayMs ?? 1000;
+  const httpTimeoutMs = boundedIntegerOption(
+    'world-celld test pump httpTimeoutMs',
+    config.httpTimeoutMs,
+    300_000,
+    1,
+    MAX_QUEUE_DELIVERY_TIMEOUT_MS,
+  );
+  const maxAttempts = boundedIntegerOption(
+    'world-celld test pump maxAttempts',
+    config.maxAttempts,
+    5,
+    1,
+  );
+  const baseBackoffMs = boundedIntegerOption(
+    'world-celld test pump backoffDelayMs',
+    config.backoffDelayMs,
+    1000,
+    0,
+    MAX_TEST_PUMP_BACKOFF_MS,
+  );
 
   const queues: Record<Pathname, PumpEnvelope[]> = { flow: [] };
   const wakers: Record<Pathname, Array<() => void>> = { flow: [] };
@@ -244,9 +290,16 @@ function createTestPump(config: CelldQueueConfig) {
         parsed = null;
       }
       const timeoutSeconds = (parsed as { timeoutSeconds?: number } | null)?.timeoutSeconds;
-      if (typeof timeoutSeconds === 'number') {
+      const now = Date.now();
+      const redeliveryAt = queueDelayDeadline(
+        now,
+        timeoutSeconds,
+        1,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      );
+      if (redeliveryAt !== null) {
         // Same message re-delivered later: the idempotency key stays claimed.
-        void delay(timeoutSeconds * 1000).then(() => enqueue(pathname, envelope));
+        void delayFor(redeliveryAt - now).then(() => enqueue(pathname, envelope));
         return;
       }
     }
@@ -261,8 +314,21 @@ function createTestPump(config: CelldQueueConfig) {
 
     if (envelope.attempt < maxAttempts) {
       const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
-      const backoff = baseBackoffMs * 2 ** (next.attempt - 1);
-      void delay(backoff).then(() => enqueue(pathname, next));
+      const backoff = Math.min(
+        MAX_TEST_PUMP_BACKOFF_MS,
+        baseBackoffMs * 2 ** Math.min(next.attempt - 1, 30),
+      );
+      if (
+        checkedQueueTimestampAdd(Date.now(), backoff, MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS) ===
+        null
+      ) {
+        release(envelope);
+        console.error(
+          `[world-celld test pump] dropping ${envelope.messageId}: retry deadline exceeds the queue timestamp horizon`,
+        );
+        return;
+      }
+      void delayFor(backoff).then(() => enqueue(pathname, next));
     } else {
       release(envelope);
       console.error(
@@ -291,11 +357,21 @@ function createTestPump(config: CelldQueueConfig) {
       return idempotencyKey ? inflightMessages.get(idempotencyKey) : undefined;
     },
     push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number) {
+      if (
+        queueDelayDeadline(
+          Date.now(),
+          delaySeconds ?? 0,
+          0,
+          MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+        ) === null
+      ) {
+        throw new Error('world-celld queue delaySeconds lacks required delivery headroom');
+      }
       if (envelope.idempotencyKey) {
         inflightMessages.set(envelope.idempotencyKey, MessageId.parse(envelope.messageId));
       }
       if (delaySeconds && delaySeconds > 0) {
-        void delay(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
+        void delayFor(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
       } else {
         enqueue(pathname, envelope);
       }
@@ -314,7 +390,10 @@ function createTestPump(config: CelldQueueConfig) {
 
 export function createQueue(config: CelldQueueConfig): Queue & { start(): Promise<void> } {
   const { env, deploymentId } = config;
-  const queueShards = config.queueShards ?? 1;
+  if (!env?.WORKFLOW_QUEUE) {
+    throw new Error('world-celld queue missing WORKFLOW_QUEUE binding');
+  }
+  const queueShards = boundedIntegerOption('world-celld queueShards', config.queueShards, 1, 1);
 
   const generateMessageId = monotonicFactory();
   const testPump = createTestPump(config);
@@ -327,8 +406,24 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
   return {
     async queue(queueName, message, opts) {
       parseQueueName(queueName);
+      const parsedMessage = QueuePayloadSchema.safeParse(message);
+      if (!parsedMessage.success) {
+        throw new WorkflowWorldError('world-celld queue payload is invalid', { status: 422 });
+      }
+      if (
+        queueDelayDeadline(
+          Date.now(),
+          opts?.delaySeconds ?? 0,
+          0,
+          MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+        ) === null
+      ) {
+        throw new Error('world-celld queue delaySeconds lacks required delivery headroom');
+      }
       const runId =
-        'runId' in message && typeof message.runId === 'string' ? message.runId : undefined;
+        'runId' in parsedMessage.data && typeof parsedMessage.data.runId === 'string'
+          ? parsedMessage.data.runId
+          : undefined;
 
       if (isTestMode()) {
         // Dedup on idempotencyKey while a message with the same key is in
@@ -345,7 +440,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
             messageId,
             queueName,
             attempt: 1,
-            message,
+            message: parsedMessage.data,
             idempotencyKey: opts?.idempotencyKey,
           },
           opts?.delaySeconds,
@@ -362,7 +457,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         messageId,
         queueName,
         pathname: QUEUE_PATHNAME,
-        body: stringify(message),
+        body: stringify(parsedMessage.data),
         runId,
         idempotencyKey: opts?.idempotencyKey,
         delaySeconds: opts?.delaySeconds,
@@ -391,6 +486,15 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
       // - 404/409/410/422         -> permanent, drop without retrying
       // - other non-2xx           -> retry with capped backoff
       return async (req: Request) => {
+        if (req.method !== 'POST') {
+          return Response.json({ error: 'Expected POST' }, { status: 405 });
+        }
+        if (
+          req.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() !==
+          'application/json'
+        ) {
+          return Response.json({ error: 'Expected application/json' }, { status: 415 });
+        }
         const reqQueueName = req.headers.get('x-vqs-queue-name');
         const reqMessageId = req.headers.get('x-vqs-message-id') as MessageId | null;
         const attemptStr = req.headers.get('x-vqs-message-attempt');
@@ -401,16 +505,40 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         if (!reqQueueName.startsWith(queueNamePrefix)) {
           return Response.json({ error: 'Unhandled queue' }, { status: 400 });
         }
-        const attempt = Number.parseInt(attemptStr, 10);
+        let attempt: number;
+        try {
+          attempt = strictIntegerSetting('x-vqs-message-attempt', attemptStr, 1, 1);
+        } catch {
+          return Response.json({ error: 'Invalid x-vqs-message-attempt header' }, { status: 400 });
+        }
         try {
           // Tagged-JSON codec: revives Uint8Array payloads (runInput.input).
-          const body = parse<unknown>(await req.text());
-          const result = await handler(body, {
+          let body: unknown;
+          try {
+            body = parse<unknown>(await req.text());
+          } catch {
+            return Response.json({ error: 'Malformed tagged JSON body' }, { status: 422 });
+          }
+          const parsedBody = QueuePayloadSchema.safeParse(body);
+          if (!parsedBody.success) {
+            return Response.json({ error: 'Invalid queue payload' }, { status: 422 });
+          }
+          const result = await handler(parsedBody.data, {
             attempt,
             queueName: reqQueueName,
             messageId: reqMessageId,
           });
           if (result && typeof result.timeoutSeconds === 'number') {
+            if (
+              queueDelayDeadline(
+                Date.now(),
+                result.timeoutSeconds,
+                1,
+                MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+              ) === null
+            ) {
+              throw new Error('Queue handler timeoutSeconds is out of range');
+            }
             return Response.json(
               { timeoutSeconds: result.timeoutSeconds },
               { status: 503, headers: { 'Retry-After': String(result.timeoutSeconds) } },

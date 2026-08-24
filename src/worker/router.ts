@@ -11,19 +11,15 @@
  * Generic RPC bodies use the tagged JSON codec. Stream chunk bodies use the
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
-import { SPEC_VERSION_CURRENT, type WorkflowRun } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { rpcParse, rpcStringify } from '../codec.js';
-import type { HookTokenOwner } from '../config.js';
 import {
   createWorkflowIndex,
   type CellNamespaceLike,
-  type HookReservation,
   type HookIdShardStub,
   type HookTokenShardStub,
-  type IndexListOptions,
   type RunCatalogShardStub,
 } from '../indexes.js';
-import type { ExpireRunIndexesRequest, ReleaseHookIndexesRequest } from '../retention.js';
 import {
   MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_CHUNK_BYTES,
@@ -39,6 +35,7 @@ import {
   type StreamWriteResult,
 } from '../stream-protocol.js';
 import { authenticate } from './auth.js';
+import { INDEX_OPERATIONS, type IndexOperation, validateIndexRequest } from './index-validation.js';
 
 export const WORLD_NAME = 'world-celld';
 export const WORLD_VERSION = '0.1.0';
@@ -132,6 +129,40 @@ function errorResponse(status: number, name: string, message: string): Response 
   return Response.json({ error: { name, message } }, { status });
 }
 
+function hasContentType(request: Request, expected: string): boolean {
+  return (
+    request.headers.get('content-type')?.split(';', 1)[0].trim().toLowerCase() ===
+    expected.toLowerCase()
+  );
+}
+
+function declaredContentLength(request: Request): number | null {
+  const raw = request.headers.get('content-length');
+  if (raw === null) return null;
+  if (!/^\d+$/.test(raw)) {
+    const error = new Error('content-length must be a non-negative integer');
+    error.name = 'RequestValidationError';
+    throw error;
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value)) {
+    const error = new Error('content-length is out of range');
+    error.name = 'RequestValidationError';
+    throw error;
+  }
+  return value;
+}
+
+function decodePathComponent(value: string, name: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    const error = new Error(`${name} has malformed percent encoding`);
+    error.name = 'RequestValidationError';
+    throw error;
+  }
+}
+
 async function readBoundedBody(request: Request): Promise<string | null> {
   if (!request.body) return '';
   const reader = request.body.getReader();
@@ -185,7 +216,7 @@ async function readBoundedBytes(request: Request, maxBytes: number): Promise<Uin
 
 function parseBoundedInteger(url: URL, name: string, minimum: number, maximum: number): number {
   const raw = url.searchParams.get(name);
-  const value = raw === null ? Number.NaN : Number(raw);
+  const value = raw !== null && /^\d+$/.test(raw) ? Number(raw) : Number.NaN;
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     const error = new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
     error.name = 'StreamProtocolError';
@@ -211,6 +242,9 @@ export function createRouter(env: WorkerEnv) {
     }
 
     if (parts[1] === 'health' && parts.length === 2) {
+      if (request.method !== 'GET') {
+        return errorResponse(405, 'MethodNotAllowed', 'expected GET');
+      }
       return Response.json({
         ok: true,
         name: WORLD_NAME,
@@ -228,8 +262,25 @@ export function createRouter(env: WorkerEnv) {
       if (request.method !== 'POST') {
         return errorResponse(405, 'MethodNotAllowed', 'expected POST');
       }
-      const contentLength = Number(request.headers.get('content-length') ?? '0');
-      if (contentLength > MAX_BODY_BYTES) {
+      if (!hasContentType(request, 'application/json')) {
+        return errorResponse(415, 'UnsupportedMediaType', 'expected application/json');
+      }
+      for (const required of [
+        'WORKFLOW_RUN_CATALOG',
+        'WORKFLOW_HOOK_TOKENS',
+        'WORKFLOW_HOOK_IDS',
+      ] as const) {
+        if (!env[required]) {
+          return errorResponse(500, 'WorldMisconfigured', `missing binding: ${required}`);
+        }
+      }
+      let contentLength: number | null;
+      try {
+        contentLength = declaredContentLength(request);
+      } catch (error) {
+        return errorResponse(400, 'BadRequest', (error as Error).message);
+      }
+      if (contentLength !== null && contentLength > MAX_BODY_BYTES) {
         return errorResponse(413, 'PayloadTooLarge', `body exceeds ${MAX_BODY_BYTES} bytes`);
       }
       let args: unknown[];
@@ -246,40 +297,41 @@ export function createRouter(env: WorkerEnv) {
       } catch {
         return errorResponse(400, 'BadRequest', 'malformed rpc body');
       }
+      const operation = `${parts[2]}.${parts[3]}`;
+      if (!INDEX_OPERATIONS.has(operation as IndexOperation)) {
+        return errorResponse(404, 'NotFound', `unknown index operation: ${operation}`);
+      }
+      let validated;
+      try {
+        validated = validateIndexRequest(operation as IndexOperation, args);
+      } catch (error) {
+        return errorResponse(400, 'BadRequest', (error as Error).message);
+      }
       try {
         const index = workflowIndex(env);
         let result: unknown;
-        const operation = `${parts[2]}.${parts[3]}`;
-        if (operation === 'runs.list') {
-          result = await index.listRuns(args[0] as IndexListOptions | undefined);
-        } else if (operation === 'runs.commit') {
-          result = await index.commitRun(
-            args[0] as WorkflowRun,
-            args[1] as string,
-            args[2] as number,
-          );
-        } else if (operation === 'runs.expire') {
-          result = await index.expireRun(args[0] as ExpireRunIndexesRequest);
-        } else if (operation === 'hooks.reserve') {
-          result = await index.reserveHook(args[0] as string, args[1] as HookTokenOwner);
-        } else if (operation === 'hooks.finalize') {
-          result = await index.finalizeHookIndexes(
-            args[0] as string,
-            args[1] as string,
-            args[2] as string,
-            args[3] as HookTokenOwner,
-            args[4] as HookReservation | undefined,
-          );
-        } else if (operation === 'hooks.release-reservation') {
-          result = await index.releaseHookReservation(
-            args[0] as string,
-            args[1] as HookTokenOwner,
-            args[2] as HookReservation,
-          );
-        } else if (operation === 'hooks.release') {
-          result = await index.releaseHookIndexes(args[0] as ReleaseHookIndexesRequest);
-        } else {
-          return errorResponse(404, 'NotFound', `unknown index operation: ${operation}`);
+        switch (validated.operation) {
+          case 'runs.list':
+            result = await index.listRuns(...validated.args);
+            break;
+          case 'runs.commit':
+            result = await index.commitRun(...validated.args);
+            break;
+          case 'runs.expire':
+            result = await index.expireRun(...validated.args);
+            break;
+          case 'hooks.reserve':
+            result = await index.reserveHook(...validated.args);
+            break;
+          case 'hooks.finalize':
+            result = await index.finalizeHookIndexes(...validated.args);
+            break;
+          case 'hooks.release-reservation':
+            result = await index.releaseHookReservation(...validated.args);
+            break;
+          case 'hooks.release':
+            result = await index.releaseHookIndexes(...validated.args);
+            break;
         }
         return new Response(rpcStringify(result ?? null), {
           status: 200,
@@ -301,25 +353,22 @@ export function createRouter(env: WorkerEnv) {
     }
 
     if (parts[1] === 'streams' && parts.length === 4 && parts[3] === 'chunks') {
-      const namespace = env.WORKFLOW_STREAMS;
-      if (!namespace) {
-        return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_STREAMS');
-      }
-      const name = decodeURIComponent(parts[2]);
       const runId = url.searchParams.get('runId');
       if (!runId) return errorResponse(400, 'BadRequest', 'runId is required');
-      const stub = namespace.get(namespace.idFromName(name)) as {
-        writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult>;
-        readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult>;
-      };
+      let name: string;
+      try {
+        name = decodePathComponent(parts[2], 'stream name');
+      } catch (error) {
+        return errorResponse(400, 'BadRequest', (error as Error).message);
+      }
 
       try {
         if (request.method === 'POST') {
-          if (!request.headers.get('content-type')?.startsWith(STREAM_BATCH_CONTENT_TYPE)) {
+          if (!hasContentType(request, STREAM_BATCH_CONTENT_TYPE)) {
             return errorResponse(415, 'UnsupportedMediaType', STREAM_BATCH_CONTENT_TYPE);
           }
-          const contentLength = Number(request.headers.get('content-length') ?? '0');
-          if (contentLength > MAX_STREAM_WRITE_BODY_BYTES) {
+          const contentLength = declaredContentLength(request);
+          if (contentLength !== null && contentLength > MAX_STREAM_WRITE_BODY_BYTES) {
             return errorResponse(
               413,
               'PayloadTooLarge',
@@ -334,26 +383,39 @@ export function createRouter(env: WorkerEnv) {
               `body exceeds ${MAX_STREAM_WRITE_BODY_BYTES} bytes`,
             );
           }
-          const result = await stub.writeChunks(runId, decodeStreamWriteBatch(body));
+          const chunks = decodeStreamWriteBatch(body);
+          const namespace = env.WORKFLOW_STREAMS;
+          if (!namespace) {
+            return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_STREAMS');
+          }
+          const stub = namespace.get(namespace.idFromName(name)) as {
+            writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult>;
+          };
+          const result = await stub.writeChunks(runId, chunks);
           return streamResponse(encodeStreamWriteResult(result));
         }
 
         if (request.method === 'GET') {
-          const result = await stub.readChunks(
-            {
-              runId,
-              startIndex: parseBoundedInteger(url, 'startIndex', 0, 0x7fffffff),
-              maxChunks: parseBoundedInteger(url, 'maxChunks', 0, MAX_STREAM_READ_CHUNKS),
-              maxBytes: parseBoundedInteger(
-                url,
-                'maxBytes',
-                MAX_STREAM_CHUNK_BYTES,
-                MAX_STREAM_READ_BYTES,
-              ),
-              waitMs: parseBoundedInteger(url, 'waitMs', 0, MAX_STREAM_LONG_POLL_MS),
-            },
-            request.signal,
-          );
+          const readRequest = {
+            runId,
+            startIndex: parseBoundedInteger(url, 'startIndex', 0, 0x7fffffff),
+            maxChunks: parseBoundedInteger(url, 'maxChunks', 0, MAX_STREAM_READ_CHUNKS),
+            maxBytes: parseBoundedInteger(
+              url,
+              'maxBytes',
+              MAX_STREAM_CHUNK_BYTES,
+              MAX_STREAM_READ_BYTES,
+            ),
+            waitMs: parseBoundedInteger(url, 'waitMs', 0, MAX_STREAM_LONG_POLL_MS),
+          } satisfies StreamReadRequest;
+          const namespace = env.WORKFLOW_STREAMS;
+          if (!namespace) {
+            return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_STREAMS');
+          }
+          const stub = namespace.get(namespace.idFromName(name)) as {
+            readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult>;
+          };
+          const result = await stub.readChunks(readRequest, request.signal);
           return streamResponse(encodeStreamReadResult(result));
         }
 
@@ -368,7 +430,12 @@ export function createRouter(env: WorkerEnv) {
               status: typeof err?.status === 'number' ? err.status : undefined,
             },
           },
-          { status: err?.name === 'StreamProtocolError' ? 400 : 500 },
+          {
+            status:
+              err?.name === 'StreamProtocolError' || err?.name === 'RequestValidationError'
+                ? 400
+                : 500,
+          },
         );
       }
     }
@@ -377,8 +444,11 @@ export function createRouter(env: WorkerEnv) {
       return errorResponse(404, 'NotFound', `unknown path: ${url.pathname}`);
     }
 
-    if (request.method !== 'POST' || parts.length !== 5) {
+    if (parts.length !== 5) {
       return errorResponse(404, 'NotFound', 'expected POST /v1/rpc/{binding}/{name}/{method}');
+    }
+    if (request.method !== 'POST') {
+      return errorResponse(405, 'MethodNotAllowed', 'expected POST');
     }
 
     const [, , bindingKey, encodedName, method] = parts;
@@ -390,8 +460,26 @@ export function createRouter(env: WorkerEnv) {
       return errorResponse(404, 'NotFound', `unknown method: ${bindingKey}.${method}`);
     }
 
-    const contentLength = Number(request.headers.get('content-length') ?? '0');
-    if (contentLength > MAX_BODY_BYTES) {
+    if (!hasContentType(request, 'application/json')) {
+      return errorResponse(415, 'UnsupportedMediaType', 'expected application/json');
+    }
+    let name: string;
+    try {
+      name = decodePathComponent(encodedName, 'Durable Object name');
+    } catch (error) {
+      return errorResponse(400, 'BadRequest', (error as Error).message);
+    }
+    const namespace = env[binding.env] as DONamespaceLike | undefined;
+    if (!namespace) {
+      return errorResponse(500, 'WorldMisconfigured', `missing binding: ${binding.env}`);
+    }
+    let contentLength: number | null;
+    try {
+      contentLength = declaredContentLength(request);
+    } catch (error) {
+      return errorResponse(400, 'BadRequest', (error as Error).message);
+    }
+    if (contentLength !== null && contentLength > MAX_BODY_BYTES) {
       return errorResponse(413, 'PayloadTooLarge', `body exceeds ${MAX_BODY_BYTES} bytes`);
     }
 
@@ -408,12 +496,6 @@ export function createRouter(env: WorkerEnv) {
       args = parsed;
     } catch {
       return errorResponse(400, 'BadRequest', 'malformed rpc body');
-    }
-
-    const name = decodeURIComponent(encodedName);
-    const namespace = env[binding.env] as DONamespaceLike | undefined;
-    if (!namespace) {
-      return errorResponse(500, 'WorldMisconfigured', `missing binding: ${binding.env}`);
     }
 
     try {

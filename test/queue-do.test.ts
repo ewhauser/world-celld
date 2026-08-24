@@ -4,10 +4,21 @@
  */
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { EnqueueRequest } from '../src/queue.js';
+import { stringify } from '../src/vendor/shared/index.js';
 import { QueueDO, type MessageRow } from '../src/worker/durable-objects/QueueDO.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
-import { LIFECYCLE_COMPACTION_RETRY_MS, QUEUE_FENCE_GRACE_MS } from '../src/lifecycle.js';
+import {
+  LIFECYCLE_COMPACTION_RETRY_MS,
+  MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+  MAX_QUEUE_SCHEDULE_TIMESTAMP_MS,
+  QUEUE_FENCE_GRACE_MS,
+} from '../src/lifecycle.js';
 import type { RunLifecycleStatus } from '../src/retention.js';
+import {
+  checkedQueueTimestampAdd,
+  MAX_QUEUE_DELAY_SECONDS,
+  MAX_QUEUE_TIMESTAMP_MS,
+} from '../src/validation.js';
 
 class TestRunLifecycleDO {
   constructor(private ctx: { storage: DurableObjectStorage }) {}
@@ -23,14 +34,19 @@ function jsonResponse(status: number, body?: unknown, headers?: Record<string, s
   return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
 }
 
-const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
-  messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
-  queueName: '__wkf_workflow_test',
-  pathname: 'flow',
-  body: '{"data":"payload"}',
-  config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
-  ...over,
-});
+const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => {
+  const payload = over.runId
+    ? { runId: over.runId }
+    : { __healthCheck: true as const, correlationId: 'queue-do-test' };
+  return {
+    messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
+    queueName: '__wkf_workflow_test',
+    pathname: 'flow',
+    body: JSON.stringify(payload),
+    config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
+    ...over,
+  };
+};
 
 const MIN_TEST_ALARM_DELAY_MS = 1;
 const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
@@ -44,11 +60,21 @@ function storedMessage(messageId: string, now: number): MessageRow {
     messageId,
     queueName: '__wkf_workflow_test',
     pathname: 'flow',
-    body: '{"data":"payload"}',
+    body: '{"__healthCheck":true,"correlationId":"queue-do-test"}',
     targetBaseUrl: 'http://app.test:3000',
     attempt: 0,
     enqueuedAt: now,
   };
+}
+
+function expectQueueTimestampContract(data: Map<string, unknown>, alarmAt: number | null): void {
+  const timestamped = /^(?:due|inflight-deadline|dlq|expired-run-gc):(\d+):/;
+  const timestamps = Array.from(data.keys()).flatMap((key) => {
+    const match = timestamped.exec(key);
+    return match ? [match[1]] : [];
+  });
+  expect(timestamps.every((timestamp) => /^\d{13}$/.test(timestamp))).toBe(true);
+  expect(alarmAt === null || alarmAt <= MAX_QUEUE_TIMESTAMP_MS).toBe(true);
 }
 
 describe('QueueDO', () => {
@@ -101,7 +127,7 @@ describe('QueueDO', () => {
     expect(init.headers['x-vqs-queue-name']).toBe('__wkf_workflow_test');
     expect(init.headers['x-vqs-message-id']).toBe('msg_1');
     expect(init.headers['x-vqs-message-attempt']).toBe('1');
-    expect(init.body).toBe('{"data":"payload"}');
+    expect(init.body).toBe('{"__healthCheck":true,"correlationId":"queue-do-test"}');
 
     // Fully settled: no message, schedule, claim, or alarm left behind.
     const keys = Array.from(storage().keys());
@@ -123,6 +149,124 @@ describe('QueueDO', () => {
     await expect(invalidQueue.enqueue(enqueueReq())).rejects.toThrow(
       'QUEUE_MAX_INFLIGHT must be at most 128',
     );
+  });
+
+  it.each([
+    ['QUEUE_MAX_ATTEMPTS', '5junk'],
+    ['QUEUE_MAX_ATTEMPTS', '0'],
+    ['QUEUE_MAX_ATTEMPTS', '1.5'],
+    ['QUEUE_MAX_ATTEMPTS', ''],
+    ['QUEUE_MAX_INFLIGHT', '5junk'],
+    ['QUEUE_MAX_INFLIGHT', '0'],
+    ['QUEUE_DELIVERY_TIMEOUT_MS', '5junk'],
+    ['QUEUE_DELIVERY_TIMEOUT_MS', '0'],
+    ['QUEUE_DELIVERY_TIMEOUT_MS', '300001'],
+  ] as const)(
+    'rejects malformed runtime setting %s=%j before queue mutation',
+    async (name, value) => {
+      const invalidFleet = new FakeFleet(
+        { queue: QueueDO },
+        { [name]: value, clock: () => invalidFleet.now, fetch: fetchStub },
+      );
+      const invalidQueue = invalidFleet
+        .namespace('queue')
+        .get({ toString: () => 'q:0' }) as QueueDO;
+
+      await expect(invalidQueue.enqueue(enqueueReq())).rejects.toThrow(name);
+      const invalidStorage = invalidFleet.cell('queue', 'q:0').storage;
+      expect(invalidStorage.data.size).toBe(0);
+      expect(invalidStorage.alarmAt).toBeNull();
+      expect(fetchStub).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 0 } },
+    { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1.5 } },
+    {
+      config: {
+        targetBaseUrl: 'http://app.test:3000',
+        queueShards: Number.MAX_SAFE_INTEGER + 1,
+      },
+    },
+    { delaySeconds: -1 },
+    { delaySeconds: MAX_QUEUE_DELAY_SECONDS },
+    { delaySeconds: Number.MAX_SAFE_INTEGER },
+    { body: 'null' },
+    { body: '{}' },
+    { body: '{"data":"not-a-queue-payload"}' },
+    { body: '{"payload":{"__type":"Uint8Array"}}' },
+  ])('rejects malformed enqueue envelope before queue mutation: %j', async (over) => {
+    await expect(queue.enqueue(enqueueReq(over as Partial<EnqueueRequest>))).rejects.toThrow(
+      /world-celld queue enqueue/,
+    );
+    expect(storage().size).toBe(0);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBeNull();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('classifies an invalid payload as permanent 422 without storage or delivery', async () => {
+    await expect(queue.enqueue(enqueueReq({ body: '{}' }))).rejects.toMatchObject({ status: 422 });
+    expect(storage().size).toBe(0);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBeNull();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('accepts and stores a valid tagged-JSON queue payload byte-identically', async () => {
+    const runId = 'wrun_tagged_queue_payload';
+    setRunStatus(runId, 'active');
+    const body = stringify({
+      runId,
+      runInput: {
+        input: new Uint8Array([0, 1, 254, 255]),
+        deploymentId: 'queue-do-tests',
+        workflowName: 'tagged-payload',
+        specVersion: 6,
+      },
+    });
+
+    await expect(
+      queue.enqueue(enqueueReq({ messageId: 'msg_tagged_payload', runId, body, delaySeconds: 60 })),
+    ).resolves.toMatchObject({ ok: true });
+    expect(storage().get('msg:msg_tagged_payload')).toMatchObject({ body });
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it.each([129, Number.MAX_SAFE_INTEGER])(
+    'accepts a positive safe queue shard count %s',
+    async (queueShards) => {
+      const isolatedFleet = new FakeFleet(
+        { queue: QueueDO, runs: TestRunLifecycleDO as never },
+        { clock: () => isolatedFleet.now, fetch: fetchStub },
+      );
+      const isolatedQueue = isolatedFleet.namespace('queue').get({
+        toString: () => 'q:0',
+      }) as QueueDO;
+      await expect(
+        isolatedQueue.enqueue(
+          enqueueReq({
+            messageId: `msg_shards_${queueShards}`,
+            config: { targetBaseUrl: 'http://app.test:3000', queueShards },
+          }),
+        ),
+      ).resolves.toMatchObject({ ok: true });
+    },
+  );
+
+  it('rejects a run-owned enqueue when WORKFLOW_DB is missing without persisting it', async () => {
+    const missingBindingFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => missingBindingFleet.now, fetch: fetchStub },
+    );
+    const missingBindingQueue = missingBindingFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+
+    await expect(
+      missingBindingQueue.enqueue(enqueueReq({ runId: 'wrun_missing_binding' })),
+    ).rejects.toThrow(/missing WORKFLOW_DB/);
+    expect(missingBindingFleet.cell('queue', 'q:0').storage.data.size).toBe(0);
+    expect(fetchStub).not.toHaveBeenCalled();
   });
 
   it('dedups on idempotencyKey while active and releases after ack', async () => {
@@ -275,6 +419,160 @@ describe('QueueDO', () => {
     expect(fetchStub).toHaveBeenCalledOnce();
   });
 
+  it('orders ordinary and far-future deadlines through the exact admissible boundary', async () => {
+    const startTime = 998;
+    const boundaryFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => boundaryFleet.now, fetch: fetchStub },
+      startTime,
+    );
+    const boundaryQueue = boundaryFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    const exactBoundaryDelay = (MAX_QUEUE_SCHEDULE_TIMESTAMP_MS - startTime) / 1000;
+
+    await boundaryQueue.enqueue(
+      enqueueReq({ messageId: 'msg_boundary', delaySeconds: exactBoundaryDelay }),
+    );
+    await boundaryQueue.enqueue(enqueueReq({ messageId: 'msg_ordinary', delaySeconds: 1 }));
+    const boundaryStorage = boundaryFleet.cell('queue', 'q:0').storage;
+    expect(Array.from((await boundaryStorage.list<string>({ prefix: 'due:' })).keys())).toEqual([
+      `due:${padded(startTime + 1_000)}:msg_ordinary`,
+      `due:${padded(MAX_QUEUE_SCHEDULE_TIMESTAMP_MS)}:msg_boundary`,
+    ]);
+    expect(boundaryStorage.alarmAt).toBe(startTime + 1_000);
+    await expect(
+      boundaryQueue.enqueue(
+        enqueueReq({
+          messageId: 'msg_over_boundary',
+          delaySeconds: exactBoundaryDelay + 1,
+        }),
+      ),
+    ).rejects.toThrow(/delaySeconds/);
+    expect(
+      checkedQueueTimestampAdd(
+        MAX_QUEUE_SCHEDULE_TIMESTAMP_MS,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      ),
+    ).toBe(MAX_QUEUE_TIMESTAMP_MS);
+    expect(
+      checkedQueueTimestampAdd(
+        MAX_QUEUE_SCHEDULE_TIMESTAMP_MS + 1,
+        0,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      ),
+    ).toBeNull();
+    expect(checkedQueueTimestampAdd(MAX_QUEUE_TIMESTAMP_MS, 0)).toBe(MAX_QUEUE_TIMESTAMP_MS);
+    expect(checkedQueueTimestampAdd(MAX_QUEUE_TIMESTAMP_MS, 1)).toBeNull();
+    const oneMillisecondOverFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => oneMillisecondOverFleet.now, fetch: fetchStub },
+      MAX_QUEUE_SCHEDULE_TIMESTAMP_MS + 1,
+    );
+    const oneMillisecondOverQueue = oneMillisecondOverFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    await expect(
+      oneMillisecondOverQueue.enqueue(enqueueReq({ messageId: 'msg_one_ms_over' })),
+    ).rejects.toThrow(/delivery headroom/);
+    const oneMillisecondOverStorage = oneMillisecondOverFleet.cell('queue', 'q:0').storage;
+    expect(oneMillisecondOverStorage.data.size).toBe(0);
+    expect(oneMillisecondOverStorage.alarmAt).toBeNull();
+
+    boundaryFleet.advance(1_000);
+    await boundaryFleet.fireDueAlarms();
+    expect(fetchStub).toHaveBeenCalledOnce();
+    expect(boundaryStorage.data.has('msg:msg_boundary')).toBe(true);
+    expect(boundaryStorage.alarmAt).toBe(MAX_QUEUE_SCHEDULE_TIMESTAMP_MS);
+
+    boundaryFleet.advance(MAX_QUEUE_SCHEDULE_TIMESTAMP_MS - boundaryFleet.now);
+    await boundaryFleet.fireDueAlarms();
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(boundaryStorage.data.has('msg:msg_boundary')).toBe(false);
+    expectQueueTimestampContract(boundaryStorage.data, boundaryStorage.alarmAt);
+  });
+
+  it.each([
+    ['HTTP 500', jsonResponse(500, { error: 'boom' })],
+    ['valid 503 hint', jsonResponse(503, { timeoutSeconds: 1 })],
+    ['missing 503 hint', jsonResponse(503, {})],
+    ['malformed 503 hint', jsonResponse(503, { timeoutSeconds: '5junk' })],
+  ])('dead-letters %s at the retry horizon without an overflow cycle', async (_, response) => {
+    const boundaryFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => boundaryFleet.now, fetch: fetchStub },
+      MAX_QUEUE_SCHEDULE_TIMESTAMP_MS,
+    );
+    const boundaryQueue = boundaryFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    const boundaryStorage = boundaryFleet.cell('queue', 'q:0').storage;
+    let sawExactMaxClaim = false;
+    fetchStub.mockImplementation(async () => {
+      sawExactMaxClaim = boundaryStorage.data.has(
+        `${INFLIGHT_DEADLINE_PREFIX}${padded(MAX_QUEUE_TIMESTAMP_MS)}:msg_horizon_retry`,
+      );
+      return response;
+    });
+
+    await boundaryQueue.enqueue(enqueueReq({ messageId: 'msg_horizon_retry' }));
+    boundaryFleet.advance(1);
+    await boundaryFleet.fireDueAlarms();
+    await boundaryFleet.settle();
+
+    expect(fetchStub).toHaveBeenCalledOnce();
+    await expect(boundaryQueue.listDeadLetters()).resolves.toMatchObject({
+      data: [
+        expect.objectContaining({
+          messageId: 'msg_horizon_retry',
+          attempt: 1,
+          lastError: expect.stringContaining('timestamp horizon'),
+        }),
+      ],
+    });
+    expect(sawExactMaxClaim).toBe(true);
+    expect(boundaryStorage.alarmAt).toBeNull();
+    expectQueueTimestampContract(boundaryStorage.data, boundaryStorage.alarmAt);
+  });
+
+  it('dead-letters an unrecoverable max-deadline inflight claim after restart', async () => {
+    const boundaryFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => boundaryFleet.now, fetch: fetchStub },
+      MAX_QUEUE_TIMESTAMP_MS,
+    );
+    const messageId = 'msg_horizon_restart';
+    const boundaryStorage = boundaryFleet.cell('queue', 'q:0').storage;
+    boundaryStorage.data.set(`msg:${messageId}`, {
+      ...storedMessage(messageId, boundaryFleet.now),
+      attempt: 2,
+    });
+    boundaryStorage.data.set(
+      `${INFLIGHT_DEADLINE_PREFIX}${padded(MAX_QUEUE_TIMESTAMP_MS)}:${messageId}`,
+      messageId,
+    );
+    boundaryStorage.alarmAt = MAX_QUEUE_TIMESTAMP_MS;
+    boundaryFleet.restartCell('queue', 'q:0');
+
+    await boundaryFleet.fireDueAlarms();
+
+    const boundaryQueue = boundaryFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    await expect(boundaryQueue.listDeadLetters()).resolves.toMatchObject({
+      data: [
+        expect.objectContaining({
+          messageId,
+          attempt: 2,
+          lastError: expect.stringContaining('inflight recovery'),
+        }),
+      ],
+    });
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(boundaryStorage.alarmAt).toBeNull();
+    expectQueueTimestampContract(boundaryStorage.data, boundaryStorage.alarmAt);
+  });
+
   it('redelivers after 503 {timeoutSeconds} without advancing the attempt', async () => {
     fetchStub
       .mockResolvedValueOnce(jsonResponse(503, { timeoutSeconds: 30 }))
@@ -291,6 +589,40 @@ describe('QueueDO', () => {
     expect(fetchStub).toHaveBeenCalledTimes(2);
     // Same message, attempt header unchanged (503-redeliver is not a retry).
     expect(fetchStub.mock.calls[1][1].headers['x-vqs-message-attempt']).toBe('1');
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER])(
+    'treats invalid 503 timeoutSeconds %s as a normal retry rather than ack or immediate redelivery',
+    async (timeoutSeconds) => {
+      fetchStub.mockResolvedValue(jsonResponse(503, { timeoutSeconds }));
+      await queue.enqueue(enqueueReq({ messageId: 'msg_invalid_timeout' }));
+
+      await tick();
+
+      expect(fetchStub).toHaveBeenCalledOnce();
+      expect(storage().get('msg:msg_invalid_timeout')).toMatchObject({ attempt: 1 });
+      const dueKeys = Array.from(storage().keys()).filter((key) => key.startsWith('due:'));
+      expect(dueKeys).toEqual([`due:${padded(fleet.now + 2_000)}:msg_invalid_timeout`]);
+      expect(Array.from(storage().keys()).some((key) => key.startsWith('dlq:'))).toBe(false);
+    },
+  );
+
+  it('consumes attempts and reaches the DLQ for malformed 503 retry hints', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(503, { timeoutSeconds: '5junk' }));
+    await queue.enqueue(enqueueReq({ messageId: 'msg_malformed_retry_hint' }));
+
+    for (const advance of [0, 2_100, 4_100, 8_100, 16_100]) await tick(advance);
+
+    expect(fetchStub.mock.calls.map((call) => call[1].headers['x-vqs-message-attempt'])).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+    ]);
+    await expect(queue.listDeadLetters()).resolves.toMatchObject({
+      data: [expect.objectContaining({ messageId: 'msg_malformed_retry_hint', attempt: 5 })],
+    });
   });
 
   it('drops permanently on 404/409/410/422 without retrying', async () => {
@@ -629,6 +961,27 @@ describe('QueueDO', () => {
     expect((await queue.stats()).deadLetters).toBe(0);
   });
 
+  it('rejects malformed queue admin input before storage mutation', async () => {
+    const queueStorage = fleet.cell('queue', 'q:0').storage;
+    queueStorage.resetOperationCounts();
+    await expect(queue.listDeadLetters({ limit: 0 })).rejects.toThrow(/dead-letter limit/);
+    await expect(queue.listDeadLetters({ limit: '5' as unknown as number })).rejects.toThrow(
+      /dead-letter limit/,
+    );
+    await expect(queue.redriveDeadLetter('')).rejects.toThrow(/messageId/);
+    await expect(queue.expireRun('', fleet.now)).rejects.toThrow(/runId/);
+    await expect(queue.expireRun('wrun_admin', -1)).rejects.toThrow(/expiredAt/);
+    await expect(queue.expireRun('wrun_admin', fleet.now, { limit: 65 })).rejects.toThrow(/limit/);
+    await expect(
+      queue.expireRun('wrun_admin', fleet.now, { limit: '5' as unknown as number }),
+    ).rejects.toThrow(/limit/);
+    await expect(
+      queue.acknowledgeExpireRun('wrun_admin', { expiredAt: -1, deleted: 0 }),
+    ).rejects.toThrow(/receipt/);
+    expect(queueStorage.operationCounts.transaction).toBe(0);
+    expect(queueStorage.data.size).toBe(0);
+  });
+
   it('purges every message state for an expired run and fences late enqueue', async () => {
     const runId = 'wrun_queue_cleanup';
     await queue.enqueue(
@@ -866,6 +1219,55 @@ describe('QueueDO', () => {
     fleet.advance(QUEUE_FENCE_GRACE_MS);
     await fleet.fireDueAlarms();
     expect(storage().has(`expired-run:${runId}`)).toBe(false);
+  });
+
+  it('schedules expiry-fence GC at the exact timestamp boundary and retains it past the horizon', async () => {
+    const exactFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => exactFleet.now, fetch: fetchStub },
+      MAX_QUEUE_TIMESTAMP_MS - QUEUE_FENCE_GRACE_MS,
+    );
+    const exactQueue = exactFleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
+    const exactRunId = 'wrun_exact_gc_horizon';
+    const exactReceipt = await exactQueue.expireRun(exactRunId, exactFleet.now);
+    if (!exactReceipt.done) throw new Error('expected exact-boundary expiry receipt');
+    await expect(
+      exactQueue.acknowledgeExpireRun(exactRunId, exactReceipt.receipt),
+    ).resolves.toEqual({ acknowledged: true });
+    const exactStorage = exactFleet.cell('queue', 'q:0').storage;
+    expect(exactStorage.alarmAt).toBe(MAX_QUEUE_TIMESTAMP_MS);
+    expect(
+      Array.from(exactStorage.data.keys()).find((key) => key.startsWith('expired-run-gc:')),
+    ).toMatch(`expired-run-gc:${padded(MAX_QUEUE_TIMESTAMP_MS)}:`);
+    expectQueueTimestampContract(exactStorage.data, exactStorage.alarmAt);
+    exactFleet.advance(QUEUE_FENCE_GRACE_MS);
+    await exactFleet.fireDueAlarms();
+    expect(exactStorage.data.has(`expired-run:${exactRunId}`)).toBe(false);
+    expect(exactStorage.alarmAt).toBeNull();
+
+    const overflowFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => overflowFleet.now, fetch: fetchStub },
+      MAX_QUEUE_TIMESTAMP_MS - QUEUE_FENCE_GRACE_MS + 1,
+    );
+    const overflowQueue = overflowFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    const overflowRunId = 'wrun_overflow_gc_horizon';
+    const overflowReceipt = await overflowQueue.expireRun(overflowRunId, overflowFleet.now);
+    if (!overflowReceipt.done) throw new Error('expected overflow-boundary expiry receipt');
+    await expect(
+      overflowQueue.acknowledgeExpireRun(overflowRunId, overflowReceipt.receipt),
+    ).resolves.toEqual({ acknowledged: true });
+    const overflowStorage = overflowFleet.cell('queue', 'q:0').storage;
+    expect(overflowStorage.data.get(`expired-run:${overflowRunId}`)).toMatchObject({
+      compactAt: null,
+    });
+    expect(
+      Array.from(overflowStorage.data.keys()).filter((key) => key.startsWith('expired-run-gc:')),
+    ).toEqual([]);
+    expect(overflowStorage.alarmAt).toBeNull();
+    expectQueueTimestampContract(overflowStorage.data, overflowStorage.alarmAt);
   });
 
   it('compacts many acknowledged exact fences to no derivative state in paged alarm work', async () => {

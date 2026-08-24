@@ -1,3 +1,5 @@
+import { WorkflowWorldError } from '@workflow/errors';
+import { QueuePayloadSchema } from '@workflow/world';
 import { DurableObject } from '../do-base.js';
 import type { EnqueueOutcome, EnqueueRequest } from '../../queue.js';
 import type {
@@ -6,10 +8,23 @@ import type {
   QueueExpiryReceipt,
 } from '../../retention.js';
 import type { RunLifecycleStatus } from '../../retention.js';
+import { parse } from '../../vendor/shared/index.js';
+import {
+  boundedIntegerOption,
+  checkedQueueTimestampAdd,
+  isNonNegativeSafeInteger,
+  isPositiveSafeInteger,
+  isRecord,
+  isValidQueueDelaySeconds,
+  MAX_QUEUE_TIMESTAMP_MS,
+  queueDelayDeadline,
+  strictIntegerSetting,
+} from '../../validation.js';
 import {
   LIFECYCLE_COMPACTION_BATCH,
   LIFECYCLE_COMPACTION_RETRY_MS,
   MAX_QUEUE_DELIVERY_TIMEOUT_MS,
+  MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
   QUEUE_FENCE_GRACE_MS,
   QUEUE_INFLIGHT_GRACE_MS,
 } from '../../lifecycle.js';
@@ -116,6 +131,7 @@ const EXPIRED_INFLIGHT_BATCH = 128;
 const STORAGE_BATCH_SIZE = 128;
 const EXPIRE_RUN_REFERENCE_BATCH = 64;
 const PURGE_DEAD_LETTER_BATCH = 128;
+const MAX_DEAD_LETTER_LIST_SIZE = 1000;
 
 const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
 const EXPIRED_RUN_GC_PREFIX = 'expired-run-gc:';
@@ -123,7 +139,10 @@ const EXPIRED_RUN_GC_PREFIX = 'expired-run-gc:';
 type AlarmStorage = Pick<DurableObjectStorage, 'list' | 'getAlarm' | 'setAlarm' | 'deleteAlarm'>;
 
 function pad(ms: number): string {
-  return String(Math.max(0, Math.floor(ms))).padStart(13, '0');
+  if (!isNonNegativeSafeInteger(ms) || ms > MAX_QUEUE_TIMESTAMP_MS) {
+    throw new Error('queue timestamp must be a non-negative 13-digit integer');
+  }
+  return String(ms).padStart(13, '0');
 }
 
 function dueKey(atMs: number, messageId: string): string {
@@ -141,6 +160,10 @@ function deadlineFromInflightKey(key: string): number {
   );
 }
 
+function inclusiveTimestampEnd(prefix: string, now: number): string {
+  return now >= MAX_QUEUE_TIMESTAMP_MS ? `${prefix.slice(0, -1)};` : `${prefix}${pad(now + 1)}`;
+}
+
 function runReferenceKey(runId: string, messageId: string): string {
   return `run:${runId}:${messageId}`;
 }
@@ -153,9 +176,64 @@ function expiredRunGcKey(runId: string, compactAt: number): string {
   return `${EXPIRED_RUN_GC_PREFIX}${pad(compactAt)}:${encodeURIComponent(runId)}`;
 }
 
-function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
-  if (value === undefined || !Number.isFinite(value)) return fallback;
-  return Math.max(1, Math.min(maximum, Math.floor(value)));
+function validateEnqueueRequest(request: unknown): asserts request is EnqueueRequest {
+  if (!isRecord(request)) throw new Error('world-celld queue enqueue request must be an object');
+  for (const field of ['messageId', 'queueName', 'body'] as const) {
+    if (typeof request[field] !== 'string' || request[field].length === 0) {
+      throw new Error(`world-celld queue enqueue ${field} must be a non-empty string`);
+    }
+  }
+  if (request.pathname !== 'flow') {
+    throw new Error('world-celld queue enqueue pathname must be flow');
+  }
+  if (
+    !isRecord(request.config) ||
+    typeof request.config.targetBaseUrl !== 'string' ||
+    request.config.targetBaseUrl.length === 0
+  ) {
+    throw new Error('world-celld queue enqueue config is invalid');
+  }
+  if (!isPositiveSafeInteger(request.config.queueShards)) {
+    throw new Error('world-celld queue enqueue queueShards must be a positive safe integer');
+  }
+  if (request.delaySeconds !== undefined && !isValidQueueDelaySeconds(request.delaySeconds)) {
+    throw new Error('world-celld queue enqueue delaySeconds is out of range');
+  }
+  if (
+    request.runId !== undefined &&
+    (typeof request.runId !== 'string' || request.runId.length === 0)
+  ) {
+    throw new Error('world-celld queue enqueue runId must be a non-empty string');
+  }
+  if (
+    request.idempotencyKey !== undefined &&
+    (typeof request.idempotencyKey !== 'string' || request.idempotencyKey.length === 0)
+  ) {
+    throw new Error('world-celld queue enqueue idempotencyKey must be a non-empty string');
+  }
+  let body: unknown;
+  try {
+    body = parse(request.body as string);
+  } catch {
+    throw new WorkflowWorldError('world-celld queue enqueue body must be valid tagged JSON', {
+      status: 422,
+    });
+  }
+  const payload = QueuePayloadSchema.safeParse(body);
+  if (!payload.success) {
+    throw new WorkflowWorldError('world-celld queue enqueue body is an invalid queue payload', {
+      status: 422,
+    });
+  }
+  const payloadRunId =
+    'runId' in payload.data && typeof payload.data.runId === 'string'
+      ? payload.data.runId
+      : undefined;
+  if (request.runId !== payloadRunId) {
+    throw new WorkflowWorldError('world-celld queue enqueue runId does not match body', {
+      status: 422,
+    });
+  }
 }
 
 async function getMany<T>(
@@ -234,8 +312,11 @@ export class QueueDO extends DurableObject {
     fallback: number,
   ): number {
     const raw = (this.env as QueueCellEnv)?.[name];
-    const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+    return strictIntegerSetting(name, raw, fallback, 1);
+  }
+
+  #maxAttempts(): number {
+    return this.#intVar('QUEUE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS);
   }
 
   #maxInflight(): number {
@@ -252,6 +333,12 @@ export class QueueDO extends DurableObject {
       throw new Error(`QUEUE_DELIVERY_TIMEOUT_MS must be at most ${MAX_QUEUE_DELIVERY_TIMEOUT_MS}`);
     }
     return configured;
+  }
+
+  #validateRuntimeConfig(): void {
+    this.#maxAttempts();
+    this.#maxInflight();
+    this.#deliveryTimeoutMs();
   }
 
   async #authoritativeRunExpired(runId: string): Promise<boolean> {
@@ -280,10 +367,19 @@ export class QueueDO extends DurableObject {
   }
 
   async enqueue(request: EnqueueRequest): Promise<EnqueueOutcome> {
-    this.#maxInflight();
-    this.#deliveryTimeoutMs();
+    this.#validateRuntimeConfig();
+    validateEnqueueRequest(request);
     const storage = this.ctx.storage;
     const now = this.#now();
+    const dueAt = queueDelayDeadline(
+      now,
+      request.delaySeconds ?? 0,
+      0,
+      MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+    );
+    if (dueAt === null) {
+      throw new Error('world-celld queue enqueue delaySeconds lacks required delivery headroom');
+    }
 
     const persist = async (txn: DurableObjectTransaction): Promise<EnqueueOutcome> => {
       // Pin the shard count from the first enqueue and reject drift loudly:
@@ -330,7 +426,6 @@ export class QueueDO extends DurableObject {
         attempt: 0,
         enqueuedAt: now,
       };
-      const dueAt = now + Math.max(0, request.delaySeconds ?? 0) * 1000;
       const scheduleKey = dueKey(dueAt, row.messageId);
       await txn.put(`msg:${row.messageId}`, row);
       await txn.put(scheduleKey, row.messageId);
@@ -362,6 +457,7 @@ export class QueueDO extends DurableObject {
   }
 
   async alarm(): Promise<void> {
+    this.#validateRuntimeConfig();
     // celld#144: alarm handlers can overlap while awaiting. The storage-only
     // claim phase runs under the input gate; a failure is carried out and
     // rethrown outside so a failed critical section cannot reset the cell.
@@ -380,7 +476,9 @@ export class QueueDO extends DurableObject {
       await attempt();
     }
     if (failure !== null) {
-      await this.ctx.storage.setAlarm(this.#now() + LIFECYCLE_COMPACTION_RETRY_MS);
+      const retryAt = checkedQueueTimestampAdd(this.#now(), LIFECYCLE_COMPACTION_RETRY_MS);
+      if (retryAt === null) await this.ctx.storage.deleteAlarm();
+      else await this.ctx.storage.setAlarm(retryAt);
       throw failure;
     }
 
@@ -402,7 +500,9 @@ export class QueueDO extends DurableObject {
       // Queue operations always consult the authoritative RunDO tombstone, so
       // deleting the receipt cannot reopen the run.
       if (await this.#compactExpiredRunFences(txn, now)) {
-        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
+        const nextAt = checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS);
+        if (nextAt === null) await txn.deleteAlarm();
+        else await txn.setAlarm(nextAt);
         return [];
       }
 
@@ -410,7 +510,7 @@ export class QueueDO extends DurableObject {
       // (node crash, deploy restart) — back to due for redelivery.
       const expiredPage = await txn.list<string>({
         prefix: INFLIGHT_DEADLINE_PREFIX,
-        end: `${INFLIGHT_DEADLINE_PREFIX}${pad(now + 1)}`,
+        end: inclusiveTimestampEnd(INFLIGHT_DEADLINE_PREFIX, now),
         limit: EXPIRED_INFLIGHT_BATCH + 1,
       });
       const expired = Array.from(expiredPage.entries()).slice(0, EXPIRED_INFLIGHT_BATCH);
@@ -426,7 +526,22 @@ export class QueueDO extends DurableObject {
       for (const [, messageId] of expired) {
         const row = expiredRows.get(`msg:${messageId}`);
         if (row) {
-          const scheduleKey = dueKey(now, messageId);
+          const recoveryAt = checkedQueueTimestampAdd(
+            now,
+            0,
+            MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+          );
+          if (recoveryAt === null) {
+            await this.#deadLetter(
+              txn,
+              row,
+              row.attempt,
+              'inflight recovery exceeded the queue timestamp horizon',
+              now,
+            );
+            continue;
+          }
+          const scheduleKey = dueKey(recoveryAt, messageId);
           recoveryWrites.push([scheduleKey, messageId]);
           if (row.runId) {
             recoveryWrites.push([
@@ -442,7 +557,9 @@ export class QueueDO extends DurableObject {
       }
       await putMany(txn, recoveryWrites);
       if (expiredPage.size > EXPIRED_INFLIGHT_BATCH) {
-        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
+        const nextAt = checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS);
+        if (nextAt === null) await txn.deleteAlarm();
+        else await txn.setAlarm(nextAt);
         return [];
       }
 
@@ -459,7 +576,7 @@ export class QueueDO extends DurableObject {
       if (inflightCount < maxInflight) {
         const due = await txn.list<string>({
           prefix: 'due:',
-          end: `due:${pad(now + 1)}`,
+          end: inclusiveTimestampEnd('due:', now),
           limit: maxInflight - inflightCount,
         });
         const timeoutMs = this.#deliveryTimeoutMs();
@@ -472,7 +589,18 @@ export class QueueDO extends DurableObject {
         for (const [, messageId] of due) {
           const row = dueRows.get(`msg:${messageId}`);
           if (!row) continue; // orphaned schedule entry
-          const claimKey = inflightKey(now + timeoutMs + QUEUE_INFLIGHT_GRACE_MS, messageId);
+          const claimDeadline = checkedQueueTimestampAdd(now, timeoutMs + QUEUE_INFLIGHT_GRACE_MS);
+          if (claimDeadline === null) {
+            await this.#deadLetter(
+              txn,
+              row,
+              row.attempt,
+              'delivery lease exceeded the queue timestamp horizon',
+              now,
+            );
+            continue;
+          }
+          const claimKey = inflightKey(claimDeadline, messageId);
           claimWrites.push([claimKey, messageId]);
           if (row.runId) {
             claimWrites.push([
@@ -544,12 +672,18 @@ export class QueueDO extends DurableObject {
       } catch {
         timeoutSeconds = undefined;
       }
-      if (typeof timeoutSeconds === 'number') {
+      const redeliveryAt = queueDelayDeadline(
+        now,
+        timeoutSeconds,
+        1,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      );
+      if (redeliveryAt !== null) {
         const reschedule = async (txn: DurableObjectTransaction) => {
           // Deleting the exact deadline key doubles as a lease-token check. A
           // late response from an expired claim must not mutate a newer claim.
           if (!(await txn.delete(claimKey))) return;
-          const scheduleKey = dueKey(now + timeoutSeconds * 1000, row.messageId);
+          const scheduleKey = dueKey(redeliveryAt, row.messageId);
           await txn.put(scheduleKey, row.messageId);
           if (row.runId) {
             await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
@@ -623,36 +757,31 @@ export class QueueDO extends DurableObject {
   async #retry(row: MessageRow, claimKey: string, reason: string): Promise<void> {
     const storage = this.ctx.storage;
     const now = this.#now();
-    const maxAttempts = this.#intVar('QUEUE_MAX_ATTEMPTS', DEFAULT_MAX_ATTEMPTS);
+    const maxAttempts = this.#maxAttempts();
     const attempt = row.attempt + 1;
+    const retryAt = checkedQueueTimestampAdd(
+      now,
+      backoffSeconds(attempt) * 1000,
+      MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+    );
 
     const persistRetry = async (txn: DurableObjectTransaction) => {
       if (!(await txn.delete(claimKey))) return;
 
-      if (attempt >= maxAttempts) {
-        const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt: now };
-        const deadKey = `dlq:${pad(now)}:${row.messageId}`;
-        await txn.put(deadKey, dead);
-        await txn.delete(`msg:${row.messageId}`);
-        if (row.idempotencyKey) {
-          const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
-          if (holder === row.messageId) {
-            await txn.delete(`key:${row.idempotencyKey}`);
-          }
-        }
-        if (row.runId) {
-          await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
-            messageId: row.messageId,
-            dlqKey: deadKey,
-            idempotencyKey: row.idempotencyKey,
-          });
-        }
+      if (attempt >= maxAttempts || retryAt === null) {
+        await this.#deadLetter(
+          txn,
+          row,
+          attempt,
+          retryAt === null ? `${reason}; retry exceeded the queue timestamp horizon` : reason,
+          now,
+        );
         await this.#scheduleNextAlarm(txn, now);
         return;
       }
 
       const updated: MessageRow = { ...row, attempt, lastError: reason };
-      const scheduleKey = dueKey(now + backoffSeconds(attempt) * 1000, row.messageId);
+      const scheduleKey = dueKey(retryAt, row.messageId);
       await txn.put(`msg:${row.messageId}`, updated);
       await txn.put(scheduleKey, row.messageId);
       if (row.runId) {
@@ -675,11 +804,40 @@ export class QueueDO extends DurableObject {
     }
   }
 
+  async #deadLetter(
+    txn: DurableObjectTransaction,
+    row: MessageRow,
+    attempt: number,
+    reason: string,
+    now: number,
+  ): Promise<void> {
+    const failedAt = checkedQueueTimestampAdd(now, 0);
+    await txn.delete(`msg:${row.messageId}`);
+    if (row.idempotencyKey) {
+      const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
+      if (holder === row.messageId) await txn.delete(`key:${row.idempotencyKey}`);
+    }
+    if (failedAt === null) {
+      if (row.runId) await txn.delete(runReferenceKey(row.runId, row.messageId));
+      return;
+    }
+    const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt };
+    const deadKey = `dlq:${pad(failedAt)}:${row.messageId}`;
+    await txn.put(deadKey, dead);
+    if (row.runId) {
+      await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+        messageId: row.messageId,
+        dlqKey: deadKey,
+        idempotencyKey: row.idempotencyKey,
+      });
+    }
+  }
+
   /** Return true when another due compaction page must run immediately. */
   async #compactExpiredRunFences(txn: DurableObjectTransaction, now: number): Promise<boolean> {
     const due = await txn.list<ExpiredRunGc>({
       prefix: EXPIRED_RUN_GC_PREFIX,
-      end: `${EXPIRED_RUN_GC_PREFIX}${pad(now + 1)}`,
+      end: inclusiveTimestampEnd(EXPIRED_RUN_GC_PREFIX, now),
       limit: LIFECYCLE_COMPACTION_BATCH + 1,
     });
     const page = Array.from(due).slice(0, LIFECYCLE_COMPACTION_BATCH);
@@ -703,12 +861,18 @@ export class QueueDO extends DurableObject {
   /** Arm the alarm no later than `atMs` (durable backoff never throws). */
   async #armAlarmAtMost(storage: AlarmStorage, atMs: number, now: number): Promise<void> {
     const current = await storage.getAlarm();
+    const immediate = checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS);
     if (current !== null && current <= now) {
-      await storage.setAlarm(now + MIN_ALARM_DELAY_MS);
+      if (immediate === null) await storage.deleteAlarm();
+      else await storage.setAlarm(immediate);
       return;
     }
 
-    const target = atMs <= now ? now + MIN_ALARM_DELAY_MS : atMs;
+    const target = atMs <= now ? immediate : atMs;
+    if (target === null) {
+      await storage.deleteAlarm();
+      return;
+    }
     if (current === null || target < current) {
       await storage.setAlarm(target);
     }
@@ -740,7 +904,9 @@ export class QueueDO extends DurableObject {
     }
 
     if (next !== null) {
-      await storage.setAlarm(next <= now ? now + MIN_ALARM_DELAY_MS : next);
+      const target = next <= now ? checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS) : next;
+      if (target === null) await storage.deleteAlarm();
+      else await storage.setAlarm(target);
     } else {
       await storage.deleteAlarm();
     }
@@ -768,7 +934,19 @@ export class QueueDO extends DurableObject {
     limit?: number;
     cursor?: string;
   }): Promise<{ data: DeadLetterRow[]; cursor: string | null; hasMore: boolean }> {
-    const limit = params?.limit ?? 100;
+    if (params !== undefined && !isRecord(params)) {
+      throw new Error('world-celld queue dead-letter list options must be an object');
+    }
+    const limit = boundedIntegerOption(
+      'world-celld queue dead-letter limit',
+      params?.limit,
+      100,
+      1,
+      MAX_DEAD_LETTER_LIST_SIZE,
+    );
+    if (params?.cursor !== undefined && typeof params.cursor !== 'string') {
+      throw new Error('world-celld queue dead-letter cursor must be a string');
+    }
     const entries = await this.ctx.storage.list<DeadLetterRow>({
       prefix: 'dlq:',
       startAfter: params?.cursor,
@@ -786,8 +964,14 @@ export class QueueDO extends DurableObject {
 
   /** Move a dead letter back to the live queue (attempt count reset). */
   async redriveDeadLetter(messageId: string): Promise<{ ok: boolean }> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new Error('world-celld queue redrive messageId must be a non-empty string');
+    }
     const storage = this.ctx.storage;
     const now = this.#now();
+    if (checkedQueueTimestampAdd(now, 0, MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS) === null) {
+      return { ok: false };
+    }
     const found = Array.from(await storage.list<DeadLetterRow>({ prefix: 'dlq:' })).find(
       ([, dead]) => dead.messageId === messageId,
     );
@@ -872,10 +1056,21 @@ export class QueueDO extends DurableObject {
     expiredAt: number,
     options?: { limit?: number },
   ): Promise<ExpireQueueRunResult> {
+    if (typeof runId !== 'string' || runId.length === 0) {
+      throw new Error('world-celld queue expiry runId must be a non-empty string');
+    }
+    if (!isNonNegativeSafeInteger(expiredAt)) {
+      throw new Error('world-celld queue expiry expiredAt must be a non-negative safe integer');
+    }
+    if (options !== undefined && !isRecord(options)) {
+      throw new Error('world-celld queue expiry options must be an object');
+    }
     const storage = this.ctx.storage;
-    const limit = boundedLimit(
+    const limit = boundedIntegerOption(
+      'world-celld queue expiry limit',
       options?.limit,
       EXPIRE_RUN_REFERENCE_BATCH,
+      1,
       EXPIRE_RUN_REFERENCE_BATCH,
     );
     return await storage.transaction(async (txn) => {
@@ -924,6 +1119,16 @@ export class QueueDO extends DurableObject {
     runId: string,
     receipt: QueueExpiryReceipt,
   ): Promise<AcknowledgeQueueExpiryResult> {
+    if (typeof runId !== 'string' || runId.length === 0) {
+      throw new Error('world-celld queue expiry runId must be a non-empty string');
+    }
+    if (
+      !isRecord(receipt) ||
+      !isNonNegativeSafeInteger(receipt.expiredAt) ||
+      !isNonNegativeSafeInteger(receipt.deleted)
+    ) {
+      throw new Error('world-celld queue expiry receipt is invalid');
+    }
     return await this.ctx.storage.transaction(async (txn) => {
       const key = expiredRunKey(runId);
       const marker = await txn.get<ExpiredRunFence>(key);
@@ -935,9 +1140,11 @@ export class QueueDO extends DurableObject {
         return { acknowledged: false };
       }
       if (marker.compactAt === null) {
-        const compactAt = this.#now() + QUEUE_FENCE_GRACE_MS;
-        await txn.put<ExpiredRunFence>(key, { ...marker, compactAt });
-        await txn.put<ExpiredRunGc>(expiredRunGcKey(runId, compactAt), { runId, compactAt });
+        const compactAt = checkedQueueTimestampAdd(this.#now(), QUEUE_FENCE_GRACE_MS);
+        if (compactAt !== null) {
+          await txn.put<ExpiredRunFence>(key, { ...marker, compactAt });
+          await txn.put<ExpiredRunGc>(expiredRunGcKey(runId, compactAt), { runId, compactAt });
+        }
       }
       await this.#scheduleNextAlarm(txn, this.#now());
       return { acknowledged: true };

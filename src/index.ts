@@ -48,6 +48,13 @@ export interface CelldRetentionAdmin {
 
 export type CelldWorld = World & CelldStreamer & { retention: CelldRetentionAdmin };
 
+const REQUIRED_ENV_BINDINGS = [
+  'WORKFLOW_DB',
+  'WORKFLOW_INDEX',
+  'WORKFLOW_QUEUE',
+  'WORKFLOW_STREAMS',
+] as const satisfies readonly (keyof CelldWorldEnv)[];
+
 export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
   const resolved = resolveConfig(config);
 
@@ -81,6 +88,12 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
         '(or CELLD_FLEET_URL / CELLD_WORLD_SECRET), or pass config.env with ' +
         'WORKFLOW_DB, WORKFLOW_INDEX, WORKFLOW_QUEUE, WORKFLOW_STREAMS',
     );
+  }
+
+  for (const binding of REQUIRED_ENV_BINDINGS) {
+    if (!env[binding]) {
+      throw new Error(`world-celld: config.env is missing required binding ${binding}`);
+    }
   }
 
   const storage = createStorage({

@@ -435,7 +435,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
     const before = deliveries.length;
     const { messageId } = await w.queue(
       `__wkf_workflow_restart_${marker.slice(0, 8)}`,
-      { marker },
+      { __healthCheck: true, correlationId: marker },
       { delaySeconds: 2, idempotencyKey: `restart:${marker}` },
     );
     expect(deliveries.slice(before).filter((delivery) => delivery.body.includes(marker))).toEqual(
