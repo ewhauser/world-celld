@@ -36,6 +36,7 @@ import type {
 } from '@workflow/world';
 import {
   applyAttributeChanges,
+  CreateEventSchema,
   eventIdToSlot,
   EventSchema,
   getMaxEventsPerRun,
@@ -163,6 +164,84 @@ export interface ApplyEventRequest {
   hookClaimId?: string;
   /** Internal world-celld retention policy captured with the event. */
   cleanup?: ScheduleCleanupRequest;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+/**
+ * Validate and canonicalize the untyped fleet-facing applyEvent envelope.
+ * This runs before a RunDO transaction starts; in particular, malformed hook
+ * events cannot allocate a sequence or touch hook/entity storage.
+ */
+export function parseApplyEventRequest(value: unknown): ApplyEventRequest {
+  if (!isRecord(value)) throw new TypeError('applyEvent request must be an object');
+  if (typeof value.runId !== 'string' || value.runId.length === 0) {
+    throw new TypeError('applyEvent runId must be a non-empty string');
+  }
+
+  const data = CreateEventSchema.parse(isRecord(value.data) ? compact(value.data) : value.data);
+  const params = value.params;
+  if (params !== undefined) {
+    if (!isRecord(params)) throw new TypeError('applyEvent params must be an object');
+    if (
+      params.occurredAt !== undefined &&
+      (!(params.occurredAt instanceof Date) || Number.isNaN(params.occurredAt.getTime()))
+    ) {
+      throw new TypeError('applyEvent params.occurredAt must be a valid Date');
+    }
+    for (const key of ['resumeId', 'resumePayloadDigest', 'sinceCursor'] as const) {
+      if (params[key] !== undefined && typeof params[key] !== 'string') {
+        throw new TypeError(`applyEvent params.${key} must be a string`);
+      }
+    }
+    if (
+      params.eventCount !== undefined &&
+      (typeof params.eventCount !== 'number' ||
+        !Number.isSafeInteger(params.eventCount) ||
+        params.eventCount < 0)
+    ) {
+      throw new TypeError('applyEvent params.eventCount must be a non-negative safe integer');
+    }
+    for (const key of ['skipPreload', 'preloadEvents'] as const) {
+      if (params[key] !== undefined && params[key] !== true) {
+        throw new TypeError(`applyEvent params.${key} must be true when present`);
+      }
+    }
+  }
+
+  let tokenHolder: ApplyEventRequest['tokenHolder'];
+  if (value.tokenHolder === null) {
+    tokenHolder = null;
+  } else if (value.tokenHolder !== undefined) {
+    if (
+      !isRecord(value.tokenHolder) ||
+      typeof value.tokenHolder.runId !== 'string' ||
+      value.tokenHolder.runId.length === 0 ||
+      typeof value.tokenHolder.hookId !== 'string' ||
+      value.tokenHolder.hookId.length === 0
+    ) {
+      throw new TypeError('applyEvent tokenHolder must contain non-empty runId and hookId strings');
+    }
+    tokenHolder = { runId: value.tokenHolder.runId, hookId: value.tokenHolder.hookId };
+  }
+
+  if (
+    value.hookClaimId !== undefined &&
+    (typeof value.hookClaimId !== 'string' || value.hookClaimId.length === 0)
+  ) {
+    throw new TypeError('applyEvent hookClaimId must be a non-empty string');
+  }
+
+  return {
+    runId: value.runId,
+    data,
+    ...(params === undefined ? {} : { params }),
+    ...(value.tokenHolder === undefined ? {} : { tokenHolder }),
+    ...(value.hookClaimId === undefined ? {} : { hookClaimId: value.hookClaimId }),
+    ...(value.cleanup === undefined ? {} : { cleanup: value.cleanup as ScheduleCleanupRequest }),
+  };
 }
 
 export type ApplyEventErrorCode =

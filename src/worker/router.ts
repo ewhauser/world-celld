@@ -12,6 +12,7 @@
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
+import { parseApplyEventRequest } from '../apply-event.js';
 import { rpcParse, rpcStringify } from '../codec.js';
 import {
   createWorkflowIndex,
@@ -496,6 +497,25 @@ export function createRouter(env: WorkerEnv) {
       args = parsed;
     } catch {
       return errorResponse(400, 'BadRequest', 'malformed rpc body');
+    }
+
+    if (bindingKey === 'runs' && method === 'applyEvent') {
+      if (args.length !== 1) {
+        return errorResponse(400, 'BadRequest', 'applyEvent expects exactly one request argument');
+      }
+      try {
+        const applyRequest = parseApplyEventRequest(args[0]);
+        if (applyRequest.runId !== name) {
+          return errorResponse(
+            400,
+            'BadRequest',
+            `applyEvent runId "${applyRequest.runId}" does not match routed run "${name}"`,
+          );
+        }
+        args = [applyRequest];
+      } catch (error) {
+        return errorResponse(400, 'BadRequest', (error as Error).message);
+      }
     }
 
     try {
