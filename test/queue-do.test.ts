@@ -4,11 +4,12 @@
  */
 import { beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { EnqueueRequest } from '../src/queue.js';
+import { stringify } from '../src/vendor/shared/index.js';
 import { QueueDO, type MessageRow } from '../src/worker/durable-objects/QueueDO.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 import { LIFECYCLE_COMPACTION_RETRY_MS, QUEUE_FENCE_GRACE_MS } from '../src/lifecycle.js';
 import type { RunLifecycleStatus } from '../src/retention.js';
-import { MAX_QUEUE_DELAY_SECONDS } from '../src/validation.js';
+import { MAX_QUEUE_DELAY_SECONDS, MAX_QUEUE_TIMESTAMP_MS } from '../src/validation.js';
 
 class TestRunLifecycleDO {
   constructor(private ctx: { storage: DurableObjectStorage }) {}
@@ -24,14 +25,19 @@ function jsonResponse(status: number, body?: unknown, headers?: Record<string, s
   return new Response(body === undefined ? null : JSON.stringify(body), { status, headers });
 }
 
-const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => ({
-  messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
-  queueName: '__wkf_workflow_test',
-  pathname: 'flow',
-  body: '{"data":"payload"}',
-  config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
-  ...over,
-});
+const enqueueReq = (over: Partial<EnqueueRequest> = {}): EnqueueRequest => {
+  const payload = over.runId
+    ? { runId: over.runId }
+    : { __healthCheck: true as const, correlationId: 'queue-do-test' };
+  return {
+    messageId: over.messageId ?? `msg_${Math.random().toString(36).slice(2)}`,
+    queueName: '__wkf_workflow_test',
+    pathname: 'flow',
+    body: JSON.stringify(payload),
+    config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1 },
+    ...over,
+  };
+};
 
 const MIN_TEST_ALARM_DELAY_MS = 1;
 const INFLIGHT_DEADLINE_PREFIX = 'inflight-deadline:';
@@ -45,7 +51,7 @@ function storedMessage(messageId: string, now: number): MessageRow {
     messageId,
     queueName: '__wkf_workflow_test',
     pathname: 'flow',
-    body: '{"data":"payload"}',
+    body: '{"__healthCheck":true,"correlationId":"queue-do-test"}',
     targetBaseUrl: 'http://app.test:3000',
     attempt: 0,
     enqueuedAt: now,
@@ -102,7 +108,7 @@ describe('QueueDO', () => {
     expect(init.headers['x-vqs-queue-name']).toBe('__wkf_workflow_test');
     expect(init.headers['x-vqs-message-id']).toBe('msg_1');
     expect(init.headers['x-vqs-message-attempt']).toBe('1');
-    expect(init.body).toBe('{"data":"payload"}');
+    expect(init.body).toBe('{"__healthCheck":true,"correlationId":"queue-do-test"}');
 
     // Fully settled: no message, schedule, claim, or alarm left behind.
     const keys = Array.from(storage().keys());
@@ -158,11 +164,18 @@ describe('QueueDO', () => {
   it.each([
     { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 0 } },
     { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 1.5 } },
-    { config: { targetBaseUrl: 'http://app.test:3000', queueShards: 129 } },
+    {
+      config: {
+        targetBaseUrl: 'http://app.test:3000',
+        queueShards: Number.MAX_SAFE_INTEGER + 1,
+      },
+    },
     { delaySeconds: -1 },
     { delaySeconds: MAX_QUEUE_DELAY_SECONDS },
     { delaySeconds: Number.MAX_SAFE_INTEGER },
     { body: 'null' },
+    { body: '{}' },
+    { body: '{"data":"not-a-queue-payload"}' },
     { body: '{"payload":{"__type":"Uint8Array"}}' },
   ])('rejects malformed enqueue envelope before queue mutation: %j', async (over) => {
     await expect(queue.enqueue(enqueueReq(over as Partial<EnqueueRequest>))).rejects.toThrow(
@@ -172,6 +185,54 @@ describe('QueueDO', () => {
     expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBeNull();
     expect(fetchStub).not.toHaveBeenCalled();
   });
+
+  it('classifies an invalid payload as permanent 422 without storage or delivery', async () => {
+    await expect(queue.enqueue(enqueueReq({ body: '{}' }))).rejects.toMatchObject({ status: 422 });
+    expect(storage().size).toBe(0);
+    expect(fleet.cell('queue', 'q:0').storage.alarmAt).toBeNull();
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it('accepts and stores a valid tagged-JSON queue payload byte-identically', async () => {
+    const runId = 'wrun_tagged_queue_payload';
+    setRunStatus(runId, 'active');
+    const body = stringify({
+      runId,
+      runInput: {
+        input: new Uint8Array([0, 1, 254, 255]),
+        deploymentId: 'queue-do-tests',
+        workflowName: 'tagged-payload',
+        specVersion: 6,
+      },
+    });
+
+    await expect(
+      queue.enqueue(enqueueReq({ messageId: 'msg_tagged_payload', runId, body, delaySeconds: 60 })),
+    ).resolves.toMatchObject({ ok: true });
+    expect(storage().get('msg:msg_tagged_payload')).toMatchObject({ body });
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
+  it.each([129, Number.MAX_SAFE_INTEGER])(
+    'accepts a positive safe queue shard count %s',
+    async (queueShards) => {
+      const isolatedFleet = new FakeFleet(
+        { queue: QueueDO, runs: TestRunLifecycleDO as never },
+        { clock: () => isolatedFleet.now, fetch: fetchStub },
+      );
+      const isolatedQueue = isolatedFleet.namespace('queue').get({
+        toString: () => 'q:0',
+      }) as QueueDO;
+      await expect(
+        isolatedQueue.enqueue(
+          enqueueReq({
+            messageId: `msg_shards_${queueShards}`,
+            config: { targetBaseUrl: 'http://app.test:3000', queueShards },
+          }),
+        ),
+      ).resolves.toMatchObject({ ok: true });
+    },
+  );
 
   it('rejects a run-owned enqueue when WORKFLOW_DB is missing without persisting it', async () => {
     const missingBindingFleet = new FakeFleet(
@@ -339,6 +400,49 @@ describe('QueueDO', () => {
     expect(fetchStub).toHaveBeenCalledOnce();
   });
 
+  it('orders ordinary and far-future deadlines and accepts the exact 13-digit boundary', async () => {
+    const startTime = 999;
+    const boundaryFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => boundaryFleet.now, fetch: fetchStub },
+      startTime,
+    );
+    const boundaryQueue = boundaryFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    const exactBoundaryDelay = (MAX_QUEUE_TIMESTAMP_MS - startTime) / 1000;
+
+    await boundaryQueue.enqueue(
+      enqueueReq({ messageId: 'msg_boundary', delaySeconds: exactBoundaryDelay }),
+    );
+    await boundaryQueue.enqueue(enqueueReq({ messageId: 'msg_ordinary', delaySeconds: 1 }));
+    const boundaryStorage = boundaryFleet.cell('queue', 'q:0').storage;
+    expect(Array.from((await boundaryStorage.list<string>({ prefix: 'due:' })).keys())).toEqual([
+      `due:${padded(startTime + 1_000)}:msg_ordinary`,
+      `due:${padded(MAX_QUEUE_TIMESTAMP_MS)}:msg_boundary`,
+    ]);
+    expect(boundaryStorage.alarmAt).toBe(startTime + 1_000);
+    await expect(
+      boundaryQueue.enqueue(
+        enqueueReq({
+          messageId: 'msg_over_boundary',
+          delaySeconds: exactBoundaryDelay + 1,
+        }),
+      ),
+    ).rejects.toThrow(/delaySeconds/);
+
+    boundaryFleet.advance(1_000);
+    await boundaryFleet.fireDueAlarms();
+    expect(fetchStub).toHaveBeenCalledOnce();
+    expect(boundaryStorage.data.has('msg:msg_boundary')).toBe(true);
+    expect(boundaryStorage.alarmAt).toBe(MAX_QUEUE_TIMESTAMP_MS);
+
+    boundaryFleet.advance(MAX_QUEUE_TIMESTAMP_MS - boundaryFleet.now);
+    await boundaryFleet.fireDueAlarms();
+    expect(fetchStub).toHaveBeenCalledTimes(2);
+    expect(boundaryStorage.data.has('msg:msg_boundary')).toBe(false);
+  });
+
   it('redelivers after 503 {timeoutSeconds} without advancing the attempt', async () => {
     fetchStub
       .mockResolvedValueOnce(jsonResponse(503, { timeoutSeconds: 30 }))
@@ -372,6 +476,24 @@ describe('QueueDO', () => {
       expect(Array.from(storage().keys()).some((key) => key.startsWith('dlq:'))).toBe(false);
     },
   );
+
+  it('consumes attempts and reaches the DLQ for malformed 503 retry hints', async () => {
+    fetchStub.mockResolvedValue(jsonResponse(503, { timeoutSeconds: '5junk' }));
+    await queue.enqueue(enqueueReq({ messageId: 'msg_malformed_retry_hint' }));
+
+    for (const advance of [0, 2_100, 4_100, 8_100, 16_100]) await tick(advance);
+
+    expect(fetchStub.mock.calls.map((call) => call[1].headers['x-vqs-message-attempt'])).toEqual([
+      '1',
+      '2',
+      '3',
+      '4',
+      '5',
+    ]);
+    await expect(queue.listDeadLetters()).resolves.toMatchObject({
+      data: [expect.objectContaining({ messageId: 'msg_malformed_retry_hint', attempt: 5 })],
+    });
+  });
 
   it('drops permanently on 404/409/410/422 without retrying', async () => {
     fetchStub.mockResolvedValue(jsonResponse(410, { error: 'gone', permanent: true }));

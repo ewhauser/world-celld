@@ -16,12 +16,12 @@
  *   HTTP statuses. QueueDO deliveries and the in-process test pump hit the
  *   exact same handler path.
  */
-import { setTimeout as delay } from 'node:timers/promises';
 import { WorkflowWorldError } from '@workflow/errors';
 import { RunExpiredError } from '@workflow/errors';
 import {
   MessageId,
   parseQueueName,
+  QueuePayloadSchema,
   type Queue,
   type QueuePayload,
   type ValidQueueName,
@@ -33,12 +33,16 @@ import { MAX_QUEUE_DELIVERY_TIMEOUT_MS } from './lifecycle.js';
 import {
   boundedIntegerOption,
   isValidQueueDelaySeconds,
-  MAX_QUEUE_SHARDS,
+  queueDelayDeadline,
   strictIntegerSetting,
 } from './validation.js';
 
 const MAX_TIMER_DELAY_MS = 0x7fffffff;
 const MAX_TEST_PUMP_BACKOFF_MS = 60_000;
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 async function delayFor(milliseconds: number): Promise<void> {
   let remaining = milliseconds;
@@ -147,7 +151,7 @@ export interface CelldQueueConfig {
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
    */
   baseUrl?: string;
-  /** Number of `q:<shard>` cells to spread enqueues over. Default: 1; maximum: 128 */
+  /** Number of `q:<shard>` cells to spread enqueues over. Default: 1 */
   queueShards?: number;
   /** Per-job HTTP request timeout (ms) for the test pump. Default/max: 300_000 */
   httpTimeoutMs?: number;
@@ -177,8 +181,8 @@ function resolveBaseUrl(config: CelldQueueConfig): string {
  * land on the same cell so dedup stays strictly consistent.
  */
 export function shardFor(key: string, shards: number): number {
-  if (!Number.isSafeInteger(shards) || shards < 1 || shards > MAX_QUEUE_SHARDS) {
-    throw new Error(`world-celld queueShards must be between 1 and ${MAX_QUEUE_SHARDS}`);
+  if (!Number.isSafeInteger(shards) || shards < 1) {
+    throw new Error('world-celld queueShards must be a positive safe integer');
   }
   if (shards <= 1) return 0;
   let hash = 0x811c9dc5;
@@ -359,13 +363,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
   if (!env?.WORKFLOW_QUEUE) {
     throw new Error('world-celld queue missing WORKFLOW_QUEUE binding');
   }
-  const queueShards = boundedIntegerOption(
-    'world-celld queueShards',
-    config.queueShards,
-    1,
-    1,
-    MAX_QUEUE_SHARDS,
-  );
+  const queueShards = boundedIntegerOption('world-celld queueShards', config.queueShards, 1, 1);
 
   const generateMessageId = monotonicFactory();
   const testPump = createTestPump(config);
@@ -378,11 +376,17 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
   return {
     async queue(queueName, message, opts) {
       parseQueueName(queueName);
-      if (opts?.delaySeconds !== undefined && !isValidQueueDelaySeconds(opts.delaySeconds)) {
+      const parsedMessage = QueuePayloadSchema.safeParse(message);
+      if (!parsedMessage.success) {
+        throw new WorkflowWorldError('world-celld queue payload is invalid', { status: 422 });
+      }
+      if (queueDelayDeadline(Date.now(), opts?.delaySeconds ?? 0) === null) {
         throw new Error('world-celld queue delaySeconds is out of range');
       }
       const runId =
-        'runId' in message && typeof message.runId === 'string' ? message.runId : undefined;
+        'runId' in parsedMessage.data && typeof parsedMessage.data.runId === 'string'
+          ? parsedMessage.data.runId
+          : undefined;
 
       if (isTestMode()) {
         // Dedup on idempotencyKey while a message with the same key is in
@@ -399,7 +403,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
             messageId,
             queueName,
             attempt: 1,
-            message,
+            message: parsedMessage.data,
             idempotencyKey: opts?.idempotencyKey,
           },
           opts?.delaySeconds,
@@ -416,7 +420,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         messageId,
         queueName,
         pathname: QUEUE_PATHNAME,
-        body: stringify(message),
+        body: stringify(parsedMessage.data),
         runId,
         idempotencyKey: opts?.idempotencyKey,
         delaySeconds: opts?.delaySeconds,
@@ -475,19 +479,20 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
           let body: unknown;
           try {
             body = parse<unknown>(await req.text());
-            if (!body || typeof body !== 'object' || Array.isArray(body)) {
-              throw new SyntaxError('payload is not an object');
-            }
           } catch {
             return Response.json({ error: 'Malformed tagged JSON body' }, { status: 422 });
           }
-          const result = await handler(body, {
+          const parsedBody = QueuePayloadSchema.safeParse(body);
+          if (!parsedBody.success) {
+            return Response.json({ error: 'Invalid queue payload' }, { status: 422 });
+          }
+          const result = await handler(parsedBody.data, {
             attempt,
             queueName: reqQueueName,
             messageId: reqMessageId,
           });
           if (result && typeof result.timeoutSeconds === 'number') {
-            if (!isValidQueueDelaySeconds(result.timeoutSeconds, 1)) {
+            if (queueDelayDeadline(Date.now(), result.timeoutSeconds, 1) === null) {
               throw new Error('Queue handler timeoutSeconds is out of range');
             }
             return Response.json(

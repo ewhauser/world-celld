@@ -1,3 +1,5 @@
+import { WorkflowWorldError } from '@workflow/errors';
+import { QueuePayloadSchema } from '@workflow/world';
 import { DurableObject } from '../do-base.js';
 import type { EnqueueOutcome, EnqueueRequest } from '../../queue.js';
 import type {
@@ -13,7 +15,7 @@ import {
   isPositiveSafeInteger,
   isRecord,
   isValidQueueDelaySeconds,
-  MAX_QUEUE_SHARDS,
+  MAX_QUEUE_TIMESTAMP_MS,
   queueDelayDeadline,
   strictIntegerSetting,
 } from '../../validation.js';
@@ -153,6 +155,10 @@ function deadlineFromInflightKey(key: string): number {
   );
 }
 
+function inclusiveTimestampEnd(prefix: string, now: number): string {
+  return now >= MAX_QUEUE_TIMESTAMP_MS ? `${prefix.slice(0, -1)};` : `${prefix}${pad(now + 1)}`;
+}
+
 function runReferenceKey(runId: string, messageId: string): string {
   return `run:${runId}:${messageId}`;
 }
@@ -182,13 +188,8 @@ function validateEnqueueRequest(request: unknown): asserts request is EnqueueReq
   ) {
     throw new Error('world-celld queue enqueue config is invalid');
   }
-  if (
-    !isPositiveSafeInteger(request.config.queueShards) ||
-    request.config.queueShards > MAX_QUEUE_SHARDS
-  ) {
-    throw new Error(
-      `world-celld queue enqueue queueShards must be between 1 and ${MAX_QUEUE_SHARDS}`,
-    );
+  if (!isPositiveSafeInteger(request.config.queueShards)) {
+    throw new Error('world-celld queue enqueue queueShards must be a positive safe integer');
   }
   if (request.delaySeconds !== undefined && !isValidQueueDelaySeconds(request.delaySeconds)) {
     throw new Error('world-celld queue enqueue delaySeconds is out of range');
@@ -205,10 +206,28 @@ function validateEnqueueRequest(request: unknown): asserts request is EnqueueReq
   ) {
     throw new Error('world-celld queue enqueue idempotencyKey must be a non-empty string');
   }
+  let body: unknown;
   try {
-    if (!isRecord(parse(request.body as string))) throw new SyntaxError('payload is not an object');
+    body = parse(request.body as string);
   } catch {
-    throw new Error('world-celld queue enqueue body must be valid tagged JSON');
+    throw new WorkflowWorldError('world-celld queue enqueue body must be valid tagged JSON', {
+      status: 422,
+    });
+  }
+  const payload = QueuePayloadSchema.safeParse(body);
+  if (!payload.success) {
+    throw new WorkflowWorldError('world-celld queue enqueue body is an invalid queue payload', {
+      status: 422,
+    });
+  }
+  const payloadRunId =
+    'runId' in payload.data && typeof payload.data.runId === 'string'
+      ? payload.data.runId
+      : undefined;
+  if (request.runId !== payloadRunId) {
+    throw new WorkflowWorldError('world-celld queue enqueue runId does not match body', {
+      status: 422,
+    });
   }
 }
 
@@ -477,7 +496,7 @@ export class QueueDO extends DurableObject {
       // (node crash, deploy restart) — back to due for redelivery.
       const expiredPage = await txn.list<string>({
         prefix: INFLIGHT_DEADLINE_PREFIX,
-        end: `${INFLIGHT_DEADLINE_PREFIX}${pad(now + 1)}`,
+        end: inclusiveTimestampEnd(INFLIGHT_DEADLINE_PREFIX, now),
         limit: EXPIRED_INFLIGHT_BATCH + 1,
       });
       const expired = Array.from(expiredPage.entries()).slice(0, EXPIRED_INFLIGHT_BATCH);
@@ -526,7 +545,7 @@ export class QueueDO extends DurableObject {
       if (inflightCount < maxInflight) {
         const due = await txn.list<string>({
           prefix: 'due:',
-          end: `due:${pad(now + 1)}`,
+          end: inclusiveTimestampEnd('due:', now),
           limit: maxInflight - inflightCount,
         });
         const timeoutMs = this.#deliveryTimeoutMs();

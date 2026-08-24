@@ -10,7 +10,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createQueue, shardFor } from '../src/queue.js';
 import { parse, stringify } from '../src/vendor/shared/index.js';
 import { clearMockData, createMockEnv, recordedEnqueues } from '../src/test-mocks.js';
-import { MAX_QUEUE_DELAY_SECONDS, MAX_QUEUE_SHARDS } from '../src/validation.js';
+import { MAX_QUEUE_DELAY_SECONDS } from '../src/validation.js';
+
+const WORKFLOW_PAYLOAD = { runId: 'wrun_queue_test' };
 
 function vqsRequest(
   message: unknown,
@@ -42,6 +44,7 @@ describe('Queue (celld QueueDO integration)', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     process.env.VITEST = originalVitest;
     process.env.NODE_ENV = originalNodeEnv;
     vi.unstubAllGlobals();
@@ -50,7 +53,7 @@ describe('Queue (celld QueueDO integration)', () => {
 
   it.each([
     ['queueShards', 0],
-    ['queueShards', MAX_QUEUE_SHARDS + 1],
+    ['queueShards', Number.MAX_SAFE_INTEGER + 1],
     ['httpTimeoutMs', 0],
     ['httpTimeoutMs', 300_001],
     ['maxAttempts', 0],
@@ -65,6 +68,16 @@ describe('Queue (celld QueueDO integration)', () => {
         [name]: value,
       }),
     ).toThrow(name);
+  });
+
+  it.each([129, Number.MAX_SAFE_INTEGER])('accepts queueShards=%s', (queueShards) => {
+    expect(() =>
+      createQueue({
+        env: { WORKFLOW_QUEUE: mockEnv.WORKFLOW_QUEUE },
+        deploymentId: 'test-deployment',
+        queueShards,
+      }),
+    ).not.toThrow();
   });
 
   it('requires the queue binding before constructing the queue', () => {
@@ -90,7 +103,7 @@ describe('Queue (celld QueueDO integration)', () => {
 
     it('should enqueue into a queue cell with a tagged-JSON body', async () => {
       const queueName = '__wkf_workflow_test' as ValidQueueName;
-      const message = { data: 'test-message' };
+      const message = { runId: 'wrun_test_message', stepId: 'step_test' };
 
       const result = await queue.queue(queueName, message);
 
@@ -109,34 +122,39 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should route workflow queues to the flow pathname', async () => {
-      await queue.queue('__wkf_workflow_test', {});
+      await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD);
       expect(recordedEnqueues[0].pathname).toBe('flow');
     });
 
     it('should include the idempotency key in the enqueue request', async () => {
       const idempotencyKey = 'unique-key-123';
-      await queue.queue('__wkf_workflow_test', { data: 'test' }, { idempotencyKey });
+      await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD, { idempotencyKey });
       expect(recordedEnqueues[0].idempotencyKey).toBe(idempotencyKey);
     });
 
     it('should pass delaySeconds through to the queue cell', async () => {
-      await queue.queue('__wkf_workflow_test', {}, { delaySeconds: 42 });
+      await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD, { delaySeconds: 42 });
       expect(recordedEnqueues[0].delaySeconds).toBe(42);
     });
 
     it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_QUEUE_DELAY_SECONDS + 1])(
       'rejects invalid delaySeconds %s before enqueue',
       async (delaySeconds) => {
-        await expect(queue.queue('__wkf_workflow_test', {}, { delaySeconds })).rejects.toThrow(
-          /delaySeconds/,
-        );
+        await expect(
+          queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD, { delaySeconds }),
+        ).rejects.toThrow(/delaySeconds/);
         expect(recordedEnqueues).toHaveLength(0);
       },
     );
 
+    it('rejects a malformed queue payload before resolving a cell', async () => {
+      await expect(queue.queue('__wkf_workflow_test', {})).rejects.toMatchObject({ status: 422 });
+      expect(recordedEnqueues).toHaveLength(0);
+    });
+
     it('should generate unique monotonic message IDs', async () => {
-      const first = await queue.queue('__wkf_workflow_test', {});
-      const second = await queue.queue('__wkf_workflow_test', {});
+      const first = await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD);
+      const second = await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD);
 
       expect(first.messageId).toMatch(/^msg_/);
       expect(second.messageId).toMatch(/^msg_/);
@@ -146,12 +164,12 @@ describe('Queue (celld QueueDO integration)', () => {
     it('should return the original messageId when the cell dedups on idempotencyKey', async () => {
       const first = await queue.queue(
         '__wkf_workflow_a',
-        { data: 1 },
+        { ...WORKFLOW_PAYLOAD, stepId: 'step_1' },
         { idempotencyKey: 'step-abc' },
       );
       const second = await queue.queue(
         '__wkf_workflow_a',
-        { data: 1 },
+        { ...WORKFLOW_PAYLOAD, stepId: 'step_1' },
         { idempotencyKey: 'step-abc' },
       );
 
@@ -184,8 +202,8 @@ describe('Queue (celld QueueDO integration)', () => {
         queueShards: 4,
       });
 
-      await queue.queue('__wkf_workflow_a', { n: 1 }, { idempotencyKey: 'k-1' });
-      await queue.queue('__wkf_workflow_b', { n: 2 }, { idempotencyKey: 'k-1' });
+      await queue.queue('__wkf_workflow_a', WORKFLOW_PAYLOAD, { idempotencyKey: 'k-1' });
+      await queue.queue('__wkf_workflow_b', WORKFLOW_PAYLOAD, { idempotencyKey: 'k-1' });
 
       // Cell-level dedup on the same key means only the first enqueue lands.
       expect(recordedEnqueues).toHaveLength(1);
@@ -203,7 +221,7 @@ describe('Queue (celld QueueDO integration)', () => {
     });
 
     it('should not enqueue into queue cells in test mode', async () => {
-      await queue.queue('__wkf_workflow_q', { data: 'test' });
+      await queue.queue('__wkf_workflow_q', WORKFLOW_PAYLOAD);
       expect(recordedEnqueues).toHaveLength(0);
     });
 
@@ -216,19 +234,19 @@ describe('Queue (celld QueueDO integration)', () => {
         deploymentId: 'test-deployment',
       });
 
-      await queue.queue('__wkf_workflow_q', { data: 'test' });
+      await queue.queue('__wkf_workflow_q', WORKFLOW_PAYLOAD);
       expect(recordedEnqueues).toHaveLength(0);
     });
 
     it('should dedup messages on idempotencyKey while inflight', async () => {
       const first = await queue.queue(
         '__wkf_workflow_a',
-        { data: 1 },
+        { ...WORKFLOW_PAYLOAD, stepId: 'step_1' },
         { idempotencyKey: 'step-abc' },
       );
       const second = await queue.queue(
         '__wkf_workflow_a',
-        { data: 1 },
+        { ...WORKFLOW_PAYLOAD, stepId: 'step_1' },
         { idempotencyKey: 'step-abc' },
       );
 
@@ -236,7 +254,7 @@ describe('Queue (celld QueueDO integration)', () => {
 
       const third = await queue.queue(
         '__wkf_workflow_a',
-        { data: 2 },
+        { ...WORKFLOW_PAYLOAD, stepId: 'step_2' },
         { idempotencyKey: 'step-other' },
       );
       expect(third.messageId).not.toBe(first.messageId);
@@ -255,9 +273,46 @@ describe('Queue (celld QueueDO integration)', () => {
       vi.stubGlobal('fetch', fetchStub);
 
       await queue.start();
-      await queue.queue('__wkf_workflow_q', { data: 'test' });
+      await queue.queue('__wkf_workflow_q', WORKFLOW_PAYLOAD);
 
       await vi.waitFor(() => expect(cancel).toHaveBeenCalledOnce());
+    });
+
+    it('chunks waits beyond the host timer ceiling without early delivery', async () => {
+      vi.useFakeTimers({ now: Date.now() });
+      const fetchStub = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(new Response(null, { status: 204 }));
+      vi.stubGlobal('fetch', fetchStub);
+      const delaySeconds = Math.floor(0x7fffffff / 1000) + 2;
+
+      await queue.start();
+      await queue.queue('__wkf_workflow_q', WORKFLOW_PAYLOAD, { delaySeconds });
+      await vi.advanceTimersByTimeAsync(0x7fffffff);
+      expect(fetchStub).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(delaySeconds * 1000 - 0x7fffffff - 1);
+      expect(fetchStub).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
+    });
+
+    it('delivers at the exact queue timestamp boundary and rejects one second beyond it', async () => {
+      const startTime = 9_999_999_998_999;
+      vi.useFakeTimers({ now: startTime });
+      const fetchStub = vi
+        .fn<typeof fetch>()
+        .mockResolvedValue(new Response(null, { status: 204 }));
+      vi.stubGlobal('fetch', fetchStub);
+
+      await queue.start();
+      await queue.queue('__wkf_workflow_q', WORKFLOW_PAYLOAD, { delaySeconds: 1 });
+      await expect(
+        queue.queue('__wkf_workflow_q', WORKFLOW_PAYLOAD, { delaySeconds: 2 }),
+      ).rejects.toThrow(/delaySeconds/);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(fetchStub).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
     });
   });
 
@@ -273,14 +328,16 @@ describe('Queue (celld QueueDO integration)', () => {
       const handler = vi.fn<QueueMessageHandler>().mockResolvedValue(undefined);
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
-      const response = await queueHandler(vqsRequest({ data: 'test-data' }));
+      const response = await queueHandler(
+        vqsRequest({ runId: 'wrun_handler', stepId: 'step_handler' }),
+      );
 
       expect(response.status).toBe(204);
       expect(response.body).toBeNull();
       await expect(response.text()).resolves.toBe('');
       expect(handler).toHaveBeenCalledOnce();
       expect(handler).toHaveBeenCalledWith(
-        { data: 'test-data' },
+        { runId: 'wrun_handler', stepId: 'step_handler' },
         expect.objectContaining({
           queueName: 'workflow:test-queue',
           attempt: 1,
@@ -294,7 +351,17 @@ describe('Queue (celld QueueDO integration)', () => {
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const input = new Uint8Array([9, 8, 7]);
-      const response = await queueHandler(vqsRequest({ runInput: { input } }));
+      const response = await queueHandler(
+        vqsRequest({
+          runId: 'wrun_binary',
+          runInput: {
+            input,
+            deploymentId: 'deployment',
+            workflowName: 'workflow',
+            specVersion: SPEC_VERSION_CURRENT,
+          },
+        }),
+      );
 
       expect(response.status).toBe(204);
       const [message] = handler.mock.calls[0];
@@ -307,14 +374,11 @@ describe('Queue (celld QueueDO integration)', () => {
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       await queueHandler(
-        vqsRequest(
-          { data: 'test' },
-          {
-            'x-vqs-queue-name': 'workflow:test-queue',
-            'x-vqs-message-id': 'msg_test',
-            'x-vqs-message-attempt': '3',
-          },
-        ),
+        vqsRequest(WORKFLOW_PAYLOAD, {
+          'x-vqs-queue-name': 'workflow:test-queue',
+          'x-vqs-message-id': 'msg_test',
+          'x-vqs-message-attempt': '3',
+        }),
       );
 
       expect(handler).toHaveBeenCalledWith(
@@ -329,14 +393,11 @@ describe('Queue (celld QueueDO integration)', () => {
         const handler = vi.fn<QueueMessageHandler>();
         const queueHandler = queue.createQueueHandler('workflow:', handler);
         const response = await queueHandler(
-          vqsRequest(
-            { data: 'test' },
-            {
-              'x-vqs-queue-name': 'workflow:test-queue',
-              'x-vqs-message-id': 'msg_test',
-              'x-vqs-message-attempt': attempt,
-            },
-          ),
+          vqsRequest(WORKFLOW_PAYLOAD, {
+            'x-vqs-queue-name': 'workflow:test-queue',
+            'x-vqs-message-id': 'msg_test',
+            'x-vqs-message-attempt': attempt,
+          }),
         );
         expect(response.status).toBe(400);
         expect(handler).not.toHaveBeenCalled();
@@ -347,6 +408,8 @@ describe('Queue (celld QueueDO integration)', () => {
       '{',
       'null',
       '[]',
+      '{}',
+      '{"data":"not-a-queue-payload"}',
       '{"data":{"__type":"Uint8Array"}}',
       '{"data":{"__type":"Uint8Array","data":"not base64!"}}',
       '{"data":{"__uint8array":true,"data":[0,256]}}',
@@ -373,7 +436,7 @@ describe('Queue (celld QueueDO integration)', () => {
       const handler = vi.fn<QueueMessageHandler>().mockResolvedValue({ timeoutSeconds: 30 });
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
-      const response = await queueHandler(vqsRequest({ data: 'test' }));
+      const response = await queueHandler(vqsRequest(WORKFLOW_PAYLOAD));
 
       expect(response.status).toBe(503);
       expect(response.headers.get('Retry-After')).toBe('30');
@@ -386,7 +449,7 @@ describe('Queue (celld QueueDO integration)', () => {
       async (timeoutSeconds) => {
         const handler = vi.fn<QueueMessageHandler>().mockResolvedValue({ timeoutSeconds });
         const queueHandler = queue.createQueueHandler('workflow:', handler);
-        const response = await queueHandler(vqsRequest({ data: 'test' }));
+        const response = await queueHandler(vqsRequest(WORKFLOW_PAYLOAD));
         expect(response.status).toBe(500);
         expect(response.headers.get('Retry-After')).toBe('2');
       },
@@ -419,7 +482,7 @@ describe('Queue (celld QueueDO integration)', () => {
         .mockRejectedValue(new WorkflowWorldError('run already terminal', { status: 410 }));
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
-      const response = await queueHandler(vqsRequest({ data: 'test' }));
+      const response = await queueHandler(vqsRequest(WORKFLOW_PAYLOAD));
 
       expect(response.status).toBe(410);
       const body = await response.json();
@@ -430,7 +493,7 @@ describe('Queue (celld QueueDO integration)', () => {
       const handler = vi.fn<QueueMessageHandler>().mockRejectedValue(new Error('Handler error'));
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
-      const response = await queueHandler(vqsRequest({ data: 'test' }));
+      const response = await queueHandler(vqsRequest(WORKFLOW_PAYLOAD));
 
       expect(response.status).toBe(500);
       expect(response.headers.get('Retry-After')).toBeDefined();
@@ -443,14 +506,11 @@ describe('Queue (celld QueueDO integration)', () => {
       const queueHandler = queue.createQueueHandler('workflow:', handler);
 
       const response = await queueHandler(
-        vqsRequest(
-          { data: 'test' },
-          {
-            'x-vqs-queue-name': 'invalid:test-queue',
-            'x-vqs-message-id': 'msg_test',
-            'x-vqs-message-attempt': '1',
-          },
-        ),
+        vqsRequest(WORKFLOW_PAYLOAD, {
+          'x-vqs-queue-name': 'invalid:test-queue',
+          'x-vqs-message-id': 'msg_test',
+          'x-vqs-message-attempt': '1',
+        }),
       );
 
       expect(response.status).toBe(400);
@@ -465,7 +525,7 @@ describe('Queue (celld QueueDO integration)', () => {
         new Request('http://localhost', {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: stringify({ data: 'x' }),
+          body: stringify(WORKFLOW_PAYLOAD),
         }),
       );
 
@@ -506,8 +566,16 @@ describe('Queue (celld QueueDO integration)', () => {
       expect(shardFor('anything', 1)).toBe(0);
     });
 
-    it.each([0, 1.5, MAX_QUEUE_SHARDS + 1])('rejects an invalid shard count %s', (shards) => {
-      expect(() => shardFor('anything', shards)).toThrow(/queueShards/);
+    it.each([0, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+      'rejects an invalid shard count %s',
+      (shards) => {
+        expect(() => shardFor('anything', shards)).toThrow(/queueShards/);
+      },
+    );
+
+    it.each([129, Number.MAX_SAFE_INTEGER])('accepts a positive safe shard count %s', (shards) => {
+      expect(shardFor('anything', shards)).toBeGreaterThanOrEqual(0);
+      expect(shardFor('anything', shards)).toBeLessThan(shards);
     });
   });
 });

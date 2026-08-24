@@ -52,12 +52,7 @@ import {
   workflowRunIndexKey,
 } from '../../retention.js';
 import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../../lifecycle.js';
-import {
-  isNonNegativeSafeInteger,
-  isPositiveSafeInteger,
-  isRecord,
-  MAX_QUEUE_SHARDS,
-} from '../../validation.js';
+import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../validation.js';
 
 interface CellId {
   toString(): string;
@@ -131,8 +126,8 @@ function validateCleanupRequest(request: unknown, allowDisabled: boolean): Sched
       `world-celld retentionMs must be a ${allowDisabled ? 'non-negative' : 'positive'} safe integer`,
     );
   }
-  if (!isPositiveSafeInteger(request.queueShards) || request.queueShards > MAX_QUEUE_SHARDS) {
-    throw new Error(`world-celld retention queueShards must be between 1 and ${MAX_QUEUE_SHARDS}`);
+  if (!isPositiveSafeInteger(request.queueShards)) {
+    throw new Error('world-celld retention queueShards must be a positive safe integer');
   }
   return request as unknown as ScheduleCleanupRequest;
 }

@@ -172,7 +172,7 @@ variable is shown below.
 | `secret`                | `CELLD_WORLD_SECRET`     | required with `fleetUrl` |
 | `baseUrl`               | `WORKFLOW_BASE_URL`      | `http://localhost:$PORT` |
 | `deploymentId`          | `CELLD_DEPLOYMENT_ID`    | `celld-default`          |
-| `queueShards`           | —                        | `1` (maximum `128`)      |
+| `queueShards`           | —                        | `1`                      |
 | `runRetentionMs`        | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
 | `streamLongPollMs`      | —                        | `20000`                  |
 | `streamFlushIntervalMs` | —                        | `0`                      |
@@ -189,10 +189,17 @@ The deployed worker also accepts these celld variables:
 | `QUEUE_DELIVERY_TIMEOUT_MS`       | `300000` | Callback timeout (maximum `300000`)                  |
 | `WORKFLOW_RETENTION_MS`           | `0`      | Maximum run age from creation; includes active runs  |
 | `WORKFLOW_RETENTION_BATCH_SIZE`   | `128`    | Runs admitted by each cron sweep (maximum `1000`)    |
-| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for older runs (maximum `128`)  |
+| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for older runs                  |
 
 `queueShards` is part of queue placement and is pinned when a queue cell is
-first used. Drain pending work before changing it.
+first used. It may be any positive safe integer; the `128` storage-operation
+batch limit does not cap the fleet's total shard count. Drain pending work
+before changing it.
+
+Queue deadlines use fixed-width 13-digit epoch-millisecond keys. A requested
+`delaySeconds` or handler redelivery timeout is accepted only when its deadline
+is at most `9999999999999`; long test-mode waits are chunked at the host timer
+limit without changing that persisted deadline contract.
 
 ## Workflow retention
 
@@ -218,8 +225,8 @@ does not provide the desired expiration resolution or catch-up rate.
 
 New runs persist the application's `queueShards` value for complete queue
 cleanup. `WORKFLOW_RETENTION_QUEUE_SHARDS` is the fallback for runs created
-before that metadata existed and must match the placement used by those runs;
-both shard settings have a maximum of `128`.
+before that metadata existed and must match the placement used by those runs.
+Both values may be any positive safe integer.
 
 ### Terminal payload retention
 

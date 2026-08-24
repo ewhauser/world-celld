@@ -3,7 +3,6 @@ import {
   type CellNamespaceLike,
   type HookIdShardStub,
   type HookTokenShardStub,
-  runCatalogShardName,
   type RunCatalogShardStub,
 } from '../indexes.js';
 import {
@@ -11,7 +10,7 @@ import {
   type EnforceRetentionRequest,
   type EnforceRetentionResult,
 } from '../retention.js';
-import { isRecord, MAX_QUEUE_SHARDS, strictIntegerSetting } from '../validation.js';
+import { isRecord, strictIntegerSetting } from '../validation.js';
 
 export const DEFAULT_RETENTION_SWEEP_BATCH_SIZE = 128;
 export const MAX_RETENTION_SWEEP_BATCH_SIZE = 1000;
@@ -45,6 +44,8 @@ export interface RetentionSweepResult {
   missing: number;
   notDue: number;
   invalid: number;
+  /** Candidates preserved because their exact catalog value changed during the sweep. */
+  preserved: number;
 }
 
 function requireNamespace<T>(
@@ -105,6 +106,7 @@ export async function runRetentionSweep(
       missing: 0,
       notDue: 0,
       invalid: 0,
+      preserved: 0,
     };
   }
   const batchSize = strictIntegerSetting(
@@ -119,7 +121,6 @@ export async function runRetentionSweep(
     env.WORKFLOW_RETENTION_QUEUE_SHARDS,
     1,
     1,
-    MAX_QUEUE_SHARDS,
   );
   const cutoff = scheduledTime - retentionMs;
   const runNamespace = requireNamespace('WORKFLOW_DB', env.WORKFLOW_DB);
@@ -144,6 +145,7 @@ export async function runRetentionSweep(
     missing: 0,
     notDue: 0,
     invalid: 0,
+    preserved: 0,
   };
   const failures: unknown[] = [];
   for (let offset = 0; offset < page.keys.length; offset += RETENTION_SWEEP_CONCURRENCY) {
@@ -151,19 +153,21 @@ export async function runRetentionSweep(
     const settled = await Promise.allSettled(
       candidates.map(async (entry) => {
         const { runId, invalid } = catalogCandidate(entry.name, entry.value);
-        const catalog = catalogNamespace.get(
-          catalogNamespace.idFromName(runCatalogShardName(runId)),
-        );
+        if (!entry.sourceShard) {
+          throw new Error('world-celld: merged run catalog entry omitted its source shard');
+        }
+        const catalog = catalogNamespace.get(catalogNamespace.idFromName(entry.sourceShard));
         if (invalid) {
-          await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
-          return { state: 'invalid' } as const;
+          const deleted = await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
+          return { state: 'invalid', preserved: !deleted.deleted } as const;
         }
         const run = runNamespace.get(runNamespace.idFromName(runId));
         const outcome = await run.enforceRetention({ retentionMs, queueShards, scheduledTime });
         if (outcome.state === 'missing' || outcome.state === 'not-due') {
-          await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
+          const deleted = await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
+          return { state: outcome.state, preserved: !deleted.deleted };
         }
-        return outcome;
+        return { state: outcome.state, preserved: false };
       }),
     );
     for (const outcome of settled) {
@@ -171,6 +175,7 @@ export async function runRetentionSweep(
         failures.push(outcome.reason);
       } else {
         result[outcome.value.state === 'not-due' ? 'notDue' : outcome.value.state]++;
+        if (outcome.value.preserved) result.preserved++;
       }
     }
   }

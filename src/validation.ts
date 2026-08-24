@@ -1,8 +1,6 @@
-/** Largest queue deadline representable by JavaScript's Date and alarm APIs. */
-export const MAX_QUEUE_TIMESTAMP_MS = 8_640_000_000_000_000;
+/** Largest epoch-ms deadline that fits the queue's fixed-width 13-digit keys. */
+export const MAX_QUEUE_TIMESTAMP_MS = 9_999_999_999_999;
 export const MAX_QUEUE_DELAY_SECONDS = Math.floor(MAX_QUEUE_TIMESTAMP_MS / 1000);
-/** Bounds queue-cell fanout and the per-run retention cleanup state machine. */
-export const MAX_QUEUE_SHARDS = 128;
 
 export function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);

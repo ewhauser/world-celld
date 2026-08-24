@@ -4,7 +4,6 @@ import { createCelldWorld } from '../src/index.js';
 import { MAX_FLEET_RPC_TIMEOUT_MS } from '../src/lifecycle.js';
 import { MAX_STREAM_LONG_POLL_MS } from '../src/stream-protocol.js';
 import { createMockEnv } from '../src/test-mocks.js';
-import { MAX_QUEUE_SHARDS } from '../src/validation.js';
 
 describe('runtime configuration validation', () => {
   const originalGlobalEnv = (globalThis as { CELLD_ENV?: CelldWorldEnv }).CELLD_ENV;
@@ -36,16 +35,15 @@ describe('runtime configuration validation', () => {
     });
   });
 
-  it.each([
-    0,
-    -1,
-    1.5,
-    Number.NaN,
-    Number.POSITIVE_INFINITY,
-    MAX_QUEUE_SHARDS + 1,
-    Number.MAX_SAFE_INTEGER + 1,
-  ])('rejects invalid queueShards %s', (queueShards) => {
-    expect(() => resolveConfig({ queueShards })).toThrow(/queueShards/);
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects invalid queueShards %s',
+    (queueShards) => {
+      expect(() => resolveConfig({ queueShards })).toThrow(/queueShards/);
+    },
+  );
+
+  it.each([129, Number.MAX_SAFE_INTEGER])('accepts positive safe queueShards %s', (queueShards) => {
+    expect(resolveConfig({ queueShards }).queueShards).toBe(queueShards);
   });
 
   it('does not coerce numeric strings in typed configuration options', () => {

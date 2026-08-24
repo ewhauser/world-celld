@@ -4,7 +4,7 @@ import type { QueueCellNamespace } from './queue.js';
 import { MAX_STREAM_LONG_POLL_MS } from './stream-protocol.js';
 import type { WorkflowIndex } from './indexes.js';
 import { MAX_FLEET_RPC_TIMEOUT_MS } from './lifecycle.js';
-import { boundedIntegerOption, MAX_QUEUE_SHARDS, strictIntegerSetting } from './validation.js';
+import { boundedIntegerOption, strictIntegerSetting } from './validation.js';
 
 /** Public alias retained for custom in-process environments. */
 export type IndexNamespace = WorkflowIndex;
@@ -47,7 +47,7 @@ export interface CelldWorldConfig {
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${PORT ?? 3000}`
    */
   baseUrl?: string;
-  /** Number of queue cells to spread enqueues over. Default: 1; maximum: 128 */
+  /** Number of queue cells to spread enqueues over. Default: 1 */
   queueShards?: number;
   /**
    * Keep terminal run payloads for this many milliseconds before replacing
@@ -77,13 +77,7 @@ export interface ResolvedCelldConfig {
 }
 
 export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
-  const queueShards = boundedIntegerOption(
-    'world-celld: queueShards',
-    config?.queueShards,
-    1,
-    1,
-    MAX_QUEUE_SHARDS,
-  );
+  const queueShards = boundedIntegerOption('world-celld: queueShards', config?.queueShards, 1, 1);
 
   const runRetentionMs =
     config?.runRetentionMs !== undefined

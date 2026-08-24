@@ -127,7 +127,7 @@ describe('terminal workflow retention', () => {
       { retentionMs: Number.NaN, queueShards: 1 },
       { retentionMs: 1, queueShards: 0 },
       { retentionMs: 1, queueShards: 1.5 },
-      { retentionMs: 1, queueShards: 129 },
+      { retentionMs: 1, queueShards: Number.MAX_SAFE_INTEGER + 1 },
     ]) {
       await expect(run.scheduleCleanup(request)).rejects.toThrow(/retention/);
       await expect(run.cleanupNow(request)).rejects.toThrow(/retention/);
@@ -136,6 +136,32 @@ describe('terminal workflow retention', () => {
     expect(Array.from(storage.data.entries())).toEqual(before);
     expect(storage.operationCounts.transaction).toBe(0);
   });
+
+  it.each([129, Number.MAX_SAFE_INTEGER])(
+    'accepts positive safe queueShards %s in run cleanup metadata',
+    async (queueShards) => {
+      const fleet = new FakeFleet({ runs: WorkflowRunDO });
+      const runId = `wrun_valid_cleanup_${queueShards}`;
+      const run = fleet.namespace('runs').get({ toString: () => runId }) as WorkflowRunDO;
+      await expect(
+        run.applyEvent({
+          runId,
+          data: {
+            eventType: 'run_created',
+            eventData: {
+              deploymentId: 'retention-tests',
+              workflowName: 'valid-cleanup',
+              input: [],
+            },
+          },
+          cleanup: { retentionMs: 1_000, queueShards },
+        }),
+      ).resolves.toMatchObject({ ok: true });
+      expect(fleet.cell('runs', runId).storage.data.get('retention:queue-shards')).toBe(
+        queueShards,
+      );
+    },
+  );
 
   it('rejects invalid event cleanup metadata before creating a run', async () => {
     const fleet = new FakeFleet({ runs: WorkflowRunDO });

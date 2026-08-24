@@ -11,19 +11,15 @@
  * Generic RPC bodies use the tagged JSON codec. Stream chunk bodies use the
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
-import { SPEC_VERSION_CURRENT, type WorkflowRun } from '@workflow/world';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { rpcParse, rpcStringify } from '../codec.js';
-import type { HookTokenOwner } from '../config.js';
 import {
   createWorkflowIndex,
   type CellNamespaceLike,
-  type HookReservation,
   type HookIdShardStub,
   type HookTokenShardStub,
-  type IndexListOptions,
   type RunCatalogShardStub,
 } from '../indexes.js';
-import type { ExpireRunIndexesRequest, ReleaseHookIndexesRequest } from '../retention.js';
 import {
   MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_CHUNK_BYTES,
@@ -39,6 +35,7 @@ import {
   type StreamWriteResult,
 } from '../stream-protocol.js';
 import { authenticate } from './auth.js';
+import { INDEX_OPERATIONS, type IndexOperation, validateIndexRequest } from './index-validation.js';
 
 export const WORLD_NAME = 'world-celld';
 export const WORLD_VERSION = '0.1.0';
@@ -300,40 +297,41 @@ export function createRouter(env: WorkerEnv) {
       } catch {
         return errorResponse(400, 'BadRequest', 'malformed rpc body');
       }
+      const operation = `${parts[2]}.${parts[3]}`;
+      if (!INDEX_OPERATIONS.has(operation as IndexOperation)) {
+        return errorResponse(404, 'NotFound', `unknown index operation: ${operation}`);
+      }
+      let validated;
+      try {
+        validated = validateIndexRequest(operation as IndexOperation, args);
+      } catch (error) {
+        return errorResponse(400, 'BadRequest', (error as Error).message);
+      }
       try {
         const index = workflowIndex(env);
         let result: unknown;
-        const operation = `${parts[2]}.${parts[3]}`;
-        if (operation === 'runs.list') {
-          result = await index.listRuns(args[0] as IndexListOptions | undefined);
-        } else if (operation === 'runs.commit') {
-          result = await index.commitRun(
-            args[0] as WorkflowRun,
-            args[1] as string,
-            args[2] as number,
-          );
-        } else if (operation === 'runs.expire') {
-          result = await index.expireRun(args[0] as ExpireRunIndexesRequest);
-        } else if (operation === 'hooks.reserve') {
-          result = await index.reserveHook(args[0] as string, args[1] as HookTokenOwner);
-        } else if (operation === 'hooks.finalize') {
-          result = await index.finalizeHookIndexes(
-            args[0] as string,
-            args[1] as string,
-            args[2] as string,
-            args[3] as HookTokenOwner,
-            args[4] as HookReservation | undefined,
-          );
-        } else if (operation === 'hooks.release-reservation') {
-          result = await index.releaseHookReservation(
-            args[0] as string,
-            args[1] as HookTokenOwner,
-            args[2] as HookReservation,
-          );
-        } else if (operation === 'hooks.release') {
-          result = await index.releaseHookIndexes(args[0] as ReleaseHookIndexesRequest);
-        } else {
-          return errorResponse(404, 'NotFound', `unknown index operation: ${operation}`);
+        switch (validated.operation) {
+          case 'runs.list':
+            result = await index.listRuns(...validated.args);
+            break;
+          case 'runs.commit':
+            result = await index.commitRun(...validated.args);
+            break;
+          case 'runs.expire':
+            result = await index.expireRun(...validated.args);
+            break;
+          case 'hooks.reserve':
+            result = await index.reserveHook(...validated.args);
+            break;
+          case 'hooks.finalize':
+            result = await index.finalizeHookIndexes(...validated.args);
+            break;
+          case 'hooks.release-reservation':
+            result = await index.releaseHookReservation(...validated.args);
+            break;
+          case 'hooks.release':
+            result = await index.releaseHookIndexes(...validated.args);
+            break;
         }
         return new Response(rpcStringify(result ?? null), {
           status: 200,

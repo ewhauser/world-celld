@@ -24,7 +24,8 @@ export interface IndexListOptions {
 }
 
 export interface IndexListPage {
-  keys: Array<{ name: string; value: string }>;
+  /** sourceShard is populated by the merged fleet index for exact follow-up mutation. */
+  keys: Array<{ name: string; value: string; sourceShard?: string }>;
   list_complete: boolean;
   cursor?: string;
 }
@@ -259,15 +260,19 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
           ? Math.floor(suppliedLimit)
           : 1000;
       const limit = Math.min(1000, Math.max(1, requestedLimit));
+      const shardNames = allRunCatalogShardNames();
       const pages = await Promise.all(
-        allRunCatalogShardNames().map((name) =>
+        shardNames.map((name) =>
           stub(bindings.runCatalog, name).list({ ...options, limit: limit + 1 }),
         ),
       );
       const encoder = new TextEncoder();
       const candidates = pages
-        .flatMap((shardPage) =>
-          shardPage.keys.map((entry) => ({ entry, encodedName: encoder.encode(entry.name) })),
+        .flatMap((shardPage, shardIndex) =>
+          shardPage.keys.map((entry) => ({
+            entry: { ...entry, sourceShard: shardNames[shardIndex] },
+            encodedName: encoder.encode(entry.name),
+          })),
         )
         .toSorted((left, right) => {
           const compared = compareBytes(left.encodedName, right.encodedName);

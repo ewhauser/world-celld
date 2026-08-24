@@ -7,7 +7,12 @@ import { createConnection } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { rpcParse, rpcStringify } from '../src/codec.js';
 import { createRemoteEnv } from '../src/remote/namespaces.js';
-import { allRunCatalogShardNames, hookIdShardName, runCatalogShardName } from '../src/indexes.js';
+import {
+  allRunCatalogShardNames,
+  hookIdShardName,
+  hookTokenShardName,
+  runCatalogShardName,
+} from '../src/indexes.js';
 import {
   MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_CHUNK_BYTES,
@@ -154,6 +159,77 @@ describe('router auth and shape', () => {
     const res = await rpc('/v1/rpc/runs/wrun_x/getRun', { not: 'an array' }, SECRET);
     expect(res.status).toBe(400);
     expect((await rpc('/v1/index/runs/list', { not: 'an array' }, SECRET)).status).toBe(400);
+  });
+
+  it.each([
+    ['/v1/index/runs/list', [{ limit: '5junk' }]],
+    ['/v1/index/runs/commit', [{ runId: 'wrun_only' }, '{}', 1]],
+    ['/v1/index/runs/expire', [{ runId: 'wrun_expire', keys: [], hooks: [], expiredAt: 1 }]],
+    ['/v1/index/hooks/reserve', ['', { runId: 'wrun_reserve', hookId: 'hook_reserve' }]],
+    ['/v1/index/hooks/reserve', ['token', { hookId: 'hook_missing_run' }]],
+    ['/v1/index/hooks/reserve', ['victim-token', { runId: 'wrun_missing_hook_id' }]],
+    [
+      '/v1/index/hooks/finalize',
+      ['token', 'hook', '{}', { runId: 'wrun_finalize', hookId: 'hook' }],
+    ],
+    [
+      '/v1/index/hooks/release-reservation',
+      ['token', { runId: 'wrun_release', hookId: 'hook' }, { claimId: '' }],
+    ],
+    [
+      '/v1/index/hooks/release',
+      [{ runId: 'wrun_release', hooks: [{ hookId: '', token: 'token' }] }],
+    ],
+  ])(
+    'rejects invalid operation arguments before resolving an index stub: %s',
+    async (path, body) => {
+      const idFromName = vi.fn<(name: string) => { toString(): string }>((name) => ({
+        toString: () => name,
+      }));
+      const get = vi.fn<(id: { toString(): string }) => unknown>();
+      const namespace = { idFromName, get };
+      const router = createRouter({
+        WORKFLOW_RUN_CATALOG: namespace,
+        WORKFLOW_HOOK_TOKENS: namespace,
+        WORKFLOW_HOOK_IDS: namespace,
+        WORLD_SECRET: SECRET,
+      } as unknown as WorkerEnv);
+      const response = await router(
+        new Request(`http://world.test${path}`, {
+          method: 'POST',
+          headers: {
+            authorization: `Bearer ${SECRET}`,
+            'content-type': 'application/json',
+          },
+          body: rpcStringify(body),
+        }),
+      );
+
+      expect(response.status).toBe(400);
+      expect(idFromName).not.toHaveBeenCalled();
+      expect(get).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not persist token or undefined-hook claims for a malformed reservation', async () => {
+    const token = 'victim-token';
+    const response = await rpc(
+      '/v1/index/hooks/reserve',
+      [token, { runId: 'wrun_missing_hook_id' }],
+      SECRET,
+    );
+    expect(response.status).toBe(400);
+    expect(
+      harness.fleet
+        .cell('hook-tokens', hookTokenShardName(token))
+        .storage.data.has(`claim:${token}`),
+    ).toBe(false);
+    for (const shard of Array.from(
+      { length: 32 },
+      (_, index) => `hook-id:v1:${index.toString(16).padStart(2, '0')}`,
+    )) {
+      expect(harness.fleet.cell('hook-ids', shard).storage.data.has('claim:undefined')).toBe(false);
+    }
   });
 
   it.each([
