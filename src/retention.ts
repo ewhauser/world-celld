@@ -78,7 +78,6 @@ export interface ReleaseHookIndexesResult {
 
 export interface ExpireRunIndexesRequest {
   runId: string;
-  keys: string[];
   hooks: HookIndexReference[];
   expiredAt: number;
 }

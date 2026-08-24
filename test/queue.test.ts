@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createQueue, shardFor } from '../src/queue.js';
 import { parse, stringify } from '../src/vendor/shared/index.js';
 import { clearMockData, createMockEnv, recordedEnqueues } from '../src/test-mocks.js';
+import { MAX_QUEUE_SCHEDULE_TIMESTAMP_MS } from '../src/lifecycle.js';
 import { MAX_QUEUE_DELAY_SECONDS } from '../src/validation.js';
 
 const WORKFLOW_PAYLOAD = { runId: 'wrun_queue_test' };
@@ -296,8 +297,8 @@ describe('Queue (celld QueueDO integration)', () => {
       await vi.waitFor(() => expect(fetchStub).toHaveBeenCalledOnce());
     });
 
-    it('delivers at the exact queue timestamp boundary and rejects one second beyond it', async () => {
-      const startTime = 9_999_999_998_999;
+    it('delivers at the exact admissible queue boundary and rejects one second beyond it', async () => {
+      const startTime = MAX_QUEUE_SCHEDULE_TIMESTAMP_MS - 1_000;
       vi.useFakeTimers({ now: startTime });
       const fetchStub = vi
         .fn<typeof fetch>()

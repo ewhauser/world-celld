@@ -13,6 +13,7 @@ import {
   hookTokenShardName,
   runCatalogShardName,
 } from '../src/indexes.js';
+import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../src/lifecycle.js';
 import {
   MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_CHUNK_BYTES,
@@ -26,6 +27,7 @@ import { createStreamer } from '../src/streamer.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import { createRouter } from '../src/worker/router.js';
 import type { DONamespaceLike, WorkerEnv } from '../src/worker/router.js';
+import { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
 
 const SECRET = 'test-secret';
 
@@ -164,7 +166,18 @@ describe('router auth and shape', () => {
   it.each([
     ['/v1/index/runs/list', [{ limit: '5junk' }]],
     ['/v1/index/runs/commit', [{ runId: 'wrun_only' }, '{}', 1]],
-    ['/v1/index/runs/expire', [{ runId: 'wrun_expire', keys: [], hooks: [], expiredAt: 1 }]],
+    ['/v1/index/runs/expire', [{ runId: 'wrun_expire', expiredAt: 1 }]],
+    [
+      '/v1/index/runs/expire',
+      [
+        {
+          runId: 'wrun_expire',
+          keys: ['run:workflow:1767225600000:wrun_expire', 'runall:1767225600000:wrun_expire'],
+          hooks: [],
+          expiredAt: 1,
+        },
+      ],
+    ],
     ['/v1/index/hooks/reserve', ['', { runId: 'wrun_reserve', hookId: 'hook_reserve' }]],
     ['/v1/index/hooks/reserve', ['token', { hookId: 'hook_missing_run' }]],
     ['/v1/index/hooks/reserve', ['victim-token', { runId: 'wrun_missing_hook_id' }]],
@@ -210,6 +223,66 @@ describe('router auth and shape', () => {
       expect(get).not.toHaveBeenCalled();
     },
   );
+
+  it('rejects every caller-supplied run expiry key shape without catalog mutation', async () => {
+    const runId = 'wrun_marker_probe';
+    const timestamp = '1767225600000';
+    const canonical = [`run:workflow:${timestamp}:${runId}`, `runall:${timestamp}:${runId}`];
+    const suppliedKeyPairs = [
+      [`arbitrary:workflow:${timestamp}:${runId}`, canonical[1]],
+      [canonical[1], canonical[0]],
+      [canonical[0], canonical[0]],
+      [canonical[0], `runall:1767225600001:${runId}`],
+      [`expired:${runId}`, `expiry-gc:${timestamp}:${runId}`],
+      [`run%3Aworkflow%3A${timestamp}%3A${runId}`, canonical[1]],
+      [canonical[0], `runall:${timestamp}:wrun_wrong`],
+    ];
+    const before = allRunCatalogShardNames().map(
+      (shard) => new Map(harness.fleet.cell('run-catalog', shard).storage.data),
+    );
+
+    for (const keys of suppliedKeyPairs) {
+      const response = await rpc(
+        '/v1/index/runs/expire',
+        [{ runId, keys, hooks: [], expiredAt: 1 }],
+        SECRET,
+      );
+      expect(response.status).toBe(400);
+    }
+
+    for (const [index, shard] of allRunCatalogShardNames().entries()) {
+      expect(harness.fleet.cell('run-catalog', shard).storage.data).toEqual(before[index]);
+    }
+  });
+
+  it('expires only the catalog key pair retained by the authoritative commit', async () => {
+    const runId = 'wrun_canonical_expiry_wire';
+    const timestamp = String(harness.fleet.now).padStart(13, '0');
+    const keys = [`run:canonical-wire:${timestamp}:${runId}`, `runall:${timestamp}:${runId}`];
+    const shard = runCatalogShardName(runId);
+    const catalog = harness.fleet.namespace('run-catalog').get({
+      toString: () => shard,
+    }) as RunCatalogDO;
+    await catalog.upsertRun(
+      runId,
+      keys,
+      JSON.stringify({ runId }),
+      harness.fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+    );
+
+    const response = await rpc(
+      '/v1/index/runs/expire',
+      [{ runId, hooks: [], expiredAt: harness.fleet.now }],
+      SECRET,
+    );
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toEqual({ deleted: 2 });
+    const data = harness.fleet.cell('run-catalog', shard).storage.data;
+    expect(keys.every((key) => !data.has(key))).toBe(true);
+    expect(data.has(`expired:${runId}`)).toBe(true);
+    expect(Array.from(data.keys()).some((key) => key.startsWith('catalog-keys:'))).toBe(false);
+  });
 
   it('does not persist token or undefined-hook claims for a malformed reservation', async () => {
     const token = 'victim-token';

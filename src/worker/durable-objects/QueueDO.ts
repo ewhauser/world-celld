@@ -11,6 +11,7 @@ import type { RunLifecycleStatus } from '../../retention.js';
 import { parse } from '../../vendor/shared/index.js';
 import {
   boundedIntegerOption,
+  checkedQueueTimestampAdd,
   isNonNegativeSafeInteger,
   isPositiveSafeInteger,
   isRecord,
@@ -23,6 +24,7 @@ import {
   LIFECYCLE_COMPACTION_BATCH,
   LIFECYCLE_COMPACTION_RETRY_MS,
   MAX_QUEUE_DELIVERY_TIMEOUT_MS,
+  MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
   QUEUE_FENCE_GRACE_MS,
   QUEUE_INFLIGHT_GRACE_MS,
 } from '../../lifecycle.js';
@@ -137,7 +139,10 @@ const EXPIRED_RUN_GC_PREFIX = 'expired-run-gc:';
 type AlarmStorage = Pick<DurableObjectStorage, 'list' | 'getAlarm' | 'setAlarm' | 'deleteAlarm'>;
 
 function pad(ms: number): string {
-  return String(Math.max(0, Math.floor(ms))).padStart(13, '0');
+  if (!isNonNegativeSafeInteger(ms) || ms > MAX_QUEUE_TIMESTAMP_MS) {
+    throw new Error('queue timestamp must be a non-negative 13-digit integer');
+  }
+  return String(ms).padStart(13, '0');
 }
 
 function dueKey(atMs: number, messageId: string): string {
@@ -366,9 +371,14 @@ export class QueueDO extends DurableObject {
     validateEnqueueRequest(request);
     const storage = this.ctx.storage;
     const now = this.#now();
-    const dueAt = queueDelayDeadline(now, request.delaySeconds ?? 0);
+    const dueAt = queueDelayDeadline(
+      now,
+      request.delaySeconds ?? 0,
+      0,
+      MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+    );
     if (dueAt === null) {
-      throw new Error('world-celld queue enqueue delaySeconds produces an invalid deadline');
+      throw new Error('world-celld queue enqueue delaySeconds lacks required delivery headroom');
     }
 
     const persist = async (txn: DurableObjectTransaction): Promise<EnqueueOutcome> => {
@@ -466,7 +476,9 @@ export class QueueDO extends DurableObject {
       await attempt();
     }
     if (failure !== null) {
-      await this.ctx.storage.setAlarm(this.#now() + LIFECYCLE_COMPACTION_RETRY_MS);
+      const retryAt = checkedQueueTimestampAdd(this.#now(), LIFECYCLE_COMPACTION_RETRY_MS);
+      if (retryAt === null) await this.ctx.storage.deleteAlarm();
+      else await this.ctx.storage.setAlarm(retryAt);
       throw failure;
     }
 
@@ -488,7 +500,9 @@ export class QueueDO extends DurableObject {
       // Queue operations always consult the authoritative RunDO tombstone, so
       // deleting the receipt cannot reopen the run.
       if (await this.#compactExpiredRunFences(txn, now)) {
-        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
+        const nextAt = checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS);
+        if (nextAt === null) await txn.deleteAlarm();
+        else await txn.setAlarm(nextAt);
         return [];
       }
 
@@ -512,7 +526,22 @@ export class QueueDO extends DurableObject {
       for (const [, messageId] of expired) {
         const row = expiredRows.get(`msg:${messageId}`);
         if (row) {
-          const scheduleKey = dueKey(now, messageId);
+          const recoveryAt = checkedQueueTimestampAdd(
+            now,
+            0,
+            MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+          );
+          if (recoveryAt === null) {
+            await this.#deadLetter(
+              txn,
+              row,
+              row.attempt,
+              'inflight recovery exceeded the queue timestamp horizon',
+              now,
+            );
+            continue;
+          }
+          const scheduleKey = dueKey(recoveryAt, messageId);
           recoveryWrites.push([scheduleKey, messageId]);
           if (row.runId) {
             recoveryWrites.push([
@@ -528,7 +557,9 @@ export class QueueDO extends DurableObject {
       }
       await putMany(txn, recoveryWrites);
       if (expiredPage.size > EXPIRED_INFLIGHT_BATCH) {
-        await txn.setAlarm(now + MIN_ALARM_DELAY_MS);
+        const nextAt = checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS);
+        if (nextAt === null) await txn.deleteAlarm();
+        else await txn.setAlarm(nextAt);
         return [];
       }
 
@@ -558,7 +589,18 @@ export class QueueDO extends DurableObject {
         for (const [, messageId] of due) {
           const row = dueRows.get(`msg:${messageId}`);
           if (!row) continue; // orphaned schedule entry
-          const claimKey = inflightKey(now + timeoutMs + QUEUE_INFLIGHT_GRACE_MS, messageId);
+          const claimDeadline = checkedQueueTimestampAdd(now, timeoutMs + QUEUE_INFLIGHT_GRACE_MS);
+          if (claimDeadline === null) {
+            await this.#deadLetter(
+              txn,
+              row,
+              row.attempt,
+              'delivery lease exceeded the queue timestamp horizon',
+              now,
+            );
+            continue;
+          }
+          const claimKey = inflightKey(claimDeadline, messageId);
           claimWrites.push([claimKey, messageId]);
           if (row.runId) {
             claimWrites.push([
@@ -630,7 +672,12 @@ export class QueueDO extends DurableObject {
       } catch {
         timeoutSeconds = undefined;
       }
-      const redeliveryAt = queueDelayDeadline(now, timeoutSeconds, 1);
+      const redeliveryAt = queueDelayDeadline(
+        now,
+        timeoutSeconds,
+        1,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      );
       if (redeliveryAt !== null) {
         const reschedule = async (txn: DurableObjectTransaction) => {
           // Deleting the exact deadline key doubles as a lease-token check. A
@@ -712,34 +759,29 @@ export class QueueDO extends DurableObject {
     const now = this.#now();
     const maxAttempts = this.#maxAttempts();
     const attempt = row.attempt + 1;
+    const retryAt = checkedQueueTimestampAdd(
+      now,
+      backoffSeconds(attempt) * 1000,
+      MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+    );
 
     const persistRetry = async (txn: DurableObjectTransaction) => {
       if (!(await txn.delete(claimKey))) return;
 
-      if (attempt >= maxAttempts) {
-        const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt: now };
-        const deadKey = `dlq:${pad(now)}:${row.messageId}`;
-        await txn.put(deadKey, dead);
-        await txn.delete(`msg:${row.messageId}`);
-        if (row.idempotencyKey) {
-          const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
-          if (holder === row.messageId) {
-            await txn.delete(`key:${row.idempotencyKey}`);
-          }
-        }
-        if (row.runId) {
-          await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
-            messageId: row.messageId,
-            dlqKey: deadKey,
-            idempotencyKey: row.idempotencyKey,
-          });
-        }
+      if (attempt >= maxAttempts || retryAt === null) {
+        await this.#deadLetter(
+          txn,
+          row,
+          attempt,
+          retryAt === null ? `${reason}; retry exceeded the queue timestamp horizon` : reason,
+          now,
+        );
         await this.#scheduleNextAlarm(txn, now);
         return;
       }
 
       const updated: MessageRow = { ...row, attempt, lastError: reason };
-      const scheduleKey = dueKey(now + backoffSeconds(attempt) * 1000, row.messageId);
+      const scheduleKey = dueKey(retryAt, row.messageId);
       await txn.put(`msg:${row.messageId}`, updated);
       await txn.put(scheduleKey, row.messageId);
       if (row.runId) {
@@ -762,11 +804,40 @@ export class QueueDO extends DurableObject {
     }
   }
 
+  async #deadLetter(
+    txn: DurableObjectTransaction,
+    row: MessageRow,
+    attempt: number,
+    reason: string,
+    now: number,
+  ): Promise<void> {
+    const failedAt = checkedQueueTimestampAdd(now, 0);
+    await txn.delete(`msg:${row.messageId}`);
+    if (row.idempotencyKey) {
+      const holder = await txn.get<string>(`key:${row.idempotencyKey}`);
+      if (holder === row.messageId) await txn.delete(`key:${row.idempotencyKey}`);
+    }
+    if (failedAt === null) {
+      if (row.runId) await txn.delete(runReferenceKey(row.runId, row.messageId));
+      return;
+    }
+    const dead: DeadLetterRow = { ...row, attempt, lastError: reason, failedAt };
+    const deadKey = `dlq:${pad(failedAt)}:${row.messageId}`;
+    await txn.put(deadKey, dead);
+    if (row.runId) {
+      await txn.put<QueueRunReference>(runReferenceKey(row.runId, row.messageId), {
+        messageId: row.messageId,
+        dlqKey: deadKey,
+        idempotencyKey: row.idempotencyKey,
+      });
+    }
+  }
+
   /** Return true when another due compaction page must run immediately. */
   async #compactExpiredRunFences(txn: DurableObjectTransaction, now: number): Promise<boolean> {
     const due = await txn.list<ExpiredRunGc>({
       prefix: EXPIRED_RUN_GC_PREFIX,
-      end: `${EXPIRED_RUN_GC_PREFIX}${pad(now + 1)}`,
+      end: inclusiveTimestampEnd(EXPIRED_RUN_GC_PREFIX, now),
       limit: LIFECYCLE_COMPACTION_BATCH + 1,
     });
     const page = Array.from(due).slice(0, LIFECYCLE_COMPACTION_BATCH);
@@ -790,12 +861,18 @@ export class QueueDO extends DurableObject {
   /** Arm the alarm no later than `atMs` (durable backoff never throws). */
   async #armAlarmAtMost(storage: AlarmStorage, atMs: number, now: number): Promise<void> {
     const current = await storage.getAlarm();
+    const immediate = checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS);
     if (current !== null && current <= now) {
-      await storage.setAlarm(now + MIN_ALARM_DELAY_MS);
+      if (immediate === null) await storage.deleteAlarm();
+      else await storage.setAlarm(immediate);
       return;
     }
 
-    const target = atMs <= now ? now + MIN_ALARM_DELAY_MS : atMs;
+    const target = atMs <= now ? immediate : atMs;
+    if (target === null) {
+      await storage.deleteAlarm();
+      return;
+    }
     if (current === null || target < current) {
       await storage.setAlarm(target);
     }
@@ -827,7 +904,9 @@ export class QueueDO extends DurableObject {
     }
 
     if (next !== null) {
-      await storage.setAlarm(next <= now ? now + MIN_ALARM_DELAY_MS : next);
+      const target = next <= now ? checkedQueueTimestampAdd(now, MIN_ALARM_DELAY_MS) : next;
+      if (target === null) await storage.deleteAlarm();
+      else await storage.setAlarm(target);
     } else {
       await storage.deleteAlarm();
     }
@@ -890,6 +969,9 @@ export class QueueDO extends DurableObject {
     }
     const storage = this.ctx.storage;
     const now = this.#now();
+    if (checkedQueueTimestampAdd(now, 0, MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS) === null) {
+      return { ok: false };
+    }
     const found = Array.from(await storage.list<DeadLetterRow>({ prefix: 'dlq:' })).find(
       ([, dead]) => dead.messageId === messageId,
     );
@@ -1058,9 +1140,11 @@ export class QueueDO extends DurableObject {
         return { acknowledged: false };
       }
       if (marker.compactAt === null) {
-        const compactAt = this.#now() + QUEUE_FENCE_GRACE_MS;
-        await txn.put<ExpiredRunFence>(key, { ...marker, compactAt });
-        await txn.put<ExpiredRunGc>(expiredRunGcKey(runId, compactAt), { runId, compactAt });
+        const compactAt = checkedQueueTimestampAdd(this.#now(), QUEUE_FENCE_GRACE_MS);
+        if (compactAt !== null) {
+          await txn.put<ExpiredRunFence>(key, { ...marker, compactAt });
+          await txn.put<ExpiredRunGc>(expiredRunGcKey(runId, compactAt), { runId, compactAt });
+        }
       }
       await this.#scheduleNextAlarm(txn, this.#now());
       return { acknowledged: true };

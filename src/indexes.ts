@@ -43,7 +43,7 @@ export interface RunCatalogShardStub {
     key: string,
     expectedValue: string,
   ): Promise<{ deleted: boolean }>;
-  expireRun(runId: string, keys: string[], expiredAt: number): Promise<ExpireRunIndexesResult>;
+  expireRun(runId: string, expiredAt: number): Promise<ExpireRunIndexesResult>;
 }
 
 export type HookClaimResult =
@@ -377,7 +377,6 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
       const [catalog, hookDeletes] = await Promise.all([
         stub(bindings.runCatalog, runCatalogShardName(request.runId)).expireRun(
           request.runId,
-          request.keys,
           request.expiredAt,
         ),
         releaseHooks({ runId: request.runId, hooks: request.hooks }),

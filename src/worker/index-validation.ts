@@ -96,6 +96,11 @@ function hooks(value: unknown): Array<{ hookId: string; token: string }> {
   });
 }
 
+function exactProperties(value: Record<string, unknown>, allowed: string[], name: string): void {
+  const unexpected = Object.keys(value).find((key) => !allowed.includes(key));
+  if (unexpected !== undefined) invalid(`${name}.${unexpected} is not allowed`);
+}
+
 function releaseRequest(value: unknown): ReleaseHookIndexesRequest {
   if (!isRecord(value)) invalid('release request must be an object');
   return {
@@ -106,17 +111,9 @@ function releaseRequest(value: unknown): ReleaseHookIndexesRequest {
 
 function expireRequest(value: unknown): ExpireRunIndexesRequest {
   if (!isRecord(value)) invalid('expiry request must be an object');
-  if (!Array.isArray(value.keys) || value.keys.length !== 2) {
-    invalid('request.keys must contain exactly two keys');
-  }
-  const runId = nonEmptyString(value.runId, 'request.runId');
-  const keys = value.keys.map((key, index) => nonEmptyString(key, `request.keys[${index}]`));
-  if (!keys.every((key) => key.endsWith(`:${runId}`))) {
-    invalid('request.keys must belong to request.runId');
-  }
+  exactProperties(value, ['runId', 'hooks', 'expiredAt'], 'request');
   return {
-    runId,
-    keys,
+    runId: nonEmptyString(value.runId, 'request.runId'),
     hooks: hooks(value.hooks),
     expiredAt: nonNegativeSafeInteger(value.expiredAt, 'request.expiredAt'),
   };

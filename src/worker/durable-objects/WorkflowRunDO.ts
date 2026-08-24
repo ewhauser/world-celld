@@ -37,7 +37,6 @@ import {
   type ExpireStreamResult,
   type FinalizeRunStreamsResult,
   expiredRead,
-  globalRunIndexKey,
   HOOK_MARKER_PREFIX,
   type HookIndexReference,
   hookMarkerKey,
@@ -49,7 +48,6 @@ import {
   TERMINAL_CLEANUP_KEY,
   type TerminalCleanupRecord,
   TOMBSTONE_KEY,
-  workflowRunIndexKey,
 } from '../../retention.js';
 import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../../lifecycle.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../validation.js';
@@ -871,7 +869,6 @@ export class WorkflowRunDO extends DurableObject {
     const hookMarkers = Array.from(hookEntries).slice(0, HOOK_MARKER_PAGE_SIZE);
     await this.workflowIndex().expireRun({
       runId: cleanup.runId,
-      keys: [workflowRunIndexKey(cleanup), globalRunIndexKey(cleanup)],
       hooks: hookMarkers.map(([, value]) => value),
       expiredAt: cleanup.dueAt.getTime(),
     });

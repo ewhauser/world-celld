@@ -198,8 +198,12 @@ before changing it.
 
 Queue deadlines use fixed-width 13-digit epoch-millisecond keys. A requested
 `delaySeconds` or handler redelivery timeout is accepted only when its deadline
-is at most `9999999999999`; long test-mode waits are chunked at the host timer
-limit without changing that persisted deadline contract.
+is at most `9999999669998`, leaving 330,001 ms for a fresh alarm edge and the
+maximum delivery lease. Every derived due, retry, inflight, and GC deadline is
+checked against the absolute `9999999999999` limit. A production retry which
+cannot preserve that headroom is dead-lettered instead of clamped or rescheduled;
+the test pump terminates the equivalent in-memory message. Long test-mode waits
+are chunked at the host timer limit without changing this deadline contract.
 
 ## Workflow retention
 

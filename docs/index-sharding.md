@@ -83,7 +83,8 @@ latency change.
 
 - Run create/update changed from two transactions, two fence reads, and two
   scalar writes in the singleton to one catalog-shard transaction, one local
-  expiry-fence read, and one two-key batch write. A stateless commit endpoint
+  expiry-fence read, and one three-key batch write: two public indexes plus the
+  exact internal key-pair record used by expiry. A stateless commit endpoint
   also keeps terminal fencing plus catalog publication to one public call.
 - A run list performs 16 internal catalog storage lists in parallel behind one
   authenticated stateless worker request, then the same authoritative RunDO
@@ -108,6 +109,11 @@ latency change.
   one per-run fence call and one catalog-shard expiry call. The local
   end-to-end sample was 16.70 ms before and 19.94 ms after. This is a cleanup
   safety/storage-shape tradeoff, not a portable latency claim.
+
+The public `runs.expire` operation does not accept catalog keys. It routes by
+validated `runId`; the catalog shard deletes only the exact pair retained by
+the successful catalog commit, so alternate prefixes, timestamps, encodings,
+and run IDs cannot select destructive storage keys.
 
 ### Controlled contention
 

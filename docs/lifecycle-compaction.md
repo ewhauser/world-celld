@@ -57,6 +57,7 @@ The horizons in `src/lifecycle.ts` come from enforced protocol limits:
 | idempotent fleet call     |   900,900 ms | three attempts plus the maximum two retry delays                                                |
 | run index publication     | 1,200,900 ms | one authoritative apply response plus one idempotent catalog call                               |
 | one queue delivery lease  |   330,000 ms | 300,000 ms delivery timeout plus 30,000 ms lost-claim grace                                     |
+| queue schedule headroom   |   330,001 ms | longest delivery lease plus the fresh one-millisecond alarm edge                                |
 | catalog exact-fence grace | 1,200,900 ms | maximum run-index publication lifetime                                                          |
 | queue receipt grace       |   330,000 ms | maximum of one mutation RPC and one delivery lease, starting only after durable acknowledgement |
 | hook exact-claim lease    | 2,101,800 ms | reserve retries, one authoritative apply, finalize retries, and retry delays                    |
@@ -85,7 +86,8 @@ unbounded namespace scan.
 separate from internal Durable Object/storage work.
 
 - Run create/update remains two public RPCs. Its catalog shard performs one
-  expiry-marker read, one two-key batch put, and one transaction.
+  expiry-marker read, one three-key batch put (the two public indexes plus
+  their exact internal key-pair record), and one transaction.
 - Hook create remains three public RPCs. Each ownership domain performs two
   transactions, two batch reads, three scalar writes (record, claim, claim
   deadline), and one batch delete. Finalization makes two internal lifecycle
@@ -94,8 +96,11 @@ separate from internal Durable Object/storage work.
 - Hook lookup remains one public RPC plus one internal authoritative RunDO
   lifecycle read (one RunDO transaction and one batch storage read).
 - The retention sample performs one internal catalog expiry RPC and no
-  RunFence RPC. Catalog expiry performs one marker read, two scalar writes
-  (fence and GC deadline), one two-key delete, and one transaction.
+  RunFence RPC. The caller supplies only validated run identity, hooks, and
+  expiry time. Catalog expiry reads its commit-time exact key-pair record,
+  writes the fence and GC deadline, deletes only that pair plus its internal
+  record (one two-key batch delete and one scalar delete), and does all of this
+  in one transaction. A missing pair is a mutation-free no-op.
 - A steady-state run-associated queue enqueue performs one public RPC, one
   internal RunDO lifecycle RPC, one RunDO transaction/batch read, and one queue
   transaction with two scalar reads plus four scalar writes for

@@ -10,6 +10,7 @@ import {
 
 const MAX_INDEX_LIST_SIZE = 1001;
 const EXPIRY_GC_PREFIX = 'expiry-gc:';
+const CATALOG_KEYS_PREFIX = 'catalog-keys:';
 
 interface RunCatalogEnv {
   clock?: () => number;
@@ -25,12 +26,37 @@ interface CatalogExpiryGc {
   compactAt: number;
 }
 
+interface CatalogKeys {
+  keys: [string, string];
+}
+
 function pad(ms: number): string {
   return String(Math.max(0, Math.floor(ms))).padStart(13, '0');
 }
 
 function expiredKey(runId: string): string {
   return `expired:${runId}`;
+}
+
+function catalogKeysKey(runId: string): string {
+  return `${CATALOG_KEYS_PREFIX}${encodeURIComponent(runId)}`;
+}
+
+function canonicalCatalogKeys(runId: string, keys: unknown): [string, string] {
+  if (!Array.isArray(keys) || keys.length !== 2 || keys.some((key) => typeof key !== 'string')) {
+    throw new Error('Run catalog commit requires exactly two string keys');
+  }
+  const suffix = `:${runId}`;
+  const workflowMatch = /^run:(.+):(\d{13}):/.exec(keys[0]);
+  if (
+    workflowMatch === null ||
+    !keys[0].endsWith(suffix) ||
+    keys[0] !== `run:${workflowMatch[1]}:${workflowMatch[2]}${suffix}` ||
+    keys[1] !== `runall:${workflowMatch[2]}${suffix}`
+  ) {
+    throw new Error('Run catalog commit requires the canonical run key pair');
+  }
+  return [keys[0], keys[1]];
 }
 
 function expiryGcKey(runId: string, compactAt: number): string {
@@ -50,7 +76,7 @@ export class RunCatalogDO extends DurableObject {
     serializedMetadata: string,
     publicationExpiresAt: number,
   ): Promise<{ stored: boolean }> {
-    if (keys.length !== 2) throw new Error('Run catalog commit requires exactly two keys');
+    const canonicalKeys = canonicalCatalogKeys(runId, keys);
     return await this.ctx.storage.transaction(async (txn) => {
       if ((await txn.get(expiredKey(runId))) !== undefined) return { stored: false };
       const now = this.now();
@@ -61,7 +87,11 @@ export class RunCatalogDO extends DurableObject {
       ) {
         return { stored: false };
       }
-      await txn.put(Object.fromEntries(keys.map((key) => [key, serializedMetadata])));
+      await txn.put({
+        [canonicalKeys[0]]: serializedMetadata,
+        [canonicalKeys[1]]: serializedMetadata,
+        [catalogKeysKey(runId)]: { keys: canonicalKeys } satisfies CatalogKeys,
+      });
       return { stored: true };
     });
   }
@@ -74,7 +104,9 @@ export class RunCatalogDO extends DurableObject {
         : MAX_INDEX_LIST_SIZE;
     const limit = Math.min(MAX_INDEX_LIST_SIZE, Math.max(1, requestedLimit));
     const entries = await this.ctx.storage.list<string>({
-      prefix: options.prefix ?? '',
+      // The shard also owns internal expiry metadata. An unprefixed catalog
+      // read means all public run/runall entries, never internal records.
+      prefix: options.prefix || 'run',
       ...(options.reverse
         ? { reverse: true, end: options.cursor ?? options.end }
         : { startAfter: options.cursor, end: options.end }),
@@ -104,20 +136,21 @@ export class RunCatalogDO extends DurableObject {
     });
   }
 
-  async expireRun(
-    runId: string,
-    keys: string[],
-    expiredAt: number,
-  ): Promise<ExpireRunIndexesResult> {
-    if (keys.length !== 2) throw new Error('Run catalog expiry requires exactly two keys');
+  async expireRun(runId: string, expiredAt: number): Promise<ExpireRunIndexesResult> {
     return await this.ctx.storage.transaction(async (txn) => {
+      const storedKeysKey = catalogKeysKey(runId);
+      const storedKeys = await txn.get<CatalogKeys>(storedKeysKey);
+      if (storedKeys === undefined) return { deleted: 0 };
+      const canonicalKeys = canonicalCatalogKeys(runId, storedKeys.keys);
       const marker = expiredKey(runId);
       const existing = await txn.get<CatalogExpiryFence>(marker);
       const compactAt = existing?.compactAt ?? this.now() + CATALOG_FENCE_GRACE_MS;
       await txn.put<CatalogExpiryFence>(marker, { expiredAt, compactAt });
       await txn.put<CatalogExpiryGc>(expiryGcKey(runId, compactAt), { runId, compactAt });
       await this.armAtMost(txn, compactAt);
-      return { deleted: await txn.delete(keys) };
+      const deleted = await txn.delete(canonicalKeys);
+      await txn.delete(storedKeysKey);
+      return { deleted };
     });
   }
 

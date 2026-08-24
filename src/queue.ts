@@ -29,10 +29,13 @@ import {
 import { parse, stringify } from './vendor/shared/index.js';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
-import { MAX_QUEUE_DELIVERY_TIMEOUT_MS } from './lifecycle.js';
+import {
+  MAX_QUEUE_DELIVERY_TIMEOUT_MS,
+  MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+} from './lifecycle.js';
 import {
   boundedIntegerOption,
-  isValidQueueDelaySeconds,
+  checkedQueueTimestampAdd,
   queueDelayDeadline,
   strictIntegerSetting,
 } from './validation.js';
@@ -287,9 +290,16 @@ function createTestPump(config: CelldQueueConfig) {
         parsed = null;
       }
       const timeoutSeconds = (parsed as { timeoutSeconds?: number } | null)?.timeoutSeconds;
-      if (isValidQueueDelaySeconds(timeoutSeconds, 1)) {
+      const now = Date.now();
+      const redeliveryAt = queueDelayDeadline(
+        now,
+        timeoutSeconds,
+        1,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      );
+      if (redeliveryAt !== null) {
         // Same message re-delivered later: the idempotency key stays claimed.
-        void delayFor(timeoutSeconds * 1000).then(() => enqueue(pathname, envelope));
+        void delayFor(redeliveryAt - now).then(() => enqueue(pathname, envelope));
         return;
       }
     }
@@ -308,6 +318,16 @@ function createTestPump(config: CelldQueueConfig) {
         MAX_TEST_PUMP_BACKOFF_MS,
         baseBackoffMs * 2 ** Math.min(next.attempt - 1, 30),
       );
+      if (
+        checkedQueueTimestampAdd(Date.now(), backoff, MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS) ===
+        null
+      ) {
+        release(envelope);
+        console.error(
+          `[world-celld test pump] dropping ${envelope.messageId}: retry deadline exceeds the queue timestamp horizon`,
+        );
+        return;
+      }
       void delayFor(backoff).then(() => enqueue(pathname, next));
     } else {
       release(envelope);
@@ -337,6 +357,16 @@ function createTestPump(config: CelldQueueConfig) {
       return idempotencyKey ? inflightMessages.get(idempotencyKey) : undefined;
     },
     push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number) {
+      if (
+        queueDelayDeadline(
+          Date.now(),
+          delaySeconds ?? 0,
+          0,
+          MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+        ) === null
+      ) {
+        throw new Error('world-celld queue delaySeconds lacks required delivery headroom');
+      }
       if (envelope.idempotencyKey) {
         inflightMessages.set(envelope.idempotencyKey, MessageId.parse(envelope.messageId));
       }
@@ -380,8 +410,15 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
       if (!parsedMessage.success) {
         throw new WorkflowWorldError('world-celld queue payload is invalid', { status: 422 });
       }
-      if (queueDelayDeadline(Date.now(), opts?.delaySeconds ?? 0) === null) {
-        throw new Error('world-celld queue delaySeconds is out of range');
+      if (
+        queueDelayDeadline(
+          Date.now(),
+          opts?.delaySeconds ?? 0,
+          0,
+          MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+        ) === null
+      ) {
+        throw new Error('world-celld queue delaySeconds lacks required delivery headroom');
       }
       const runId =
         'runId' in parsedMessage.data && typeof parsedMessage.data.runId === 'string'
@@ -492,7 +529,14 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
             messageId: reqMessageId,
           });
           if (result && typeof result.timeoutSeconds === 'number') {
-            if (queueDelayDeadline(Date.now(), result.timeoutSeconds, 1) === null) {
+            if (
+              queueDelayDeadline(
+                Date.now(),
+                result.timeoutSeconds,
+                1,
+                MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+              ) === null
+            ) {
               throw new Error('Queue handler timeoutSeconds is out of range');
             }
             return Response.json(

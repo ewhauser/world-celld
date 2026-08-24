@@ -303,6 +303,10 @@ class MockWorkflowIndex {
     }
     kvData.set(workflowRunIndexKey(run), serializedMetadata);
     kvData.set(globalRunIndexKey(run), serializedMetadata);
+    kvData.set(
+      `catalog-keys:${run.runId}`,
+      JSON.stringify([workflowRunIndexKey(run), globalRunIndexKey(run)]),
+    );
     return { stored: true };
   }
 
@@ -316,7 +320,7 @@ class MockWorkflowIndex {
     list_complete: boolean;
     cursor?: string;
   }> {
-    const prefix = options?.prefix || '';
+    const prefix = options?.prefix || 'run';
     const limit = options?.limit || 1000;
 
     let matchingKeys = Array.from(kvData.keys())
@@ -359,12 +363,15 @@ class MockWorkflowIndex {
   }
 
   async expireRun(request: ExpireRunIndexesRequest): Promise<{ deleted: number }> {
+    const storedKeys = kvData.get(`catalog-keys:${request.runId}`);
+    if (storedKeys === undefined) return { deleted: 0 };
     kvData.set(`expired:${request.runId}`, String(request.expiredAt));
     let deleted = 0;
     if (kvData.delete(`terminal:${request.runId}`)) deleted++;
-    for (const key of request.keys) {
+    for (const key of JSON.parse(storedKeys) as string[]) {
       if (kvData.delete(key)) deleted++;
     }
+    kvData.delete(`catalog-keys:${request.runId}`);
     for (const hook of request.hooks) {
       for (const key of [
         `hook:${hook.token}`,

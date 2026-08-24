@@ -59,10 +59,35 @@ export function queueDelayDeadline(
   now: number,
   delaySeconds: unknown,
   minimum: 0 | 1 = 0,
+  requiredHeadroomMs = 0,
 ): number | null {
   if (!isNonNegativeSafeInteger(now) || !isValidQueueDelaySeconds(delaySeconds, minimum)) {
     return null;
   }
-  const deadline = now + delaySeconds * 1000;
-  return Number.isSafeInteger(deadline) && deadline <= MAX_QUEUE_TIMESTAMP_MS ? deadline : null;
+  return checkedQueueTimestampAdd(now, delaySeconds * 1000, requiredHeadroomMs);
+}
+
+/**
+ * Add an offset to a queue timestamp while preserving its 13-digit key order.
+ * Optional headroom reserves space for a later persisted derivative deadline.
+ */
+export function checkedQueueTimestampAdd(
+  timestampMs: unknown,
+  offsetMs: unknown,
+  requiredHeadroomMs = 0,
+): number | null {
+  if (
+    !isNonNegativeSafeInteger(timestampMs) ||
+    !isNonNegativeSafeInteger(offsetMs) ||
+    !isNonNegativeSafeInteger(requiredHeadroomMs)
+  ) {
+    return null;
+  }
+  const timestamp = timestampMs;
+  const offset = offsetMs;
+  if (timestamp > MAX_QUEUE_TIMESTAMP_MS || offset > MAX_QUEUE_TIMESTAMP_MS - timestamp) {
+    return null;
+  }
+  const result = timestamp + offset;
+  return requiredHeadroomMs <= MAX_QUEUE_TIMESTAMP_MS - result ? result : null;
 }

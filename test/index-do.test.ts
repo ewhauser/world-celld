@@ -73,6 +73,22 @@ function run(sequence: number, workflowName = 'routing-workflow'): WorkflowRun {
   };
 }
 
+function paddedTimestamp(value: number): string {
+  return String(value).padStart(13, '0');
+}
+
+async function seedCatalogRun(catalog: RunCatalogDO, runId: string, now: number): Promise<void> {
+  const timestamp = paddedTimestamp(now);
+  await expect(
+    catalog.upsertRun(
+      runId,
+      [`run:catalog-compaction:${timestamp}:${runId}`, `runall:${timestamp}:${runId}`],
+      JSON.stringify({ runId }),
+      now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+    ),
+  ).resolves.toEqual({ stored: true });
+}
+
 function hook(runId: string, hookId: string, token: string): Hook {
   return {
     runId,
@@ -450,7 +466,6 @@ describe('sharded workflow indexes', () => {
     expect(
       await indexes.expireRun({
         runId: value.runId,
-        keys: [workflowRunIndexKey(value), globalRunIndexKey(value)],
         hooks: [],
         expiredAt: 123,
       }),
@@ -494,6 +509,56 @@ describe('sharded workflow indexes', () => {
     expect(await indexes.commitRun(value, currentMetadata, publicationExpiresAt)).toEqual({
       stored: true,
     });
+  });
+
+  it('rejects noncanonical internal catalog commits and makes missing-run expiry mutation-free', async () => {
+    const shardName = 'run-catalog:v1:canonical-keys-test';
+    const catalog = fleet.namespace('run-catalog').get({
+      toString: () => shardName,
+    }) as RunCatalogDO;
+    const runId = 'wrun_canonical_keys';
+    const timestamp = paddedTimestamp(fleet.now);
+    const canonical = [
+      `run:canonical-workflow:${timestamp}:${runId}`,
+      `runall:${timestamp}:${runId}`,
+    ];
+    const malformedPairs = [
+      [`arbitrary:canonical-workflow:${timestamp}:${runId}`, canonical[1]],
+      [canonical[1], canonical[0]],
+      [canonical[0], canonical[0]],
+      [canonical[0], `runall:${paddedTimestamp(fleet.now + 1)}:${runId}`],
+      [`expired:${runId}`, `expiry-gc:${timestamp}:${runId}`],
+      [`run%3Acanonical-workflow%3A${timestamp}%3A${runId}`, canonical[1]],
+      [canonical[0], `runall:${timestamp}:wrun_wrong`],
+    ];
+    const storage = fleet.cell('run-catalog', shardName).storage;
+
+    for (const keys of malformedPairs) {
+      const before = new Map(storage.data);
+      await expect(
+        catalog.upsertRun(
+          runId,
+          keys,
+          JSON.stringify({ runId }),
+          fleet.now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS,
+        ),
+      ).rejects.toThrow(/canonical run key pair/);
+      expect(storage.data).toEqual(before);
+      expect(storage.alarmAt).toBeNull();
+    }
+
+    const before = new Map(storage.data);
+    await expect(catalog.expireRun(runId, fleet.now)).resolves.toEqual({ deleted: 0 });
+    expect(storage.data).toEqual(before);
+    expect(storage.alarmAt).toBeNull();
+
+    storage.data.set(`catalog-keys:${runId}`, {
+      keys: [`expired:${runId}`, `expiry-gc:${timestamp}:${runId}`],
+    });
+    const corruptBefore = new Map(storage.data);
+    await expect(catalog.expireRun(runId, fleet.now)).rejects.toThrow(/canonical run key pair/);
+    expect(storage.data).toEqual(corruptBefore);
+    expect(storage.alarmAt).toBeNull();
   });
 
   it('compacts abandoned exact claims after the protocol lease and survives restart', async () => {
@@ -739,7 +804,8 @@ describe('sharded workflow indexes', () => {
     }) as RunCatalogDO;
     const runIds = Array.from({ length: 300 }, (_, index) => `wrun_catalog_compaction_${index}`);
     for (const runId of runIds) {
-      await catalog.expireRun(runId, [`run:${runId}`, `runall:${runId}`], fleet.now);
+      await seedCatalogRun(catalog, runId, fleet.now);
+      await catalog.expireRun(runId, fleet.now);
     }
 
     const catalogStorage = fleet.cell('run-catalog', shardName).storage;
@@ -794,7 +860,8 @@ describe('sharded workflow indexes', () => {
       toString: () => shardName,
     }) as RunCatalogDO;
     const runId = 'wrun_reused_catalog_generation';
-    await catalog.expireRun(runId, [`run:${runId}`, `runall:${runId}`], fleet.now);
+    await seedCatalogRun(catalog, runId, fleet.now);
+    await catalog.expireRun(runId, fleet.now);
 
     const catalogStorage = fleet.cell('run-catalog', shardName).storage;
     const markerKey = `expired:${runId}`;
@@ -805,7 +872,8 @@ describe('sharded workflow indexes', () => {
     const oldGc = catalogStorage.data.get(oldGcKey);
     catalogStorage.data.delete(markerKey);
     fleet.advance(1);
-    await catalog.expireRun(runId, [`run:${runId}`, `runall:${runId}`], fleet.now);
+    await seedCatalogRun(catalog, runId, fleet.now);
+    await catalog.expireRun(runId, fleet.now);
     catalogStorage.data.set(oldGcKey, oldGc);
 
     const currentFence = catalogStorage.data.get(markerKey) as { compactAt: number };

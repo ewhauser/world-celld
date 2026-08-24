@@ -7,9 +7,18 @@ import type { EnqueueRequest } from '../src/queue.js';
 import { stringify } from '../src/vendor/shared/index.js';
 import { QueueDO, type MessageRow } from '../src/worker/durable-objects/QueueDO.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
-import { LIFECYCLE_COMPACTION_RETRY_MS, QUEUE_FENCE_GRACE_MS } from '../src/lifecycle.js';
+import {
+  LIFECYCLE_COMPACTION_RETRY_MS,
+  MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+  MAX_QUEUE_SCHEDULE_TIMESTAMP_MS,
+  QUEUE_FENCE_GRACE_MS,
+} from '../src/lifecycle.js';
 import type { RunLifecycleStatus } from '../src/retention.js';
-import { MAX_QUEUE_DELAY_SECONDS, MAX_QUEUE_TIMESTAMP_MS } from '../src/validation.js';
+import {
+  checkedQueueTimestampAdd,
+  MAX_QUEUE_DELAY_SECONDS,
+  MAX_QUEUE_TIMESTAMP_MS,
+} from '../src/validation.js';
 
 class TestRunLifecycleDO {
   constructor(private ctx: { storage: DurableObjectStorage }) {}
@@ -56,6 +65,16 @@ function storedMessage(messageId: string, now: number): MessageRow {
     attempt: 0,
     enqueuedAt: now,
   };
+}
+
+function expectQueueTimestampContract(data: Map<string, unknown>, alarmAt: number | null): void {
+  const timestamped = /^(?:due|inflight-deadline|dlq|expired-run-gc):(\d+):/;
+  const timestamps = Array.from(data.keys()).flatMap((key) => {
+    const match = timestamped.exec(key);
+    return match ? [match[1]] : [];
+  });
+  expect(timestamps.every((timestamp) => /^\d{13}$/.test(timestamp))).toBe(true);
+  expect(alarmAt === null || alarmAt <= MAX_QUEUE_TIMESTAMP_MS).toBe(true);
 }
 
 describe('QueueDO', () => {
@@ -400,8 +419,8 @@ describe('QueueDO', () => {
     expect(fetchStub).toHaveBeenCalledOnce();
   });
 
-  it('orders ordinary and far-future deadlines and accepts the exact 13-digit boundary', async () => {
-    const startTime = 999;
+  it('orders ordinary and far-future deadlines through the exact admissible boundary', async () => {
+    const startTime = 998;
     const boundaryFleet = new FakeFleet(
       { queue: QueueDO },
       { clock: () => boundaryFleet.now, fetch: fetchStub },
@@ -410,7 +429,7 @@ describe('QueueDO', () => {
     const boundaryQueue = boundaryFleet.namespace('queue').get({
       toString: () => 'q:0',
     }) as QueueDO;
-    const exactBoundaryDelay = (MAX_QUEUE_TIMESTAMP_MS - startTime) / 1000;
+    const exactBoundaryDelay = (MAX_QUEUE_SCHEDULE_TIMESTAMP_MS - startTime) / 1000;
 
     await boundaryQueue.enqueue(
       enqueueReq({ messageId: 'msg_boundary', delaySeconds: exactBoundaryDelay }),
@@ -419,7 +438,7 @@ describe('QueueDO', () => {
     const boundaryStorage = boundaryFleet.cell('queue', 'q:0').storage;
     expect(Array.from((await boundaryStorage.list<string>({ prefix: 'due:' })).keys())).toEqual([
       `due:${padded(startTime + 1_000)}:msg_ordinary`,
-      `due:${padded(MAX_QUEUE_TIMESTAMP_MS)}:msg_boundary`,
+      `due:${padded(MAX_QUEUE_SCHEDULE_TIMESTAMP_MS)}:msg_boundary`,
     ]);
     expect(boundaryStorage.alarmAt).toBe(startTime + 1_000);
     await expect(
@@ -430,17 +449,128 @@ describe('QueueDO', () => {
         }),
       ),
     ).rejects.toThrow(/delaySeconds/);
+    expect(
+      checkedQueueTimestampAdd(
+        MAX_QUEUE_SCHEDULE_TIMESTAMP_MS,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      ),
+    ).toBe(MAX_QUEUE_TIMESTAMP_MS);
+    expect(
+      checkedQueueTimestampAdd(
+        MAX_QUEUE_SCHEDULE_TIMESTAMP_MS + 1,
+        0,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      ),
+    ).toBeNull();
+    expect(checkedQueueTimestampAdd(MAX_QUEUE_TIMESTAMP_MS, 0)).toBe(MAX_QUEUE_TIMESTAMP_MS);
+    expect(checkedQueueTimestampAdd(MAX_QUEUE_TIMESTAMP_MS, 1)).toBeNull();
+    const oneMillisecondOverFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => oneMillisecondOverFleet.now, fetch: fetchStub },
+      MAX_QUEUE_SCHEDULE_TIMESTAMP_MS + 1,
+    );
+    const oneMillisecondOverQueue = oneMillisecondOverFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    await expect(
+      oneMillisecondOverQueue.enqueue(enqueueReq({ messageId: 'msg_one_ms_over' })),
+    ).rejects.toThrow(/delivery headroom/);
+    const oneMillisecondOverStorage = oneMillisecondOverFleet.cell('queue', 'q:0').storage;
+    expect(oneMillisecondOverStorage.data.size).toBe(0);
+    expect(oneMillisecondOverStorage.alarmAt).toBeNull();
 
     boundaryFleet.advance(1_000);
     await boundaryFleet.fireDueAlarms();
     expect(fetchStub).toHaveBeenCalledOnce();
     expect(boundaryStorage.data.has('msg:msg_boundary')).toBe(true);
-    expect(boundaryStorage.alarmAt).toBe(MAX_QUEUE_TIMESTAMP_MS);
+    expect(boundaryStorage.alarmAt).toBe(MAX_QUEUE_SCHEDULE_TIMESTAMP_MS);
 
-    boundaryFleet.advance(MAX_QUEUE_TIMESTAMP_MS - boundaryFleet.now);
+    boundaryFleet.advance(MAX_QUEUE_SCHEDULE_TIMESTAMP_MS - boundaryFleet.now);
     await boundaryFleet.fireDueAlarms();
     expect(fetchStub).toHaveBeenCalledTimes(2);
     expect(boundaryStorage.data.has('msg:msg_boundary')).toBe(false);
+    expectQueueTimestampContract(boundaryStorage.data, boundaryStorage.alarmAt);
+  });
+
+  it.each([
+    ['HTTP 500', jsonResponse(500, { error: 'boom' })],
+    ['valid 503 hint', jsonResponse(503, { timeoutSeconds: 1 })],
+    ['missing 503 hint', jsonResponse(503, {})],
+    ['malformed 503 hint', jsonResponse(503, { timeoutSeconds: '5junk' })],
+  ])('dead-letters %s at the retry horizon without an overflow cycle', async (_, response) => {
+    const boundaryFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => boundaryFleet.now, fetch: fetchStub },
+      MAX_QUEUE_SCHEDULE_TIMESTAMP_MS,
+    );
+    const boundaryQueue = boundaryFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    const boundaryStorage = boundaryFleet.cell('queue', 'q:0').storage;
+    let sawExactMaxClaim = false;
+    fetchStub.mockImplementation(async () => {
+      sawExactMaxClaim = boundaryStorage.data.has(
+        `${INFLIGHT_DEADLINE_PREFIX}${padded(MAX_QUEUE_TIMESTAMP_MS)}:msg_horizon_retry`,
+      );
+      return response;
+    });
+
+    await boundaryQueue.enqueue(enqueueReq({ messageId: 'msg_horizon_retry' }));
+    boundaryFleet.advance(1);
+    await boundaryFleet.fireDueAlarms();
+    await boundaryFleet.settle();
+
+    expect(fetchStub).toHaveBeenCalledOnce();
+    await expect(boundaryQueue.listDeadLetters()).resolves.toMatchObject({
+      data: [
+        expect.objectContaining({
+          messageId: 'msg_horizon_retry',
+          attempt: 1,
+          lastError: expect.stringContaining('timestamp horizon'),
+        }),
+      ],
+    });
+    expect(sawExactMaxClaim).toBe(true);
+    expect(boundaryStorage.alarmAt).toBeNull();
+    expectQueueTimestampContract(boundaryStorage.data, boundaryStorage.alarmAt);
+  });
+
+  it('dead-letters an unrecoverable max-deadline inflight claim after restart', async () => {
+    const boundaryFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => boundaryFleet.now, fetch: fetchStub },
+      MAX_QUEUE_TIMESTAMP_MS,
+    );
+    const messageId = 'msg_horizon_restart';
+    const boundaryStorage = boundaryFleet.cell('queue', 'q:0').storage;
+    boundaryStorage.data.set(`msg:${messageId}`, {
+      ...storedMessage(messageId, boundaryFleet.now),
+      attempt: 2,
+    });
+    boundaryStorage.data.set(
+      `${INFLIGHT_DEADLINE_PREFIX}${padded(MAX_QUEUE_TIMESTAMP_MS)}:${messageId}`,
+      messageId,
+    );
+    boundaryStorage.alarmAt = MAX_QUEUE_TIMESTAMP_MS;
+    boundaryFleet.restartCell('queue', 'q:0');
+
+    await boundaryFleet.fireDueAlarms();
+
+    const boundaryQueue = boundaryFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    await expect(boundaryQueue.listDeadLetters()).resolves.toMatchObject({
+      data: [
+        expect.objectContaining({
+          messageId,
+          attempt: 2,
+          lastError: expect.stringContaining('inflight recovery'),
+        }),
+      ],
+    });
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(boundaryStorage.alarmAt).toBeNull();
+    expectQueueTimestampContract(boundaryStorage.data, boundaryStorage.alarmAt);
   });
 
   it('redelivers after 503 {timeoutSeconds} without advancing the attempt', async () => {
@@ -1089,6 +1219,55 @@ describe('QueueDO', () => {
     fleet.advance(QUEUE_FENCE_GRACE_MS);
     await fleet.fireDueAlarms();
     expect(storage().has(`expired-run:${runId}`)).toBe(false);
+  });
+
+  it('schedules expiry-fence GC at the exact timestamp boundary and retains it past the horizon', async () => {
+    const exactFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => exactFleet.now, fetch: fetchStub },
+      MAX_QUEUE_TIMESTAMP_MS - QUEUE_FENCE_GRACE_MS,
+    );
+    const exactQueue = exactFleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
+    const exactRunId = 'wrun_exact_gc_horizon';
+    const exactReceipt = await exactQueue.expireRun(exactRunId, exactFleet.now);
+    if (!exactReceipt.done) throw new Error('expected exact-boundary expiry receipt');
+    await expect(
+      exactQueue.acknowledgeExpireRun(exactRunId, exactReceipt.receipt),
+    ).resolves.toEqual({ acknowledged: true });
+    const exactStorage = exactFleet.cell('queue', 'q:0').storage;
+    expect(exactStorage.alarmAt).toBe(MAX_QUEUE_TIMESTAMP_MS);
+    expect(
+      Array.from(exactStorage.data.keys()).find((key) => key.startsWith('expired-run-gc:')),
+    ).toMatch(`expired-run-gc:${padded(MAX_QUEUE_TIMESTAMP_MS)}:`);
+    expectQueueTimestampContract(exactStorage.data, exactStorage.alarmAt);
+    exactFleet.advance(QUEUE_FENCE_GRACE_MS);
+    await exactFleet.fireDueAlarms();
+    expect(exactStorage.data.has(`expired-run:${exactRunId}`)).toBe(false);
+    expect(exactStorage.alarmAt).toBeNull();
+
+    const overflowFleet = new FakeFleet(
+      { queue: QueueDO },
+      { clock: () => overflowFleet.now, fetch: fetchStub },
+      MAX_QUEUE_TIMESTAMP_MS - QUEUE_FENCE_GRACE_MS + 1,
+    );
+    const overflowQueue = overflowFleet.namespace('queue').get({
+      toString: () => 'q:0',
+    }) as QueueDO;
+    const overflowRunId = 'wrun_overflow_gc_horizon';
+    const overflowReceipt = await overflowQueue.expireRun(overflowRunId, overflowFleet.now);
+    if (!overflowReceipt.done) throw new Error('expected overflow-boundary expiry receipt');
+    await expect(
+      overflowQueue.acknowledgeExpireRun(overflowRunId, overflowReceipt.receipt),
+    ).resolves.toEqual({ acknowledged: true });
+    const overflowStorage = overflowFleet.cell('queue', 'q:0').storage;
+    expect(overflowStorage.data.get(`expired-run:${overflowRunId}`)).toMatchObject({
+      compactAt: null,
+    });
+    expect(
+      Array.from(overflowStorage.data.keys()).filter((key) => key.startsWith('expired-run-gc:')),
+    ).toEqual([]);
+    expect(overflowStorage.alarmAt).toBeNull();
+    expectQueueTimestampContract(overflowStorage.data, overflowStorage.alarmAt);
   });
 
   it('compacts many acknowledged exact fences to no derivative state in paged alarm work', async () => {
