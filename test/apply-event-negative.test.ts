@@ -26,8 +26,10 @@ type ContractError = Error & {
   code?: string;
   status?: number;
   retryAfter?: number;
+  retryAfterSeconds?: number;
   runSpecVersion?: number;
   worldSpecVersion?: number;
+  details?: unknown;
 };
 
 let harness: Harness;
@@ -88,7 +90,107 @@ async function captureError(promise: Promise<unknown>): Promise<ContractError> {
   );
 }
 
+function applyOutcomeFetch(outcome: unknown): typeof fetch {
+  return async (input, init) => {
+    const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+    if (path.endsWith('/applyEvent')) {
+      return new Response(rpcStringify(outcome), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return await fetch(input, init);
+  };
+}
+
 describe('negative apply-event contract', () => {
+  it('reconstructs unknown structured failures without entering the success path', async () => {
+    const details = {
+      reason: 'new server-side failure mode',
+      observedAt: new Date('2026-08-23T20:00:00.000Z'),
+      digest: new Uint8Array([0, 1, 254, 255]),
+      nested: { retryable: true },
+    };
+    const full = await captureError(
+      storage(
+        applyOutcomeFetch({
+          ok: false,
+          code: 'FUTURE_FAILURE',
+          message: 'the server knows more than this client',
+          status: 425,
+          retryAfter: 17,
+          retryAfterSeconds: 19,
+          runSpecVersion: SPEC_VERSION_CURRENT + 2,
+          worldSpecVersion: SPEC_VERSION_CURRENT + 1,
+          details,
+        }),
+      ).events.create('wrun_future_failure_full', { eventType: 'run_started' }),
+    );
+
+    expect(WorkflowWorldError.is(full)).toBe(true);
+    expect(full).toMatchObject({
+      name: 'WorkflowWorldError',
+      code: 'FUTURE_FAILURE',
+      message: 'the server knows more than this client',
+      status: 425,
+      retryAfter: 17,
+      retryAfterSeconds: 19,
+      runSpecVersion: SPEC_VERSION_CURRENT + 2,
+      worldSpecVersion: SPEC_VERSION_CURRENT + 1,
+      details,
+    });
+
+    // Mutation sentinel: removing the unknown-code fallback makes this reach
+    // success-only `releasedHooks` access and changes the error to TypeError.
+    const minimal = await captureError(
+      storage(
+        applyOutcomeFetch({
+          ok: false,
+          code: 'FUTURE_FAILURE',
+          message: 'minimal future failure',
+        }),
+      ).events.create('wrun_future_failure_minimal', { eventType: 'run_started' }),
+    );
+    expect(WorkflowWorldError.is(minimal)).toBe(true);
+    expect(minimal).toMatchObject({
+      name: 'WorkflowWorldError',
+      code: 'FUTURE_FAILURE',
+      message: 'minimal future failure',
+    });
+  });
+
+  it.each([
+    ['missing discriminant', {}],
+    ['missing failure fields', { ok: false }],
+    ['non-string failure code', { ok: false, code: 503, message: 'bad code' }],
+    ['missing failure message', { ok: false, code: 'FUTURE_FAILURE' }],
+    ['non-string failure message', { ok: false, code: 'FUTURE_FAILURE', message: 503 }],
+    [
+      'wrong-typed failure metadata',
+      { ok: false, code: 'FUTURE_FAILURE', message: 'bad status', status: '503' },
+    ],
+    ['missing success fields', { ok: true }],
+    ['wrong-typed released hooks', { ok: true, releasedHooks: 'none' }],
+    ['malformed released hook', { ok: true, releasedHooks: [{ hookId: 'hook-only' }] }],
+    ['malformed success entity', { ok: true, releasedHooks: [], run: 'not-a-run' }],
+    [
+      'wrong-typed success metadata',
+      { ok: true, releasedHooks: [], indexPublicationExpiresAt: 'never' },
+    ],
+    ['missing event pagination', { ok: true, releasedHooks: [], events: [] }],
+  ])('rejects a malformed applyEvent outcome: %s', async (_label, outcome) => {
+    const error = await captureError(
+      storage(applyOutcomeFetch(outcome)).events.create('wrun_malformed_outcome', {
+        eventType: 'run_started',
+      }),
+    );
+
+    expect(error).toMatchObject({
+      name: 'FleetTransportError',
+      message: expect.stringContaining('world-celld: malformed applyEvent outcome:'),
+    });
+  });
+
   it('rejects malformed schemas and run identity mismatches before dispatch or sequence allocation', async () => {
     const runId = 'wrun_negative_schema';
     await createRun(runId);

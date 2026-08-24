@@ -37,13 +37,21 @@ import {
   isTerminalWorkflowRunStatus,
   SPEC_VERSION_CURRENT,
   StepSchema,
+  WaitSchema,
   WorkflowRunSchema,
 } from '@workflow/world';
 import { parse, stringify } from './vendor/shared/index.js';
 import { monotonicFactory } from 'ulid';
-import type { ApplyEventFailure, ApplyEventOutcome, ApplyEventRequest } from './apply-event.js';
+import type {
+  ApplyEventErrorCode,
+  ApplyEventFailure,
+  ApplyEventOutcome,
+  ApplyEventRequest,
+  ApplyEventSuccess,
+} from './apply-event.js';
 import type { HookTokenOwner, IndexNamespace } from './config.js';
 import type { HookReservation } from './indexes.js';
+import { FleetTransportError } from './remote/errors.js';
 import { compact } from './util.js';
 import type { RunReadOutcome } from './retention.js';
 
@@ -110,6 +118,204 @@ function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
   return { runId: hook.runId, hookId: hook.hookId };
 }
 
+const APPLY_EVENT_ERROR_CODES = new Set<string>([
+  'RUN_NOT_FOUND',
+  'STEP_NOT_FOUND',
+  'HOOK_NOT_FOUND',
+  'WAIT_NOT_FOUND',
+  'ENTITY_CONFLICT',
+  'HOOK_CLAIM_CANCELLED',
+  'RUN_EXPIRED',
+  'TOO_EARLY',
+  'RUN_NOT_SUPPORTED',
+] satisfies ApplyEventErrorCode[]);
+
+interface ApplyEventWireFailure {
+  ok: false;
+  code: string;
+  message: string;
+  status?: number;
+  retryAfter?: number;
+  retryAfterSeconds?: number;
+  runSpecVersion?: number;
+  worldSpecVersion?: number;
+  details?: unknown;
+}
+
+type ParsedApplyEventOutcome =
+  | { kind: 'success'; outcome: ApplyEventSuccess }
+  | { kind: 'known-failure'; outcome: ApplyEventFailure & ApplyEventWireFailure }
+  | { kind: 'unknown-failure'; outcome: ApplyEventWireFailure };
+
+function malformedApplyEventOutcome(reason: string): never {
+  throw new FleetTransportError(`world-celld: malformed applyEvent outcome: ${reason}`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validateOptionalNumber(
+  outcome: Record<string, unknown>,
+  key: 'status' | 'retryAfter' | 'retryAfterSeconds' | 'runSpecVersion' | 'worldSpecVersion',
+  integer: boolean,
+): void {
+  const value = outcome[key];
+  if (
+    value !== undefined &&
+    (typeof value !== 'number' ||
+      !Number.isFinite(value) ||
+      (integer && !Number.isSafeInteger(value)))
+  ) {
+    malformedApplyEventOutcome(`${key} must be ${integer ? 'a safe integer' : 'a finite number'}`);
+  }
+}
+
+function parseSuccessEntity<T>(
+  outcome: Record<string, unknown>,
+  key: 'event' | 'run' | 'step' | 'hook' | 'wait' | 'hookToIndex',
+  schema: {
+    safeParse(value: unknown): { success: true; data: T } | { success: false };
+  },
+): T | undefined {
+  const value = outcome[key];
+  if (value === undefined) return undefined;
+  if (!isRecord(value)) malformedApplyEventOutcome(`${key} is invalid`);
+  const result = schema.safeParse(compact(value));
+  if (!result.success) malformedApplyEventOutcome(`${key} is invalid`);
+  return result.data;
+}
+
+/**
+ * Validate the untrusted value decoded from the remote applyEvent RPC.
+ * Unknown failure codes are intentionally valid and classified separately so
+ * an older client can reconstruct their wire metadata without treating them
+ * as success. All fields consumed by the success path are checked before any
+ * derivative index operation can run.
+ */
+function parseApplyEventOutcome(value: unknown): ParsedApplyEventOutcome {
+  if (!isRecord(value)) malformedApplyEventOutcome('response must be an object');
+
+  if (value.ok === false) {
+    if (typeof value.code !== 'string' || value.code.length === 0) {
+      malformedApplyEventOutcome('failure code must be a non-empty string');
+    }
+    if (typeof value.message !== 'string') {
+      malformedApplyEventOutcome('failure message must be a string');
+    }
+    validateOptionalNumber(value, 'status', true);
+    validateOptionalNumber(value, 'retryAfter', false);
+    validateOptionalNumber(value, 'retryAfterSeconds', false);
+    validateOptionalNumber(value, 'runSpecVersion', true);
+    validateOptionalNumber(value, 'worldSpecVersion', true);
+
+    const outcome = value as unknown as ApplyEventWireFailure;
+    return APPLY_EVENT_ERROR_CODES.has(outcome.code)
+      ? {
+          kind: 'known-failure',
+          outcome: outcome as ApplyEventFailure & ApplyEventWireFailure,
+        }
+      : { kind: 'unknown-failure', outcome };
+  }
+
+  if (value.ok !== true) malformedApplyEventOutcome('ok must be true or false');
+  if (!Array.isArray(value.releasedHooks)) {
+    malformedApplyEventOutcome('releasedHooks must be an array');
+  }
+  for (const releasedHook of value.releasedHooks) {
+    if (
+      !isRecord(releasedHook) ||
+      typeof releasedHook.hookId !== 'string' ||
+      releasedHook.hookId.length === 0 ||
+      typeof releasedHook.token !== 'string' ||
+      releasedHook.token.length === 0
+    ) {
+      malformedApplyEventOutcome('releasedHooks entries must contain hookId and token strings');
+    }
+  }
+
+  const event = parseSuccessEntity(value, 'event', EventSchema);
+  const run = parseSuccessEntity(value, 'run', WorkflowRunSchema);
+  const step = parseSuccessEntity(value, 'step', StepSchema);
+  const hook = parseSuccessEntity(value, 'hook', HookSchema);
+  const wait = parseSuccessEntity(value, 'wait', WaitSchema);
+  const hookToIndex = parseSuccessEntity(value, 'hookToIndex', HookSchema);
+
+  if (value.stepCreated !== undefined && value.stepCreated !== true) {
+    malformedApplyEventOutcome('stepCreated must be true when present');
+  }
+  if (value.runCreated !== undefined) {
+    if (
+      !isRecord(value.runCreated) ||
+      typeof value.runCreated.workflowName !== 'string' ||
+      !(value.runCreated.createdAt instanceof Date) ||
+      Number.isNaN(value.runCreated.createdAt.getTime())
+    ) {
+      malformedApplyEventOutcome('runCreated is invalid');
+    }
+  }
+  let events: Event[] | undefined;
+  if (value.events !== undefined) {
+    if (!Array.isArray(value.events)) malformedApplyEventOutcome('events must be an array');
+    events = value.events.map((candidate) => {
+      if (!isRecord(candidate)) malformedApplyEventOutcome('events contains an invalid event');
+      const result = EventSchema.safeParse(compact(candidate));
+      if (!result.success) {
+        malformedApplyEventOutcome('events contains an invalid event');
+      }
+      return result.data;
+    });
+    if (value.cursor !== null && typeof value.cursor !== 'string') {
+      malformedApplyEventOutcome('cursor is required when events are present');
+    }
+    if (typeof value.hasMore !== 'boolean') {
+      malformedApplyEventOutcome('hasMore is required when events are present');
+    }
+  }
+  if (value.cursor !== undefined && value.cursor !== null && typeof value.cursor !== 'string') {
+    malformedApplyEventOutcome('cursor must be a string or null');
+  }
+  if (value.hasMore !== undefined && typeof value.hasMore !== 'boolean') {
+    malformedApplyEventOutcome('hasMore must be a boolean');
+  }
+  if (
+    value.maxEvents !== undefined &&
+    (typeof value.maxEvents !== 'number' ||
+      !Number.isSafeInteger(value.maxEvents) ||
+      value.maxEvents < 0)
+  ) {
+    malformedApplyEventOutcome('maxEvents must be a non-negative safe integer');
+  }
+  if (run !== undefined && value.indexPublicationExpiresAt === undefined) {
+    malformedApplyEventOutcome('indexPublicationExpiresAt is required when run is present');
+  }
+  if (
+    value.indexPublicationExpiresAt !== undefined &&
+    (typeof value.indexPublicationExpiresAt !== 'number' ||
+      !Number.isFinite(value.indexPublicationExpiresAt))
+  ) {
+    malformedApplyEventOutcome('indexPublicationExpiresAt must be a finite number');
+  }
+
+  return {
+    kind: 'success',
+    outcome: {
+      ...value,
+      event,
+      run,
+      step,
+      hook,
+      wait,
+      hookToIndex,
+      events,
+      releasedHooks: value.releasedHooks.map((releasedHook) => ({
+        hookId: (releasedHook as Record<string, unknown>).hookId as string,
+        token: (releasedHook as Record<string, unknown>).token as string,
+      })),
+    } as ApplyEventSuccess,
+  };
+}
+
 /**
  * Filter data based on ResolveData parameter.
  * When resolveData is 'none', strips specified keys to reduce data transfer.
@@ -149,7 +355,7 @@ function filterHookData(hook: Hook, resolveData: ResolveData): Hook {
  * outcome objects instead of throwing.
  */
 function throwOutcomeError(
-  outcome: ApplyEventFailure,
+  outcome: ApplyEventWireFailure,
   runId: string,
   data: CreateEventRequest | RunCreatedEventRequest,
 ): never {
@@ -177,6 +383,22 @@ function throwOutcomeError(
       throw withCode(new TooEarlyError(outcome.message, { retryAfter: outcome.retryAfterSeconds }));
     case 'RUN_NOT_SUPPORTED':
       throw withCode(new RunNotSupportedError(outcome.runSpecVersion ?? 0, SPEC_VERSION_CURRENT));
+    default: {
+      const error = new WorkflowWorldError(outcome.message, {
+        status: outcome.status,
+        code: outcome.code,
+        retryAfter: outcome.retryAfter,
+      });
+      for (const key of [
+        'retryAfterSeconds',
+        'runSpecVersion',
+        'worldSpecVersion',
+        'details',
+      ] as const) {
+        if (Object.hasOwn(outcome, key)) Object.assign(error, { [key]: outcome[key] });
+      }
+      throw error;
+    }
   }
 }
 
@@ -385,9 +607,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         // A thrown RPC is commit-ambiguous. Resolve it inside the authoritative
         // RunDO: that transaction either observes the committed hook or fences
         // this exact reservation before its token/ID claims are released.
-        let outcome: ApplyEventOutcome;
+        let parsedOutcome: ParsedApplyEventOutcome;
         try {
-          outcome = await stub.applyEvent({
+          const wireOutcome: unknown = await stub.applyEvent({
             runId: effectiveRunId,
             data,
             params,
@@ -395,6 +617,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             hookClaimId: hookAdmission?.reservation.claimId,
             cleanup,
           });
+          parsedOutcome = parseApplyEventOutcome(wireOutcome);
         } catch (error) {
           if (hookAdmission) {
             let resolution: { committed: boolean };
@@ -420,7 +643,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           throw error;
         }
 
-        if (!outcome.ok) {
+        if (parsedOutcome.kind !== 'success') {
           if (hookAdmission) {
             await env.WORKFLOW_INDEX.releaseHookReservation(
               hookAdmission.token,
@@ -428,8 +651,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               hookAdmission.reservation,
             );
           }
-          throwOutcomeError(outcome, effectiveRunId, data);
+          throwOutcomeError(parsedOutcome.outcome, effectiveRunId, data);
         }
+        const outcome = parsedOutcome.outcome;
 
         // Derived indexes are deliberately rewritten on idempotent replay so
         // a committed run or hook can repair an interrupted index update.
