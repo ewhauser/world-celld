@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.4.1 (2026-08-24)
+
+## What's Changed
+* fix: harden remote transport failure handling by @ewhauser in https://github.com/ewhauser/world-celld/pull/34
+* test: enforce real celld restart recovery by @ewhauser in https://github.com/ewhauser/world-celld/pull/36
+* test: cover index compaction alarm recovery by @ewhauser in https://github.com/ewhauser/world-celld/pull/37
+* test: harden index compaction rollback coverage by @ewhauser in https://github.com/ewhauser/world-celld/pull/38
+* test: harden StreamDO corruption handling by @ewhauser in https://github.com/ewhauser/world-celld/pull/39
+* test: harden configuration and malformed input handling by @ewhauser in https://github.com/ewhauser/world-celld/pull/40
+* fix: enforce negative apply-event contracts by @ewhauser in https://github.com/ewhauser/world-celld/pull/41
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.4.0...v0.4.1
+
 ## 0.4.0 (2026-08-22)
 
 ## What's Changed
