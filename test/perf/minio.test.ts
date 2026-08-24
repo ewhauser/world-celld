@@ -92,9 +92,8 @@ async function waitUntil(predicate: () => Promise<boolean> | boolean, timeoutMs:
 }
 
 interface PerfPayload {
-  perfRunId: string;
-  sequence: number;
-  padding: string;
+  __healthCheck: boolean;
+  correlationId: string;
 }
 
 interface Delivery {
@@ -199,18 +198,19 @@ describe('MinIO single-node queue performance and loss', () => {
         return;
       }
 
+      const [payloadRunId, sequenceText] = payload.correlationId.split('|', 2);
+      const sequence = /^\d+$/.test(sequenceText ?? '') ? Number(sequenceText) : Number.NaN;
       if (
-        payload.perfRunId !== runId ||
-        !Number.isSafeInteger(payload.sequence) ||
-        payload.sequence < 0 ||
-        payload.sequence >= messageCount
+        !payload['__healthCheck'] ||
+        payloadRunId !== runId ||
+        !Number.isSafeInteger(sequence) ||
+        sequence >= messageCount
       ) {
         invalidCallbacks.push(`unexpected payload: ${JSON.stringify(payload)}`);
         response.writeHead(400).end();
         return;
       }
 
-      const sequence = payload.sequence;
       const attemptCount = (callbackAttempts.get(sequence) ?? 0) + 1;
       callbackAttempts.set(sequence, attemptCount);
 
@@ -271,7 +271,10 @@ describe('MinIO single-node queue performance and loss', () => {
       const enqueueStart = performance.now();
       startedAt.set(sequence, enqueueStart);
       try {
-        const outcome = await world.queue(queueName, { perfRunId: runId, sequence, padding });
+        const outcome = await world.queue(queueName, {
+          __healthCheck: true,
+          correlationId: `${runId}|${sequence}|${padding}`,
+        });
         accepted.set(sequence, String(outcome.messageId));
         enqueueLatencies.push(performance.now() - enqueueStart);
       } catch (error) {

@@ -24,7 +24,7 @@ function queueRequest(messageId: string, runId: string): EnqueueRequest {
     runId,
     queueName: '__wkf_workflow_lifecycle_evidence',
     pathname: 'flow',
-    body: '{}',
+    body: JSON.stringify({ runId }),
     delaySeconds: 3_600,
     config: { targetBaseUrl: 'http://app.invalid', queueShards: 1 },
   };
