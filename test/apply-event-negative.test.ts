@@ -26,6 +26,7 @@ type ContractError = Error & {
   code?: string;
   status?: number;
   retryAfter?: number;
+  retryAfterMs?: number;
   retryAfterSeconds?: number;
   runSpecVersion?: number;
   worldSpecVersion?: number;
@@ -119,6 +120,7 @@ describe('negative apply-event contract', () => {
           message: 'the server knows more than this client',
           status: 425,
           retryAfter: 17,
+          retryAfterMs: 19_000,
           retryAfterSeconds: 19,
           runSpecVersion: SPEC_VERSION_CURRENT + 2,
           worldSpecVersion: SPEC_VERSION_CURRENT + 1,
@@ -134,6 +136,7 @@ describe('negative apply-event contract', () => {
       message: 'the server knows more than this client',
       status: 425,
       retryAfter: 17,
+      retryAfterMs: 19_000,
       retryAfterSeconds: 19,
       runSpecVersion: SPEC_VERSION_CURRENT + 2,
       worldSpecVersion: SPEC_VERSION_CURRENT + 1,
@@ -157,6 +160,7 @@ describe('negative apply-event contract', () => {
       code: 'FUTURE_FAILURE',
       message: 'minimal future failure',
     });
+    expect(minimal).not.toHaveProperty('retryAfterMs');
   });
 
   it.each([
@@ -168,6 +172,22 @@ describe('negative apply-event contract', () => {
     [
       'wrong-typed failure metadata',
       { ok: false, code: 'FUTURE_FAILURE', message: 'bad status', status: '503' },
+    ],
+    [
+      'wrong-typed retryAfterMs',
+      { ok: false, code: 'FUTURE_FAILURE', message: 'bad retry', retryAfterMs: '19000' },
+    ],
+    [
+      'negative retryAfterMs',
+      { ok: false, code: 'FUTURE_FAILURE', message: 'bad retry', retryAfterMs: -1 },
+    ],
+    [
+      'fractional retryAfterMs',
+      { ok: false, code: 'FUTURE_FAILURE', message: 'bad retry', retryAfterMs: 19.5 },
+    ],
+    [
+      'non-finite retryAfterMs',
+      { ok: false, code: 'FUTURE_FAILURE', message: 'bad retry', retryAfterMs: Infinity },
     ],
     ['missing success fields', { ok: true }],
     ['wrong-typed released hooks', { ok: true, releasedHooks: 'none' }],

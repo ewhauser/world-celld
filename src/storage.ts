@@ -136,6 +136,7 @@ interface ApplyEventWireFailure {
   message: string;
   status?: number;
   retryAfter?: number;
+  retryAfterMs?: number;
   retryAfterSeconds?: number;
   runSpecVersion?: number;
   worldSpecVersion?: number;
@@ -168,6 +169,16 @@ function validateOptionalNumber(
       (integer && !Number.isSafeInteger(value)))
   ) {
     malformedApplyEventOutcome(`${key} must be ${integer ? 'a safe integer' : 'a finite number'}`);
+  }
+}
+
+function validateOptionalRetryAfterMs(outcome: Record<string, unknown>): void {
+  const value = outcome.retryAfterMs;
+  if (
+    value !== undefined &&
+    (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0)
+  ) {
+    malformedApplyEventOutcome('retryAfterMs must be a non-negative safe integer');
   }
 }
 
@@ -205,6 +216,7 @@ function parseApplyEventOutcome(value: unknown): ParsedApplyEventOutcome {
     }
     validateOptionalNumber(value, 'status', true);
     validateOptionalNumber(value, 'retryAfter', false);
+    validateOptionalRetryAfterMs(value);
     validateOptionalNumber(value, 'retryAfterSeconds', false);
     validateOptionalNumber(value, 'runSpecVersion', true);
     validateOptionalNumber(value, 'worldSpecVersion', true);
@@ -390,6 +402,7 @@ function throwOutcomeError(
         retryAfter: outcome.retryAfter,
       });
       for (const key of [
+        'retryAfterMs',
         'retryAfterSeconds',
         'runSpecVersion',
         'worldSpecVersion',
