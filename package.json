@@ -23,6 +23,7 @@
     "CHANGELOG.md",
     "dist",
     "celld-worker",
+    "celld-queue-worker",
     "NOTICE"
   ],
   "type": "module",
@@ -39,6 +40,12 @@
       "workerd": "./dist/worker.js",
       "worker": "./dist/worker.js",
       "default": "./dist/worker.js"
+    },
+    "./queue-consumer": {
+      "types": "./dist/queue-consumer.d.ts",
+      "workerd": "./dist/queue-consumer.js",
+      "worker": "./dist/queue-consumer.js",
+      "default": "./dist/queue-consumer.js"
     },
     "./testing": {
       "types": "./dist/testing.d.ts",

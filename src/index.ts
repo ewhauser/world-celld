@@ -12,13 +12,12 @@ import { createStreamer, type CelldStreamer } from './streamer.js';
 import type { CleanupRecord } from './retention.js';
 
 export type { CelldWorldConfig, CelldWorldEnv, IndexNamespace } from './config.js';
+export type { CelldQueueProducer } from './queue.js';
 export type {
-  EnqueueOutcome,
-  EnqueueRequest,
-  QueueCellConfig,
-  QueueCellNamespace,
-  QueueCellStub,
-} from './queue.js';
+  NativeQueueEnvelope,
+  NativeQueueSendOptions,
+  NativeQueueSendResult,
+} from './queue-protocol.js';
 export type { WorkflowRunDONamespace, WorkflowRunDOStub } from './storage.js';
 export type { StreamDONamespace, StreamDOStub } from './streamer.js';
 export {
@@ -103,7 +102,6 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     },
     deploymentId: resolved.deploymentId,
     runRetentionMs: resolved.runRetentionMs,
-    queueShards: resolved.queueShards,
   });
 
   const queue = createQueue({
@@ -112,7 +110,6 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     },
     deploymentId: resolved.deploymentId,
     baseUrl: resolved.baseUrl,
-    queueShards: resolved.queueShards,
   });
 
   const streamer = createStreamer({
@@ -134,13 +131,11 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
       }
       return runStub(runId).scheduleCleanup({
         retentionMs: resolved.runRetentionMs,
-        queueShards: resolved.queueShards,
       });
     },
     cleanupNow: (runId) =>
       runStub(runId).cleanupNow({
         retentionMs: Math.max(1, resolved.runRetentionMs),
-        queueShards: resolved.queueShards,
       }),
     rearm: (runId) => runStub(runId).rearmCleanup(),
   };

@@ -1,6 +1,6 @@
 import type { WorkflowRunDONamespace } from './storage.js';
 import type { StreamDONamespace } from './streamer.js';
-import type { QueueCellNamespace } from './queue.js';
+import type { CelldQueueProducer } from './queue.js';
 import { MAX_STREAM_LONG_POLL_MS } from './stream-protocol.js';
 import type { WorkflowIndex } from './indexes.js';
 import { MAX_FLEET_RPC_TIMEOUT_MS } from './lifecycle.js';
@@ -17,7 +17,7 @@ export interface HookTokenOwner {
 export interface CelldWorldEnv {
   WORKFLOW_DB: WorkflowRunDONamespace;
   WORKFLOW_INDEX: IndexNamespace;
-  WORKFLOW_QUEUE: QueueCellNamespace;
+  WORKFLOW_QUEUE: CelldQueueProducer;
   WORKFLOW_STREAMS: StreamDONamespace;
 }
 
@@ -42,13 +42,11 @@ export interface CelldWorldConfig {
   /** Default: process.env.CELLD_DEPLOYMENT_ID || 'celld-default' */
   deploymentId?: string;
   /**
-   * Base URL the app's workflow endpoints are mounted on; QueueDO cells
-   * deliver to `${baseUrl}/.well-known/workflow/v1/flow`.
+   * Base URL the app's workflow endpoints are mounted on; the native Queue
+   * consumer delivers to `${baseUrl}/.well-known/workflow/v1/flow`.
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${PORT ?? 3000}`
    */
   baseUrl?: string;
-  /** Number of queue cells to spread enqueues over. Default: 1 */
-  queueShards?: number;
   /**
    * Keep terminal run payloads for this many milliseconds before replacing
    * them with metadata-only tombstones. Zero disables automatic cleanup.
@@ -69,7 +67,6 @@ export interface ResolvedCelldConfig {
   env?: CelldWorldEnv;
   deploymentId: string;
   baseUrl?: string;
-  queueShards: number;
   runRetentionMs: number;
   streamLongPollMs: number;
   streamFlushIntervalMs: number;
@@ -77,8 +74,6 @@ export interface ResolvedCelldConfig {
 }
 
 export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
-  const queueShards = boundedIntegerOption('world-celld: queueShards', config?.queueShards, 1, 1);
-
   const runRetentionMs =
     config?.runRetentionMs !== undefined
       ? boundedIntegerOption('world-celld: runRetentionMs', config.runRetentionMs, 0, 0)
@@ -123,7 +118,6 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
     env: config?.env,
     deploymentId: config?.deploymentId ?? process.env.CELLD_DEPLOYMENT_ID ?? 'celld-default',
     baseUrl: config?.baseUrl,
-    queueShards,
     runRetentionMs,
     streamLongPollMs,
     streamFlushIntervalMs,

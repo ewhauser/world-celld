@@ -4,20 +4,18 @@
  * Vendored from vinnymac/worlds packages/world-cloudflare/src/queue.ts
  * (Apache-2.0, see NOTICE), modified for celld:
  *
- * - The Cloudflare Queues producer is replaced by an `enqueue` RPC to a
- *   QueueDO cell (`q:<shard>`), which owns the message lifecycle: scheduling
- *   via durable alarms, delivery via outbound fetch, retries with capped
- *   backoff, and a dead-letter table.
- * - The consumer-side claim-DO idempotency mechanism is gone: a queue cell is
- *   a single serialized writer, so idempotencyKey dedup happens inside the
- *   cell (at enqueue and across the delivery state machine).
+ * - Production publishes a small pointer through celld v0.4.0 native Queues.
+ *   The deployed Queue consumer forwards deliveries to the same HTTP handler
+ *   used by the in-process test pump.
+ * - Run-bearing message bodies live in the worker's R2 binding. This preserves
+ *   the World's larger payload contract and lets run retention delete payload
+ *   bytes independently of the broker's fixed retention window.
  * - `createQueueHandler` has ONE dialect — the x-vqs wire format the test
  *   pump has always used — extended so permanent errors surface as their
- *   HTTP statuses. QueueDO deliveries and the in-process test pump hit the
+ *   HTTP statuses. Native Queue deliveries and the in-process test pump hit the
  *   exact same handler path.
  */
 import { WorkflowWorldError } from '@workflow/errors';
-import { RunExpiredError } from '@workflow/errors';
 import {
   MessageId,
   parseQueueName,
@@ -29,6 +27,12 @@ import {
 import { parse, stringify } from './vendor/shared/index.js';
 import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
+import {
+  nativeQueueDelaySeconds,
+  type NativeQueueEnvelope,
+  type NativeQueueSendOptions,
+  type NativeQueueSendResult,
+} from './queue-protocol.js';
 import {
   MAX_QUEUE_DELIVERY_TIMEOUT_MS,
   MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
@@ -84,78 +88,32 @@ type Pathname = 'flow';
 const QUEUE_PATHNAME: Pathname = 'flow';
 
 function isTestMode(): boolean {
-  // Explicit override: force the production QueueDO path even under a test
-  // runner (used by the conformance suite to exercise live queue cells —
+  // Explicit override: force the production native-Queue path even under a test
+  // runner (used by the conformance suite to exercise the live native queue —
   // the world-testing server inherits VITEST from the vitest parent).
-  if (process.env.CELLD_QUEUE_MODE === 'cells') return false;
+  if (process.env.CELLD_QUEUE_MODE === 'native') return false;
   return process.env.VITEST === 'true' || process.env.NODE_ENV === 'test';
 }
 
-/**
- * Enqueue request accepted by a QueueDO cell. The message payload travels
- * pre-encoded with the shared tagged-JSON codec (`body`), so the cell can
- * forward it byte-identical to the app's queue handler without re-encoding.
- */
-export interface EnqueueRequest {
-  messageId: string;
-  queueName: ValidQueueName;
-  pathname: Pathname;
-  /** `stringify(message)` — the exact bytes POSTed to the app on delivery. */
-  body: string;
-  /** Owning workflow run; absent only for health-check messages. */
-  runId?: string;
-  idempotencyKey?: string;
-  delaySeconds?: number;
-  /**
-   * Delivery configuration. The cell pins this from its first enqueue (the
-   * eve-ambient pattern); a later mismatch is rejected as CONFIG_MISMATCH.
-   */
-  config: QueueCellConfig;
-}
-
-export interface QueueCellConfig {
-  /** Base URL of the app; deliveries POST to `${baseUrl}/.well-known/workflow/v1/flow`. */
-  targetBaseUrl: string;
-  queueShards: number;
-}
-
-export type EnqueueOutcome =
-  | { ok: true; messageId: string; deduped: boolean }
-  | { ok: false; code: 'CONFIG_MISMATCH' | 'RUN_EXPIRED'; message: string };
-
-/** RPC surface of QueueDO used by the queue producer. */
-export interface QueueCellStub {
-  enqueue(request: EnqueueRequest): Promise<EnqueueOutcome>;
-  expireRun(
-    runId: string,
-    expiredAt: number,
-    options?: { limit?: number },
-  ): Promise<import('./retention.js').ExpireQueueRunResult>;
-  acknowledgeExpireRun(
-    runId: string,
-    receipt: import('./retention.js').QueueExpiryReceipt,
-  ): Promise<import('./retention.js').AcknowledgeQueueExpiryResult>;
-}
-
-export interface QueueCellNamespace {
-  idFromName(name: string): { toString(): string };
-  get(id: { toString(): string }): QueueCellStub;
+export interface CelldQueueProducer {
+  send(
+    envelope: NativeQueueEnvelope,
+    options?: NativeQueueSendOptions,
+  ): Promise<NativeQueueSendResult>;
 }
 
 export interface CelldQueueConfig {
   env: {
-    WORKFLOW_QUEUE: QueueCellNamespace;
+    WORKFLOW_QUEUE: CelldQueueProducer;
   };
   deploymentId: string;
   /**
-   * Base URL the app's workflow endpoints are mounted on. QueueDO cells
-   * deliver to `${baseUrl}/.well-known/workflow/v1/flow`; the test
+   * Base URL the app's workflow endpoints are mounted on. The native Queue
+   * consumer delivers to `${baseUrl}/.well-known/workflow/v1/flow`; the test
    * pump uses the same value.
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
    */
   baseUrl?: string;
-  /** Number of `q:<shard>` cells to spread enqueues over. Default: 1 */
-  queueShards?: number;
   /** Per-job HTTP request timeout (ms) for the test pump. Default/max: 300_000 */
   httpTimeoutMs?: number;
   /** Maximum retry attempts in the test pump before dropping a job. Default: 5 */
@@ -180,23 +138,6 @@ function resolveBaseUrl(config: CelldQueueConfig): string {
 }
 
 /**
- * FNV-1a hash for shard selection. All messages sharing an idempotencyKey
- * land on the same cell so dedup stays strictly consistent.
- */
-export function shardFor(key: string, shards: number): number {
-  if (!Number.isSafeInteger(shards) || shards < 1) {
-    throw new Error('world-celld queueShards must be a positive safe integer');
-  }
-  if (shards <= 1) return 0;
-  let hash = 0x811c9dc5;
-  for (let i = 0; i < key.length; i++) {
-    hash ^= key.charCodeAt(i);
-    hash = Math.imul(hash, 0x01000193);
-  }
-  return (hash >>> 0) % shards;
-}
-
-/**
  * In-process test pump. Holds an in-memory FIFO and HTTP-dispatches envelopes
  * to the user's server at `${baseUrl}/.well-known/workflow/v1/flow`.
  *
@@ -206,7 +147,7 @@ export function shardFor(key: string, shards: number): number {
  *
  * Modified vs upstream: permanent-error statuses (404/409/410/422) from the
  * handler drop the message immediately instead of burning retry budget —
- * matching QueueDO's production semantics.
+ * matching the native Queue consumer's production semantics.
  */
 function createTestPump(config: CelldQueueConfig) {
   const httpTimeoutMs = boundedIntegerOption(
@@ -393,15 +334,8 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
   if (!env?.WORKFLOW_QUEUE) {
     throw new Error('world-celld queue missing WORKFLOW_QUEUE binding');
   }
-  const queueShards = boundedIntegerOption('world-celld queueShards', config.queueShards, 1, 1);
-
   const generateMessageId = monotonicFactory();
   const testPump = createTestPump(config);
-
-  const getQueueStub = (shard: number): QueueCellStub => {
-    const id = env.WORKFLOW_QUEUE.idFromName(`q:${shard}`);
-    return env.WORKFLOW_QUEUE.get(id);
-  };
 
   return {
     async queue(queueName, message, opts) {
@@ -448,37 +382,38 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         return { messageId };
       }
 
-      // Production: enqueue into a QueueDO cell. The cell owns scheduling,
-      // delivery, retries, dedup, and the dead-letter table.
+      // Production: publish through celld's native Queue. The worker-side send
+      // route moves run-bearing payload bytes into R2 before it publishes this
+      // envelope, so only a bounded pointer reaches the broker.
       const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-      const shard = shardFor(opts?.idempotencyKey ?? messageId, queueShards);
-
-      const outcome = await getQueueStub(shard).enqueue({
+      const body = stringify(parsedMessage.data);
+      const notBefore =
+        opts?.delaySeconds && opts.delaySeconds > 0
+          ? (queueDelayDeadline(
+              Date.now(),
+              opts.delaySeconds,
+              0,
+              MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+            ) ?? undefined)
+          : undefined;
+      const envelope: NativeQueueEnvelope = {
+        version: 1,
         messageId,
         queueName,
-        pathname: QUEUE_PATHNAME,
-        body: stringify(parsedMessage.data),
+        targetBaseUrl: resolveBaseUrl(config),
         runId,
         idempotencyKey: opts?.idempotencyKey,
-        delaySeconds: opts?.delaySeconds,
-        config: {
-          targetBaseUrl: resolveBaseUrl(config),
-          queueShards,
-        },
+        body,
+        notBefore,
+      };
+      const published = await env.WORKFLOW_QUEUE.send(envelope, {
+        delaySeconds: nativeQueueDelaySeconds(notBefore, Date.now()),
       });
-
-      if (!outcome.ok) {
-        if (outcome.code === 'RUN_EXPIRED') {
-          throw new RunExpiredError(outcome.message);
-        }
-        throw new WorkflowWorldError(outcome.message, { status: 409 });
-      }
-
-      return { messageId: MessageId.parse(outcome.messageId) };
+      return { messageId: MessageId.parse(published.messageId) };
     },
 
     createQueueHandler(queueNamePrefix, handler) {
-      // ONE dialect for the pump, QueueDO deliveries, and
+      // ONE dialect for the pump, native Queue consumer deliveries, and
       // @workflow/world-testing's mounted routes: x-vqs headers + tagged-JSON
       // body. The response taxonomy drives the sender's retry state machine:
       // - 2xx                     -> ack
@@ -580,7 +515,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
       if (isTestMode()) {
         await testPump.start();
       }
-      // Production: QueueDO cells are push-based, nothing to start.
+      // Production: celld native Queues are push-based, nothing to start.
     },
   };
 }

@@ -1,25 +1,32 @@
 # world-celld worker
 
-The celld-deployable half of `@ewhauser/world-celld`: six cell classes
-(WorkflowRunDO, RunCatalogDO, HookTokenDO, HookIdDO, StreamDO, and QueueDO)
-behind an authenticated HTTP router.
-Storage, control, and queue methods use fixed JSON RPC routes; stream chunks use
-bounded binary batch writes and binary long-poll reads.
+The primary celld-deployable half of `@ewhauser/world-celld`: five cell classes
+(WorkflowRunDO, RunCatalogDO, HookTokenDO, HookIdDO, and StreamDO) behind an
+authenticated HTTP router. Storage and control methods use fixed JSON RPC
+routes; stream chunks use bounded binary batch writes and binary long-poll
+reads. Queue producers use celld's native Queue binding, with run-bearing
+payload bodies stored in R2.
 
 ## Deploy
 
-Copy this directory out of `node_modules` so `celld deploy` can bundle it
-(its `main` must live inside the project directory), then deploy against your
-fleet bucket:
+Copy this directory and the companion Queue consumer out of `node_modules` so
+`celld deploy` can bundle them. Deploy the consumer first and this primary
+worker last:
 
 ```sh
 cp -r node_modules/@ewhauser/world-celld/celld-worker ./workflow-world
+cp -r node_modules/@ewhauser/world-celld/celld-queue-worker ./workflow-world-queue
+celld deploy ./workflow-world-queue --bucket s3://my-cells-bucket
 celld deploy ./workflow-world --bucket s3://my-cells-bucket
 ```
 
+Upgrading from the former QueueDO implementation is a hard cutover. Drain or
+account for its pending messages and dead letters first; they are not migrated
+to the native Queue.
+
 Requirements:
 
-- celld v0.3.0 (the currently tested runtime baseline).
+- celld v0.4.0 (the currently tested runtime baseline).
 - `esbuild` on PATH (celld shells out to it).
 - A bucket with conditional-write support (celld's fencing requirement).
 - `WORLD_SECRET` injected at the node level (`CELLD_VAR_WORLD_SECRET=...`) —
@@ -39,14 +46,9 @@ celld --bucket s3://my-cells-bucket
 `7776000000` is 90 days. The policy includes pending and running workflows as
 well as terminal ones. Each cron occurrence admits at most
 `WORKFLOW_RETENTION_BATCH_SIZE` runs (default `128`); the existing per-run alarm
-state machine finishes bounded index, stream, queue, and payload cleanup.
-
-New runs persist the application's `queueShards` placement. Set
-`WORKFLOW_RETENTION_QUEUE_SHARDS` to the historical positive-safe-integer
-queue-shard count when cleaning runs created before this worker version. The
-`128` multikey storage-operation limit is not a total-shard ceiling. Edit
-`triggers.crons` in the copied config if hourly discovery is not the desired
-resolution.
+state machine finishes bounded index, stream, R2 queue-payload, and run-payload
+cleanup. Edit `triggers.crons` in the copied config if hourly discovery is not
+the desired resolution.
 
 Point the app at any node's public listener:
 

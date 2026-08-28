@@ -8,7 +8,6 @@ import { runRetentionSweep, type RetentionSweepEnv } from './retention-sweep.js'
 
 export { HookIdDO } from './durable-objects/HookIdDO.js';
 export { HookTokenDO } from './durable-objects/HookTokenDO.js';
-export { QueueDO } from './durable-objects/QueueDO.js';
 export { RunCatalogDO } from './durable-objects/RunCatalogDO.js';
 export { StreamDO } from './durable-objects/StreamDO.js';
 export { WorkflowRunDO } from './durable-objects/WorkflowRunDO.js';

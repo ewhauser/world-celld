@@ -17,7 +17,8 @@ import {
 } from '@workflow/world';
 import type { HookTokenOwner } from './config.js';
 import type { HookReservation, HookReservationResult } from './indexes.js';
-import type { EnqueueOutcome, EnqueueRequest, QueueCellStub } from './queue.js';
+import type { CelldQueueProducer } from './queue.js';
+import type { NativeQueueEnvelope, NativeQueueSendOptions } from './queue-protocol.js';
 import {
   normalizeStreamError,
   validateStreamReadRequest,
@@ -112,7 +113,8 @@ function createMemoryStore(getData: () => Map<string, unknown>): EventStore {
 
 interface InflightClaim {
   messageId: string;
-  claimedAt: number;
+  expiresAt: number;
+  retryAt?: number;
 }
 
 interface MockHookClaim {
@@ -267,21 +269,38 @@ class MockWorkflowRunDOStub {
 
   async claimInflight(params: { messageId: string; staleMs: number }): Promise<{
     claimed: boolean;
+    retryAt?: number;
   }> {
     const existing = await this.store.get<InflightClaim>('claim');
     const now = Date.now();
-    if (
-      existing &&
-      existing.messageId !== params.messageId &&
-      now - existing.claimedAt < params.staleMs
-    ) {
-      return { claimed: false };
+    if (existing && existing.expiresAt > now) {
+      if (existing.messageId !== params.messageId) return { claimed: false };
+      if (existing.retryAt === undefined || existing.retryAt > now) {
+        return { claimed: false, retryAt: existing.retryAt ?? existing.expiresAt };
+      }
     }
-    await this.store.put<InflightClaim>('claim', { messageId: params.messageId, claimedAt: now });
+    await this.store.put<InflightClaim>('claim', {
+      messageId: params.messageId,
+      expiresAt: now + params.staleMs,
+    });
     return { claimed: true };
   }
 
-  async releaseInflight(): Promise<void> {
+  async holdInflight(params: {
+    messageId: string;
+    retryAt: number;
+    expiresAt: number;
+    reservationExpiresAt?: number;
+  }): Promise<{ held: boolean }> {
+    const existing = await this.store.get<InflightClaim>('claim');
+    if (!existing || existing.messageId !== params.messageId) return { held: false };
+    await this.store.put<InflightClaim>('claim', { ...existing, ...params });
+    return { held: true };
+  }
+
+  async releaseInflight(messageId?: string): Promise<void> {
+    const existing = await this.store.get<InflightClaim>('claim');
+    if (!existing || (messageId !== undefined && existing.messageId !== messageId)) return;
     await this.store.delete('claim');
   }
 }
@@ -726,36 +745,28 @@ class MockStreamDOStub {
   }
 }
 
-/** Enqueues recorded by mock queue cells (for assertions in tests). */
-export const recordedEnqueues: Array<EnqueueRequest & { cellName: string }> = [];
+/** Native Queue publications recorded by the mock producer. */
+export const recordedEnqueues: Array<{
+  envelope: NativeQueueEnvelope;
+  options?: NativeQueueSendOptions;
+}> = [];
 
 /**
- * Mock QueueDO stub: records enqueues and mirrors the cell's idempotencyKey
- * dedup semantics (same key while active -> original messageId, deduped).
+ * Mock native Queue producer: records each publication and mirrors the
+ * worker-side enqueue reservation for production-mode producer tests.
  */
-class MockQueueCellStub implements QueueCellStub {
-  private activeKeys = new Map<string, string>();
+class MockQueueProducer implements CelldQueueProducer {
+  private inflight = new Map<string, string>();
 
-  constructor(private cellName: string) {}
-
-  async enqueue(request: EnqueueRequest): Promise<EnqueueOutcome> {
-    if (request.idempotencyKey) {
-      const existing = this.activeKeys.get(request.idempotencyKey);
-      if (existing) {
-        return { ok: true, messageId: existing, deduped: true };
-      }
-      this.activeKeys.set(request.idempotencyKey, request.messageId);
-    }
-    recordedEnqueues.push({ ...request, cellName: this.cellName });
-    return { ok: true, messageId: request.messageId, deduped: false };
-  }
-
-  async expireRun(): Promise<import('./retention.js').ExpireQueueRunResult> {
-    return { deleted: 0, done: true, receipt: { expiredAt: 0, deleted: 0 } };
-  }
-
-  async acknowledgeExpireRun(): Promise<import('./retention.js').AcknowledgeQueueExpiryResult> {
-    return { acknowledged: true };
+  async send(envelope: NativeQueueEnvelope, options?: NativeQueueSendOptions) {
+    const reservationKey = envelope.idempotencyKey
+      ? `${envelope.queueName.length}:${envelope.queueName}:${envelope.idempotencyKey}`
+      : undefined;
+    const existing = reservationKey ? this.inflight.get(reservationKey) : undefined;
+    if (existing) return { messageId: existing };
+    recordedEnqueues.push({ envelope, options });
+    if (reservationKey) this.inflight.set(reservationKey, envelope.messageId);
+    return { messageId: envelope.messageId };
   }
 }
 
@@ -789,7 +800,7 @@ export function createMockEnv() {
   return {
     WORKFLOW_DB: new MockDurableObjectNamespace((name) => new MockWorkflowRunDOStub(name)),
     WORKFLOW_INDEX: new MockWorkflowIndex(),
-    WORKFLOW_QUEUE: new MockDurableObjectNamespace((name) => new MockQueueCellStub(name)),
+    WORKFLOW_QUEUE: new MockQueueProducer(),
     WORKFLOW_STREAMS: new MockDurableObjectNamespace(() => new MockStreamDOStub()),
   };
 }

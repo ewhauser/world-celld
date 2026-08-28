@@ -9,8 +9,8 @@
  * actual HTTP RPC protocol.
  *
  * Queue dispatch runs on the in-process test pump inside the server child
- * (it inherits VITEST=true). M4 flips CELLD_QUEUE_MODE=cells to run the same
- * suite against live QueueDO cells.
+ * (it inherits VITEST=true). The real-celld smoke exercises the production
+ * native Queue consumer separately.
  */
 import { createTestSuite } from '@workflow/world-testing';
 import { afterAll, beforeAll, expect, test } from 'vitest';

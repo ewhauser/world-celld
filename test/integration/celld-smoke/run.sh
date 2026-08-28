@@ -44,14 +44,14 @@ download_verified() {
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
     celld_asset=celld-x86_64-unknown-linux-gnu.gz
-    celld_sha256=cbfcfa5f6d7551b5316f6f4c9d7751c741a9ba2a2305dde8d5cb4d1b37fb34a6
+    celld_sha256=0488628597154725db2f61f85434fb381e1b2535d1e9f097c6d20727cd337973
     minio_platform=linux-amd64
     minio_sha256=7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
     mc_sha256=01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
     ;;
   Darwin-arm64)
     celld_asset=celld-aarch64-apple-darwin.gz
-    celld_sha256=fc19d9fd5ed429656476190ea23f5ebdbea18538b096fdfc4a913d2e0cf551d4
+    celld_sha256=83311694b4b0797f3e12eaa581107de8b0d16b7c47d0e4edc1316445a0319bbe
     minio_platform=darwin-arm64
     minio_sha256=7c3b3039b76e55a1b80935848ed83998d5e8d317374f87851f46a019ff5c0aa4
     mc_sha256=a877fd0c183409da9f20f9d6e1811987298bbbca1aa03428eebdffba79fb9445
@@ -69,7 +69,7 @@ minio_binary="$download_root/minio-${minio_platform}-RELEASE.2025-09-07T16-13-09
 mc_binary="$download_root/mc-${minio_platform}-RELEASE.2025-08-13T08-35-41Z"
 
 download_verified \
-  "https://github.com/denoland/celld/releases/download/v0.3.0/$celld_asset" \
+  "https://github.com/denoland/celld/releases/download/v0.4.0/$celld_asset" \
   "$celld_sha256" \
   "$celld_archive"
 download_verified \

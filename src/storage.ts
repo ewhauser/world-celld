@@ -111,7 +111,6 @@ export interface CloudflareStorageConfig {
   };
   deploymentId: string;
   runRetentionMs?: number;
-  queueShards?: number;
 }
 
 function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
@@ -454,7 +453,6 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
   const { env } = config;
   const cleanup = {
     retentionMs: config.runRetentionMs ?? 0,
-    queueShards: config.queueShards ?? 1,
   };
   const ulid = monotonicFactory();
 

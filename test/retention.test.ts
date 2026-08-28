@@ -9,12 +9,11 @@ import {
   hookTokenShardName,
   runCatalogShardName,
 } from '../src/indexes.js';
-import { QUEUE_FENCE_GRACE_MS } from '../src/lifecycle.js';
 import { CLEANUP_RECORD_KEY, type CleanupRecord } from '../src/retention.js';
+import { queueOrphanName, queuePayloadRegistryKey } from '../src/queue-protocol.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import { stringify } from '../src/vendor/shared/index.js';
-import type { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
 import type { StreamDO } from '../src/worker/durable-objects/StreamDO.js';
 import { WorkflowRunDO } from '../src/worker/durable-objects/WorkflowRunDO.js';
 
@@ -121,13 +120,11 @@ describe('terminal workflow retention', () => {
     storage.resetOperationCounts();
 
     for (const request of [
-      { retentionMs: 0, queueShards: 1 },
-      { retentionMs: -1, queueShards: 1 },
-      { retentionMs: 1.5, queueShards: 1 },
-      { retentionMs: Number.NaN, queueShards: 1 },
-      { retentionMs: 1, queueShards: 0 },
-      { retentionMs: 1, queueShards: 1.5 },
-      { retentionMs: 1, queueShards: Number.MAX_SAFE_INTEGER + 1 },
+      { retentionMs: 0 },
+      { retentionMs: -1 },
+      { retentionMs: 1.5 },
+      { retentionMs: Number.NaN },
+      { retentionMs: Number.MAX_SAFE_INTEGER + 1 },
     ]) {
       await expect(run.scheduleCleanup(request)).rejects.toThrow(/retention/);
       await expect(run.cleanupNow(request)).rejects.toThrow(/retention/);
@@ -136,32 +133,6 @@ describe('terminal workflow retention', () => {
     expect(Array.from(storage.data.entries())).toEqual(before);
     expect(storage.operationCounts.transaction).toBe(0);
   });
-
-  it.each([129, Number.MAX_SAFE_INTEGER])(
-    'accepts positive safe queueShards %s in run cleanup metadata',
-    async (queueShards) => {
-      const fleet = new FakeFleet({ runs: WorkflowRunDO });
-      const runId = `wrun_valid_cleanup_${queueShards}`;
-      const run = fleet.namespace('runs').get({ toString: () => runId }) as WorkflowRunDO;
-      await expect(
-        run.applyEvent({
-          runId,
-          data: {
-            eventType: 'run_created',
-            eventData: {
-              deploymentId: 'retention-tests',
-              workflowName: 'valid-cleanup',
-              input: [],
-            },
-          },
-          cleanup: { retentionMs: 1_000, queueShards },
-        }),
-      ).resolves.toMatchObject({ ok: true });
-      expect(fleet.cell('runs', runId).storage.data.get('retention:queue-shards')).toBe(
-        queueShards,
-      );
-    },
-  );
 
   it('rejects invalid event cleanup metadata before creating a run', async () => {
     const fleet = new FakeFleet({ runs: WorkflowRunDO });
@@ -178,16 +149,16 @@ describe('terminal workflow retention', () => {
             input: [],
           },
         },
-        cleanup: { retentionMs: 0, queueShards: 0 },
+        cleanup: { retentionMs: -1 },
       }),
-    ).rejects.toThrow(/queueShards/);
+    ).rejects.toThrow(/retentionMs/);
     const storage = fleet.cell('runs', runId).storage;
     expect(storage.data.size).toBe(0);
     expect(storage.operationCounts.transaction).toBe(0);
   });
 
   it('purges payloads, indexes, streams, and queued work without allowing resurrection', async () => {
-    process.env.CELLD_QUEUE_MODE = 'cells';
+    process.env.CELLD_QUEUE_MODE = 'native';
     harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
     const world = createCelldWorld({
       fleetUrl: harness.url,
@@ -218,7 +189,8 @@ describe('terminal workflow retention', () => {
     expect((await world.getStreamInfo('retention-stream', runId)).done).toBe(true);
 
     harness.fleet.advance(1_001);
-    expect(harness.fleet.cell('queue', 'q:0').storage.data.has(`expired-run:${runId}`)).toBe(false);
+    expect(harness.queueMessages).toHaveLength(1);
+    expect(harness.queuePayloads.size).toBe(1);
     await expect(
       world.queue(
         '__wkf_workflow_retention',
@@ -230,7 +202,7 @@ describe('terminal workflow retention', () => {
     expect(status).toMatchObject({
       phase: 'tombstoned',
       deletedStreams: 1,
-      deletedQueueMessages: 1,
+      deletedQueuePayloads: 1,
     });
     expect(status.deletedPayloadKeys).toBeGreaterThan(0);
 
@@ -248,8 +220,7 @@ describe('terminal workflow retention', () => {
     );
     const listed = await world.runs.list({ workflowName: 'retention-complete' });
     expect(listed.data).toEqual([]);
-    const queue = harness.fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
-    expect(await queue.stats()).toMatchObject({ pending: 0, inflight: 0, deadLetters: 0 });
+    expect(harness.queuePayloads.size).toBe(0);
 
     const runKeys = Array.from(harness.fleet.cell('runs', runId).storage.data.keys()).toSorted();
     expect(runKeys).toEqual(['retention:tombstone']);
@@ -331,105 +302,6 @@ describe('terminal workflow retention', () => {
 
     const entries = await workflowIndex(harness).listRuns({ prefix: 'run:retention-retry:' });
     expect(entries.keys).toEqual([]);
-  });
-
-  it('replays lost queue cleanup and acknowledgement responses without losing the receipt', async () => {
-    process.env.CELLD_QUEUE_MODE = 'cells';
-    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
-    const world = createCelldWorld({
-      fleetUrl: harness.url,
-      secret: 'retention-secret',
-      deploymentId: 'retention-tests',
-      baseUrl: 'http://127.0.0.1:1',
-      runRetentionMs: 100,
-    });
-    const runId = await createCompletedRun(world, 'queue-receipt-retry');
-    await world.queue(
-      '__wkf_workflow_retention',
-      { runId },
-      { delaySeconds: 3_600, idempotencyKey: `receipt:${runId}` },
-    );
-    await finishRun(world, runId);
-    await driveTerminalCleanup(harness, runId);
-
-    const queue = harness.fleet.namespace('queue').get({ toString: () => 'q:0' }) as QueueDO;
-    const originalExpireRun = queue.expireRun.bind(queue);
-    const originalAcknowledgeExpireRun = queue.acknowledgeExpireRun.bind(queue);
-    let loseFinalResponse = true;
-    let loseAcknowledgementResponse = true;
-    queue.expireRun = async (...args: Parameters<QueueDO['expireRun']>) => {
-      const result = await originalExpireRun(...args);
-      if (result.done && loseFinalResponse) {
-        loseFinalResponse = false;
-        throw new Error('injected lost final queue cleanup response');
-      }
-      return result;
-    };
-    queue.acknowledgeExpireRun = async (...args: Parameters<QueueDO['acknowledgeExpireRun']>) => {
-      const result = await originalAcknowledgeExpireRun(...args);
-      if (result.acknowledged && loseAcknowledgementResponse) {
-        loseAcknowledgementResponse = false;
-        throw new Error('injected lost queue acknowledgement response');
-      }
-      return result;
-    };
-
-    harness.fleet.advance(101);
-    for (let page = 0; page < 10; page++) {
-      harness.fleet.advance(1);
-      await harness.fleet.fireDueAlarms();
-      if ((await world.retention.getStatus(runId))?.lastError) break;
-    }
-    expect(await world.retention.getStatus(runId)).toMatchObject({
-      phase: 'queues',
-      attempts: 1,
-      lastError: 'injected lost final queue cleanup response',
-      deletedQueueMessages: 0,
-    });
-    const queueStorage = harness.fleet.cell('queue', 'q:0').storage;
-    expect(queueStorage.data.get(`expired-run:${runId}`)).toMatchObject({
-      deleted: 1,
-      compactAt: null,
-    });
-
-    harness.fleet.advance(QUEUE_FENCE_GRACE_MS * 2);
-    await queue.alarm();
-    expect(queueStorage.data.has(`expired-run:${runId}`)).toBe(true);
-
-    await harness.fleet.fireDueAlarms();
-    expect(harness.fleet.cell('runs', runId).storage.data.get('retention:progress')).toMatchObject({
-      queueShard: 0,
-      queueShardDeleted: 1,
-      pendingAck: { queueShard: 0 },
-    });
-    harness.fleet.advance(1);
-    await harness.fleet.fireDueAlarms();
-    expect(await world.retention.getStatus(runId)).toMatchObject({
-      phase: 'queues',
-      attempts: 1,
-      lastError: 'injected lost queue acknowledgement response',
-    });
-    expect(harness.fleet.cell('runs', runId).storage.data.get('retention:progress')).toMatchObject({
-      queueShard: 0,
-      queueShardDeleted: 1,
-      pendingAck: { queueShard: 0 },
-    });
-    expect(queueStorage.data.get(`expired-run:${runId}`)).toMatchObject({
-      deleted: 1,
-      compactAt: expect.any(Number),
-    });
-
-    harness.fleet.advance(QUEUE_FENCE_GRACE_MS);
-    await queue.alarm();
-    expect(queueStorage.data.has(`expired-run:${runId}`)).toBe(false);
-    await harness.fleet.fireDueAlarms();
-    expect(harness.fleet.cell('runs', runId).storage.data.get('retention:progress')).toEqual({
-      queueShard: 1,
-      queueShardDeleted: 0,
-    });
-
-    queue.expireRun = originalExpireRun;
-    queue.acknowledgeExpireRun = originalAcknowledgeExpireRun;
   });
 
   it('does at most one bounded cleanup page per alarm and resumes a large stream', async () => {
@@ -653,35 +525,169 @@ describe('terminal workflow retention', () => {
     expect(idStorage.data.has(`runfence:${encodeURIComponent(runId)}`)).toBe(false);
   });
 
-  it('does not regress queue cleanup progress when concurrent pages resolve out of order', async () => {
+  it('holds an exact queue claim until its workflow retry deadline', async () => {
     let fleet!: FakeFleet;
-    let firstStarted!: () => void;
-    let releaseFirst!: () => void;
-    const firstStartedPromise = new Promise<void>((resolve) => {
-      firstStarted = resolve;
+    fleet = new FakeFleet({ runs: WorkflowRunDO }, { clock: () => fleet.now });
+    const claim = fleet.namespace('runs').get({
+      toString: () => 'claim:queue:test-key',
+    }) as WorkflowRunDO;
+
+    await expect(claim.claimInflight({ messageId: 'msg_a', staleMs: 1_000 })).resolves.toEqual({
+      claimed: true,
     });
-    const firstReleasePromise = new Promise<void>((resolve) => {
+    await expect(claim.claimInflight({ messageId: 'msg_a', staleMs: 1_000 })).resolves.toEqual({
+      claimed: false,
+      retryAt: fleet.now + 1_000,
+    });
+    await expect(claim.claimInflight({ messageId: 'msg_b', staleMs: 1_000 })).resolves.toEqual({
+      claimed: false,
+    });
+
+    await expect(
+      claim.holdInflight({
+        messageId: 'msg_a',
+        retryAt: fleet.now + 50,
+        expiresAt: fleet.now + 500,
+      }),
+    ).resolves.toEqual({ held: true });
+    await expect(claim.claimInflight({ messageId: 'msg_a', staleMs: 1_000 })).resolves.toEqual({
+      claimed: false,
+      retryAt: fleet.now + 50,
+    });
+    fleet.advance(50);
+    await expect(claim.claimInflight({ messageId: 'msg_a', staleMs: 1_000 })).resolves.toEqual({
+      claimed: true,
+    });
+  });
+
+  it('reserves one queue message per idempotency key until completion', async () => {
+    let fleet!: FakeFleet;
+    fleet = new FakeFleet({ runs: WorkflowRunDO }, { clock: () => fleet.now });
+    const claim = fleet.namespace('runs').get({
+      toString: () => 'claim:queue:reservation-key',
+    }) as WorkflowRunDO;
+
+    await expect(
+      claim.reserveQueueMessage({ messageId: 'msg_reserved', expiresAt: fleet.now + 5_000 }),
+    ).resolves.toEqual({ admitted: true, messageId: 'msg_reserved' });
+    await expect(
+      claim.reserveQueueMessage({ messageId: 'msg_duplicate', expiresAt: fleet.now + 5_000 }),
+    ).resolves.toEqual({ admitted: false, messageId: 'msg_reserved' });
+
+    await claim.completeQueueMessage('msg_reserved');
+    await expect(
+      claim.reserveQueueMessage({ messageId: 'msg_after_ack', expiresAt: fleet.now + 5_000 }),
+    ).resolves.toEqual({ admitted: true, messageId: 'msg_after_ack' });
+  });
+
+  it('cleans an ambiguously published R2 payload through its dedicated orphan alarm', async () => {
+    const objects = new Map([['workflow-queue/wrun_orphan/msg_orphan', 'payload']]);
+    const deleted: string[] = [];
+    const cellEnv: Record<string, unknown> = {};
+    const fleet = new FakeFleet({ runs: WorkflowRunDO }, cellEnv);
+    Object.assign(cellEnv, {
+      clock: () => fleet.now,
+      WORKFLOW_DB: fleet.namespace('runs'),
+      WORKFLOW_QUEUE_PAYLOADS: {
+        delete: async (keys: string | string[]) => {
+          for (const key of Array.isArray(keys) ? keys : [keys]) {
+            objects.delete(key);
+            deleted.push(key);
+          }
+        },
+      },
+    });
+    const runId = 'wrun_orphan';
+    const messageId = 'msg_orphan';
+    const key = 'workflow-queue/wrun_orphan/msg_orphan';
+    const run = fleet.namespace('runs').get({ toString: () => runId }) as WorkflowRunDO;
+    const orphanName = queueOrphanName(messageId);
+    const orphan = fleet.namespace('runs').get({ toString: () => orphanName }) as WorkflowRunDO;
+    await run.registerQueuePayload({
+      messageId,
+      key,
+      orphanExpiresAt: fleet.now + 10,
+    });
+    await orphan.scheduleQueuePayloadOrphan({
+      messageId,
+      runId,
+      key,
+      expiresAt: fleet.now + 10,
+    });
+
+    fleet.advance(10);
+    await fleet.fireDueAlarms();
+
+    expect(deleted).toEqual([key]);
+    expect(objects.size).toBe(0);
+    expect(fleet.cell('runs', runId).storage.data.has(queuePayloadRegistryKey(messageId))).toBe(
+      false,
+    );
+    expect(fleet.cell('runs', orphanName).storage.data.size).toBe(0);
+  });
+
+  it('rejects an orphan extension after cleanup has acquired its deletion lease', async () => {
+    const deleteStarted = Promise.withResolvers<void>();
+    const releaseDelete = Promise.withResolvers<void>();
+    let fleet!: FakeFleet;
+    const cellEnv: Record<string, unknown> = {};
+    fleet = new FakeFleet({ runs: WorkflowRunDO }, cellEnv);
+    Object.assign(cellEnv, {
+      clock: () => fleet.now,
+      WORKFLOW_DB: fleet.namespace('runs'),
+      WORKFLOW_QUEUE_PAYLOADS: {
+        delete: async () => {
+          deleteStarted.resolve();
+          await releaseDelete.promise;
+        },
+      },
+    });
+    const messageId = 'msg_orphan_extension_race';
+    const orphan = fleet.namespace('runs').get({
+      toString: () => queueOrphanName(messageId),
+    }) as WorkflowRunDO;
+    const scheduled = {
+      messageId,
+      runId: 'wrun_orphan_extension_race',
+      key: 'workflow-queue/wrun_orphan_extension_race/msg_orphan_extension_race',
+      expiresAt: fleet.now,
+    };
+    await orphan.scheduleQueuePayloadOrphan(scheduled);
+
+    const cleanup = orphan.alarm();
+    await deleteStarted.promise;
+    try {
+      await expect(
+        orphan.scheduleQueuePayloadOrphan({ ...scheduled, expiresAt: fleet.now + 10_000 }),
+      ).rejects.toThrow(/deletion.*progress/i);
+    } finally {
+      releaseDelete.resolve();
+      await cleanup;
+    }
+
+    expect(fleet.cell('runs', queueOrphanName(messageId)).storage.data.size).toBe(0);
+  });
+
+  it('deletes R2 queue payloads in bounded, generation-safe pages', async () => {
+    let fleet!: FakeFleet;
+    let releaseFirst!: () => void;
+    const firstStarted = Promise.withResolvers<void>();
+    const firstRelease = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
     let calls = 0;
-    const expireRun = vi.fn<() => Promise<{ deleted: number; done: boolean }>>(async () => {
+    const remove = vi.fn<(_keys: string | string[]) => Promise<void>>(async () => {
       calls++;
       if (calls === 1) {
-        firstStarted();
-        await firstReleasePromise;
-        return { deleted: 64, done: false };
+        firstStarted.resolve();
+        await firstRelease;
       }
-      return { deleted: 128, done: false };
     });
-    const queueNamespace = {
-      idFromName: (name: string) => ({ toString: () => name }),
-      get: () => ({ expireRun }),
-    };
     fleet = new FakeFleet(
       { runs: WorkflowRunDO },
-      { clock: () => fleet.now, WORKFLOW_QUEUE: queueNamespace },
+      { clock: () => fleet.now, WORKFLOW_QUEUE_PAYLOADS: { delete: remove } },
     );
-    const runId = 'wrun_concurrent_queue_cleanup';
+    const runId = 'wrun_concurrent_queue_payload_cleanup';
     const run = fleet.namespace('runs').get({ toString: () => runId }) as WorkflowRunDO;
     const storage = fleet.cell('runs', runId).storage;
     storage.data.set(CLEANUP_RECORD_KEY, {
@@ -692,96 +698,39 @@ describe('terminal workflow retention', () => {
       completedAt: new Date(fleet.now - 1_000),
       terminalStatus: 'completed',
       dueAt: new Date(fleet.now),
-      queueShards: 1,
       phase: 'queues',
       generation: 0,
       attempts: 0,
       deletedPayloadKeys: 0,
       deletedStreams: 0,
-      deletedQueueMessages: 0,
+      deletedQueuePayloads: 0,
     } satisfies CleanupRecord);
+    for (let index = 0; index < 130; index++) {
+      const messageId = `msg_${String(index).padStart(3, '0')}`;
+      storage.data.set(queuePayloadRegistryKey(messageId), {
+        messageId,
+        key: `queue/${messageId}`,
+        orphanExpiresAt: fleet.now + 1_000,
+      });
+    }
 
-    const first = run.cleanupNow({ retentionMs: 1, queueShards: 1 });
-    await firstStartedPromise;
-    const second = run.cleanupNow({ retentionMs: 1, queueShards: 1 });
-    await vi.waitFor(() => expect(expireRun).toHaveBeenCalledTimes(2));
+    const first = run.cleanupNow({ retentionMs: 1 });
+    await firstStarted.promise;
+    const second = run.cleanupNow({ retentionMs: 1 });
+    await vi.waitFor(() => expect(remove).toHaveBeenCalledTimes(2));
     await second;
     releaseFirst();
     await first;
 
     expect(storage.data.get(CLEANUP_RECORD_KEY)).toMatchObject({
       phase: 'queues',
-      deletedQueueMessages: 128,
-    });
-    expect(storage.data.get('retention:progress')).toEqual({
-      queueShard: 0,
-      queueShardDeleted: 128,
-    });
-  });
-
-  it('ignores a late cleanup failure after a concurrent page advances the generation', async () => {
-    let fleet!: FakeFleet;
-    let firstStarted!: () => void;
-    let rejectFirst!: () => void;
-    const firstStartedPromise = new Promise<void>((resolve) => {
-      firstStarted = resolve;
-    });
-    const firstFailurePromise = new Promise<void>((resolve) => {
-      rejectFirst = resolve;
-    });
-    let calls = 0;
-    const expireRun = vi.fn<() => Promise<{ deleted: number; done: boolean }>>(async () => {
-      calls++;
-      if (calls === 1) {
-        firstStarted();
-        await firstFailurePromise;
-        throw new Error('late queue failure');
-      }
-      return { deleted: 128, done: false };
-    });
-    fleet = new FakeFleet(
-      { runs: WorkflowRunDO },
-      {
-        clock: () => fleet.now,
-        WORKFLOW_QUEUE: {
-          idFromName: (name: string) => ({ toString: () => name }),
-          get: () => ({ expireRun }),
-        },
-      },
-    );
-    const runId = 'wrun_late_queue_failure';
-    const run = fleet.namespace('runs').get({ toString: () => runId }) as WorkflowRunDO;
-    const storage = fleet.cell('runs', runId).storage;
-    storage.data.set(CLEANUP_RECORD_KEY, {
-      version: 1,
-      runId,
-      workflowName: 'late-failure',
-      createdAt: new Date(fleet.now - 2_000),
-      completedAt: new Date(fleet.now - 1_000),
-      terminalStatus: 'completed',
-      dueAt: new Date(fleet.now),
-      queueShards: 1,
-      phase: 'queues',
-      generation: 0,
+      deletedQueuePayloads: 128,
       attempts: 0,
-      deletedPayloadKeys: 0,
-      deletedStreams: 0,
-      deletedQueueMessages: 0,
-    } satisfies CleanupRecord);
-
-    const first = run.cleanupNow({ retentionMs: 1, queueShards: 1 });
-    await firstStartedPromise;
-    const second = run.cleanupNow({ retentionMs: 1, queueShards: 1 });
-    await vi.waitFor(() => expect(expireRun).toHaveBeenCalledTimes(2));
-    await second;
-    rejectFirst();
-    await first;
-
+    });
+    await run.cleanupNow({ retentionMs: 1 });
     expect(storage.data.get(CLEANUP_RECORD_KEY)).toMatchObject({
-      phase: 'queues',
-      deletedQueueMessages: 128,
-      attempts: 0,
+      phase: 'payload',
+      deletedQueuePayloads: 130,
     });
-    expect(storage.data.get(CLEANUP_RECORD_KEY)).toMatchObject({ lastError: undefined });
   });
 });

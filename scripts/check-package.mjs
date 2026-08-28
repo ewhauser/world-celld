@@ -44,11 +44,16 @@ try {
     'NOTICE',
     'README.md',
     'package.json',
+    'celld-queue-worker/README.md',
+    'celld-queue-worker/worker.ts',
+    'celld-queue-worker/wrangler.jsonc',
     'celld-worker/README.md',
     'celld-worker/worker.ts',
     'celld-worker/wrangler.jsonc',
     'dist/index.d.ts',
     'dist/index.js',
+    'dist/queue-consumer.d.ts',
+    'dist/queue-consumer.js',
     'dist/testing.d.ts',
     'dist/testing.js',
     'dist/worker.d.ts',
@@ -64,6 +69,9 @@ try {
     'NOTICE',
     'README.md',
     'package.json',
+    'celld-queue-worker/README.md',
+    'celld-queue-worker/worker.ts',
+    'celld-queue-worker/wrangler.jsonc',
     'celld-worker/README.md',
     'celld-worker/worker.ts',
     'celld-worker/wrangler.jsonc',
@@ -77,7 +85,9 @@ try {
 
   const unexpectedTypeScript = pack.files.find(
     ({ path }) =>
-      path.endsWith('.ts') && !path.endsWith('.d.ts') && path !== 'celld-worker/worker.ts',
+      path.endsWith('.ts') &&
+      !path.endsWith('.d.ts') &&
+      !['celld-worker/worker.ts', 'celld-queue-worker/worker.ts'].includes(path),
   );
   assert(
     !unexpectedTypeScript,

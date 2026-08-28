@@ -125,10 +125,14 @@ async function stopManaged(
   }
 }
 
-async function prepareWorker(destination: string): Promise<void> {
+async function prepareWorker(
+  destination: string,
+  entryPoint: string,
+  configPath: string,
+): Promise<void> {
   await mkdir(destination, { recursive: true });
   await build({
-    entryPoints: ['dist/worker.js'],
+    entryPoints: [entryPoint],
     bundle: true,
     format: 'esm',
     platform: 'browser',
@@ -139,9 +143,9 @@ async function prepareWorker(destination: string): Promise<void> {
     logLevel: 'silent',
   });
 
-  const source = await readFile('celld-worker/wrangler.jsonc', 'utf8');
+  const source = await readFile(configPath, 'utf8');
   const main = '"main": "worker.ts",';
-  if (!source.includes(main)) throw new Error('celld worker config main entry changed');
+  if (!source.includes(main)) throw new Error(`${configPath} main entry changed`);
   await writeFile(
     join(destination, 'wrangler.jsonc'),
     source.replace(main, '"main": "index.js",\n  "no_bundle": true,'),
@@ -262,7 +266,7 @@ class NativeCelldRuntime {
   }
 }
 
-describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
+describe.skipIf(!CONFIGURED)('real celld v0.4.0 native-services restart smoke', () => {
   const deliveries: CapturedDelivery[] = [];
   let temporaryRoot: string;
   let minio: ManagedProcess | undefined;
@@ -283,7 +287,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
     const requestedRoot = process.env.CELLD_SMOKE_TEMP_ROOT;
     temporaryRoot = requestedRoot ?? (await mkdtemp(join(tmpdir(), 'world-celld-smoke-')));
     if (requestedRoot) await mkdir(temporaryRoot, { recursive: true });
-    process.env.CELLD_QUEUE_MODE = 'cells';
+    process.env.CELLD_QUEUE_MODE = 'native';
     process.once('exit', emergencyStop);
 
     try {
@@ -333,7 +337,13 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
       await execFileAsync(MC_BIN!, ['mb', '--ignore-existing', `smoke/${BUCKET}`], { env: mcEnv });
 
       const workerDirectory = join(temporaryRoot, 'worker');
-      await prepareWorker(workerDirectory);
+      const queueWorkerDirectory = join(temporaryRoot, 'queue-worker');
+      await prepareWorker(workerDirectory, 'dist/worker.js', 'celld-worker/wrangler.jsonc');
+      await prepareWorker(
+        queueWorkerDirectory,
+        'dist/queue-consumer.js',
+        'celld-queue-worker/wrangler.jsonc',
+      );
       const storageClientEnv = {
         ...process.env,
         AWS_ACCESS_KEY_ID: ACCESS_KEY,
@@ -342,9 +352,26 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
         AWS_EC2_METADATA_DISABLED: 'true',
       };
       const version = await execFileAsync(CELLD_BIN!, ['--version'], { env: storageClientEnv });
-      if (!/\b0\.3\.0\b/.test(version.stdout)) {
-        throw new Error(`expected celld v0.3.0, got ${version.stdout.trim()}`);
+      if (!/\b0\.4\.0\b/.test(version.stdout)) {
+        throw new Error(`expected celld v0.4.0, got ${version.stdout.trim()}`);
       }
+      // The consumer deploy establishes the Queue attachment and its named
+      // script pointer. The primary deploy goes last so it remains the public
+      // application selected by the fleet-wide pointer.
+      await execFileAsync(
+        CELLD_BIN!,
+        [
+          'deploy',
+          queueWorkerDirectory,
+          '--bucket',
+          `s3://${BUCKET}`,
+          '--endpoint',
+          minioUrl,
+          '--region',
+          'us-east-1',
+        ],
+        { env: storageClientEnv, maxBuffer: 4 * 1024 * 1024 },
+      );
       await execFileAsync(
         CELLD_BIN!,
         [
@@ -419,7 +446,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
     });
   }
 
-  it('recovers durable state and one accepted alarm delivery after a process restart', async () => {
+  it('recovers durable state and one accepted native Queue delivery after a process restart', async () => {
     const deploymentId = `restart-${randomUUID()}`;
     const w = world({ deploymentId });
     const workflowName = `restart-${randomUUID()}`;
@@ -443,7 +470,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
     );
 
     // Keep celld down past the queue deadline. Delivery therefore requires the
-    // restarted runtime to restore the durable alarm and accepted message.
+    // restarted runtime to restore the accepted broker message.
     const restart = await runtime!.restart(2_500, true);
     expect(restart.newPid).not.toBe(restart.oldPid);
 
@@ -462,7 +489,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
     const delivered = await waitFor(
       async () => deliveries.slice(before).find((delivery) => delivery.body.includes(marker)),
       45_000,
-      'overdue queue alarm after celld restart',
+      'overdue native Queue delivery after celld restart',
     );
     expect(delivered.receivedAt).toBeGreaterThanOrEqual(restart.startedAt);
     expect(delivered.headers['x-vqs-message-id']).toBe(messageId);
@@ -550,7 +577,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.3.0 restart smoke', () => {
     );
     expect(tombstone.generation).toBeGreaterThan(interrupted!.generation);
     expect(tombstone.deletedStreams).toBe(1);
-    expect(tombstone.deletedQueueMessages).toBe(1);
+    expect(tombstone.deletedQueuePayloads).toBe(1);
     expect(tombstone.deletedPayloadKeys).toBeGreaterThan(0);
     await expect(w.runs.get(runId)).rejects.toSatisfy((error) => RunExpiredError.is(error));
     await expect(w.getStreamInfo(streamName, runId)).rejects.toThrow(/expired/);

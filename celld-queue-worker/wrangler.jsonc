@@ -1,0 +1,24 @@
+{
+  "name": "workflow-world-queue-consumer",
+  "main": "worker.ts",
+  "compatibility_date": "2026-01-01",
+  "services": [{ "binding": "WORLD_SERVICE", "service": "workflow-world" }],
+  "queues": {
+    "producers": [{ "binding": "WORKFLOW_QUEUE", "queue": "workflow-world" }],
+    "consumers": [
+      {
+        "queue": "workflow-world",
+        "max_batch_size": 10,
+        "max_batch_timeout": 1,
+        "max_retries": 100,
+        "dead_letter_queue": "workflow-world-dlq",
+        "max_concurrency": 25,
+      },
+    ],
+  },
+  "vars": {
+    // REQUIRED. Inject the same value used by the primary worker through
+    // CELLD_VAR_WORLD_SECRET rather than committing it here.
+    "WORLD_SECRET": "",
+  },
+}

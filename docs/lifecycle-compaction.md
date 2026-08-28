@@ -3,130 +3,134 @@
 ## Invariants
 
 `WorkflowRunDO` owns the only permanent expiry record for a run:
-`retention:tombstone`. The record also contains the final cleanup accounting,
-so successful cleanup deletes `retention:cleanup` instead of retaining two
+`retention:tombstone`. The record contains the final cleanup accounting, so
+successful cleanup deletes `retention:cleanup` instead of retaining two
 authoritative-looking records.
 
 All other expiry state is derivative:
 
 - catalog `expired:<runId>` markers reject delayed publications until their
-  authoritative publication leases have expired, then a bounded alarm deletes
-  them;
-- queue `expired-run:<runId>` markers serialize cleanup against enqueue,
-  delivery retry, and redrive. The queue retains the final cumulative deletion
-  receipt until RunDO durably records and acknowledges it, then deletes the
-  marker after the explicit queue delivery/RPC horizon;
-- hook token and hook-ID shards have no run fence at all. They consult the
-  owning RunDO for reads/finalization and use exact, expiring claims to prevent
-  a released hook from being recreated.
+  authoritative publication leases expire, then a bounded alarm deletes them;
+- run-local `queue-payload:<messageId>` registrations identify R2 objects that
+  retention must remove, while dedicated `queue-orphan:<messageId>` cells own
+  their independent failure-cleanup alarms;
+- queue idempotency claims live in dedicated `WorkflowRunDO` instances and
+  expire through their cell alarms;
+- hook token and hook-ID shards have no run fence. They consult the owning
+  RunDO and use exact, expiring claims to prevent a released hook from being
+  recreated.
 
-Every run-associated queue mutation consults `WorkflowRunDO.getLifecycleStatus`
-when it begins, then rechecks the exact queue marker in the mutation
-transaction. Claimed messages repeat the authoritative check immediately
-before external delivery. Consequently an expired run remains closed before
-queue cleanup reaches its shard and after the derivative marker is deleted;
-there is no cached non-expired proof which can outlive a retention boundary.
+celld's native Queue is intentionally not another lifecycle authority. A
+retention pass cannot selectively delete one run's broker messages, and celld
+retains them for a fixed four days. Instead, a broker message is a small pointer
+to an R2 body. Retention removes that body and its registration. A late pointer
+then receives permanent `410 QueuePayloadExpired` and is acknowledged without
+calling the application or recreating the run.
 
-## Producer and consumer map
+`RunFenceDO`, `QueueDO`, `WORKFLOW_RUN_FENCES`, queue shards, queue receipt
+fences, and hook-shard `runfence:<runId>` keys no longer exist. This remains an
+intentional hard cutover; there is no decoder, dual write, or migration path for
+their previous shapes.
 
-| State                                          | Producers                                                                                          | Consumers and replay behavior                                                                                                        | Terminal state                                                                          |
-| ---------------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------- |
-| `retention:cleanup`                            | terminal `WorkflowRunDO.applyEvent`, maximum-age cron enforcement, `scheduleCleanup`, `cleanupNow` | `retentionState`, the RunDO alarm phase machine, status/rearm RPCs, generation checks after every cross-cell await, retry accounting | folded into and deleted beside the final tombstone                                      |
-| `retention:tombstone`                          | payload cleanup, before each bounded delete page and again on completion                           | every RunDO read/write guard, `getLifecycleStatus`, queue fallback, hook read/finalize fallback                                      | one permanent record per expired run                                                    |
-| terminal cleanup marker                        | terminal `applyEvent`                                                                              | hook entity pages, durable hook-marker pages, wait pages, failure backoff                                                            | deleted when all terminal pages finish                                                  |
-| hook entity/marker                             | hook event transaction                                                                             | terminal and retention cleanup replays; exact token and ID release batches                                                           | deleted in pages of at most 64 hooks                                                    |
-| exact hook claim plus deadline                 | token/ID `reserve`                                                                                 | `finalize`/`publish`, exact cancellation release, hook cleanup, shard alarm                                                          | finalized/released immediately or alarm-deleted after its protocol lease                |
-| RunDO exact cancellation                       | ambiguous `applyEvent` resolution when the hook is absent and the run has not expired              | replayed `hook_created` guard                                                                                                        | payload cleanup deletes it; resolvers never recreate it after the logical tombstone     |
-| catalog expiry marker plus GC deadline         | RunDO index cleanup calling `RunCatalogDO.expireRun`                                               | catalog `upsertRun`; catalog alarm                                                                                                   | deleted after the publication horizon                                                   |
-| queue run reference                            | enqueue, claim recovery, retry, DLQ transition, redrive                                            | paged `expireRun`, ack, purge                                                                                                        | deleted with its message lifecycle                                                      |
-| queue exact expiry receipt                     | each queue shard's paged `expireRun`                                                               | enqueue, 503 reschedule, retry/DLQ, redrive; RunDO cumulative-count reconciliation and replay                                        | retained without a deadline until RunDO persists the final receipt                      |
-| queue receipt acknowledgement plus GC deadline | RunDO after persisting the final shard receipt                                                     | idempotent `acknowledgeExpireRun`; bounded queue compaction alarm                                                                    | exact receipt and deadline are deleted; all later operations use RunDO authority        |
-| stream registry/stream expiry metadata         | RunDO stream cleanup                                                                               | stream read/write guards and bounded stream cleanup replay                                                                           | retained as the stream entity's terminal metadata, not a duplicated per-shard run fence |
+## Native Queue and R2 protocol
 
-`RunFenceDO`, `WORKFLOW_RUN_FENCES`, and hook-shard `runfence:<runId>` keys no
-longer exist. A hard cutover is intentional; there is no decoder, dual write,
-or migration path for their previous shapes.
+The application publishes a versioned queue envelope to the primary worker.
+For a run-bearing message, the worker performs these operations in order:
 
-## Bounded lifetimes and work
+1. register `{messageId, R2 key, orphan expiry}` in the authoritative run cell;
+2. write the tagged-JSON body to R2;
+3. publish a pointer envelope through celld's native Queue producer binding.
 
-The horizons in `src/lifecycle.ts` come from enforced protocol limits:
+The registration rejects an already-expired run. A dedicated orphan cell removes
+the object and unregisters it only after `notBefore + 5 days`, whether the run
+already exists or is still in resilient start. This is one day beyond celld's fixed four-day Queue
+retention, so cleanup cannot remove a body while a valid broker message can
+still exist. A failure between registration, R2 write, and broker publication
+therefore leaks only until the bounded orphan alarm; it cannot bypass run
+expiry. Every valid workflow suspension extends the orphan deadline before its
+replacement pointer is published.
 
-| Bound                     |        Value | Derivation                                                                                      |
-| ------------------------- | -----------: | ----------------------------------------------------------------------------------------------- |
-| one fleet RPC attempt     |   300,000 ms | maximum accepted `rpcTimeoutMs`                                                                 |
-| idempotent fleet call     |   900,900 ms | three attempts plus the maximum two retry delays                                                |
-| run index publication     | 1,200,900 ms | one authoritative apply response plus one idempotent catalog call                               |
-| one queue delivery lease  |   330,000 ms | 300,000 ms delivery timeout plus 30,000 ms lost-claim grace                                     |
-| queue schedule headroom   |   330,001 ms | longest delivery lease plus the fresh one-millisecond alarm edge                                |
-| catalog exact-fence grace | 1,200,900 ms | maximum run-index publication lifetime                                                          |
-| queue receipt grace       |   330,000 ms | maximum of one mutation RPC and one delivery lease, starting only after durable acknowledgement |
-| hook exact-claim lease    | 2,101,800 ms | reserve retries, one authoritative apply, finalize retries, and retry delays                    |
+celld limits one Queue message to 128,000 bytes and producer delay to 86,400
+seconds. R2 offload preserves the World's larger body contract, while the
+consumer chains waits longer than one day by publishing the same stable
+envelope with the remaining absolute `notBefore` deadline.
 
-An operation arriving after a lease must reacquire authority. This makes a
-delayed original request finite while allowing an arbitrarily late logical
-replay to start a fresh request and be rejected by the tombstone.
+celld requires the consumer to be a script without `fetch()`. The companion
+`workflow-world-queue-consumer` script therefore consumes `workflow-world` and
+calls the primary `workflow-world` script through a service binding. The
+primary script resolves the R2 body and invokes the application's
+`/.well-known/workflow/v1/flow` endpoint.
 
-Every compaction alarm lists at most 129 entries, mutates at most 128 items,
-and re-arms for `now + 1` when a page remains. Storage failures schedule a new
-alarm edge before returning or throwing, rather than relying only on the
-platform's finite automatic retry ladder.
+For an `idempotencyKey`, a dedicated claim cell is named from the queue name
+and key. A delivery claims its exact `messageId` for 15 minutes. A duplicate
+publication with another message ID is acknowledged while the claim is live.
+A valid workflow suspension (`503` plus `timeoutSeconds`) extends the claim
+through the requested deadline and republishes the stable message identity.
+Success and permanent application statuses (`404`, `409`, `410`, `422`) delete
+the R2 object, unregister it from the run, and release the claim. Ordinary
+transient failures keep the payload but release the claim so the broker retry
+can reacquire it. A valid `503` records `retryAt`; an early retry receives the
+same suspension response instead of calling the application or losing the
+future delivery.
+
+## Retention state machine
+
+| Phase        | Bounded work                                      | Durable result                           |
+| ------------ | ------------------------------------------------- | ---------------------------------------- |
+| `retained`   | wait until the pinned deadline                    | advances to `index`                      |
+| `index`      | remove hook and run catalog derivatives           | advances to `streams`                    |
+| `streams`    | fence registries and delete bounded chunk pages   | advances to `queues`                     |
+| `queues`     | delete at most 128 registered R2 queue bodies     | advances or repeats                      |
+| `payload`    | tombstone first, then delete at most 128 run keys | repeats until only the tombstone remains |
+| `tombstoned` | no further mutation                               | one permanent metadata-only record       |
+
+Every cross-cell or R2 await is followed by a generation-checked transaction.
+Concurrent pages may repeat an idempotent external delete, but only one can
+advance the generation or add to cleanup accounting. Failures persist their
+error and schedule capped-backoff retry. The final tombstone contains no
+workflow input, output, event, step, hook, stream, or queue payload.
 
 Fleet-wide maximum-age discovery is the deliberate cross-shard exception. One
 celld cron occurrence performs a bounded creation-time merge across the 16 run
-catalog shards, admits at most `WORKFLOW_RETENTION_BATCH_SIZE` runs, then
-rechecks each candidate's authoritative `createdAt` in its RunDO. The RunDO
-removes its catalog entry before the enforcement RPC returns when possible;
-the remaining cleanup stays paged and alarm-driven. Repeated cron occurrences
-therefore advance through a backlog without turning one invocation into an
+catalog shards, admits at most `WORKFLOW_RETENTION_BATCH_SIZE` runs, and then
+rechecks each candidate's authoritative `createdAt` in its RunDO. Repeated cron
+occurrences advance through a backlog without turning one invocation into an
 unbounded namespace scan.
 
-## Measured protocol and storage effects
+## Bounded lifetimes
+
+| Bound                    |                Value | Purpose                                            |
+| ------------------------ | -------------------: | -------------------------------------------------- |
+| one fleet RPC attempt    |           300,000 ms | maximum accepted `rpcTimeoutMs`                    |
+| idempotent fleet call    |           900,900 ms | three attempts plus two maximum retry delays       |
+| run index publication    |         1,200,900 ms | apply response plus idempotent catalog publication |
+| queue callback           |           300,000 ms | application delivery timeout                       |
+| queue claim stale window |           900,000 ms | crash recovery and duplicate suppression           |
+| native producer delay    |             86,400 s | celld v0.4.0 per-publication maximum               |
+| native broker retention  |               4 days | fixed celld v0.4.0 message lifetime                |
+| orphan R2 grace          | `notBefore + 5 days` | outlives every valid native Queue pointer          |
+
+Queue deadlines remain fixed-width epoch-millisecond values. Validation leaves
+enough headroom for the claim window before a suspension is accepted. A logical
+wait can span many native publications, but each publication and claim deadline
+remains representable and bounded.
+
+## Evidence and coverage
 
 `pnpm test:perf:index -- --disableConsoleIntercept` keeps public protocol RPCs
-separate from internal Durable Object/storage work.
+separate from internal Durable Object and storage work. Those measurements
+cover run catalog and hook-index behavior; the former QueueDO storage-count
+baseline was removed because it is not comparable to celld's native broker and
+R2 implementation.
 
-- Run create/update remains two public RPCs. Its catalog shard performs one
-  expiry-marker read, one three-key batch put (the two public indexes plus
-  their exact internal key-pair record), and one transaction.
-- Hook create remains three public RPCs. Each ownership domain performs two
-  transactions, two batch reads, three scalar writes (record, claim, claim
-  deadline), and one batch delete. Finalization makes two internal lifecycle
-  reads against the authoritative RunDO instead of a separate RunFenceDO; each
-  lifecycle read is one RunDO transaction and one batch storage read.
-- Hook lookup remains one public RPC plus one internal authoritative RunDO
-  lifecycle read (one RunDO transaction and one batch storage read).
-- The retention sample performs one internal catalog expiry RPC and no
-  RunFence RPC. The caller supplies only validated run identity, hooks, and
-  expiry time. Catalog expiry reads its commit-time exact key-pair record,
-  writes the fence and GC deadline, deletes only that pair plus its internal
-  record (one two-key batch delete and one scalar delete), and does all of this
-  in one transaction. A missing pair is a mutation-free no-op.
-- A steady-state run-associated queue enqueue performs one public RPC, one
-  internal RunDO lifecycle RPC, one RunDO transaction/batch read, and one queue
-  transaction with two scalar reads plus four scalar writes for
-  config/message/due/run reference.
-- An expired enqueue after exact-receipt compaction performs one public RPC,
-  one internal RunDO lifecycle RPC, one queue transaction/scalar marker read,
-  and one RunDO transaction/batch read. It performs no writes.
-- A successful run-associated delivery performs one external callback fetch,
-  one internal RunDO lifecycle RPC/transaction/batch read, and two queue
-  transactions. Queue storage performs one message batch read, ten bounded
-  index lists, one batch claim write, one batch due-index delete, and three
-  scalar acknowledgement deletes.
+Focused tests cover producer envelope validation, R2 offload and cleanup,
+consumer success/permanent/transient decisions, suspension re-publication,
+long-delay chaining, exact idempotency claims, orphan cleanup, 128-object
+retention pages, generation races, maximum-age cleanup, and tombstone
+non-resurrection. The required real celld v0.4.0 smoke additionally proves the
+two-script Queue/service graph, delayed delivery across process loss, R2-backed
+retention cleanup, durable run/stream recovery, and resumption of multi-page
+cleanup after `SIGKILL`.
 
-These are operation counts, not latency or CPU claims. The suite prints local
-elapsed-time smoke values separately.
-
-## Failure and concurrency coverage
-
-Focused fake-time tests cover late enqueue, late hook finalization, delayed
-cleanup replay, callback retry, stale DLQ redrive, exact-claim expiry, DO
-restart, 128-item compaction pages, partial compaction, injected alarm failure,
-concurrent expiry/compaction, lost final cleanup responses, unacknowledged
-receipt retention, and convergence of hundreds of exact queue receipts to no
-derivative state. Existing retention tests continue to cover cleanup
-generation races, paged hooks/streams/queues/payload, lost responses, and alarm
-backoff. Maximum-age tests additionally cover pending, running, and terminal
-runs, authoritative cutoff rechecks, bounded sweep progress, the earliest of
-terminal and fleet-wide deadlines, and cleanup across persisted queue-shard
-placement.
+These are protocol and operation-count claims. Local elapsed time and
+throughput remain machine-specific performance evidence.

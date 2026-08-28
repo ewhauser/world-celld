@@ -20,7 +20,6 @@ export interface CleanupRecord {
   terminalStatus?: TerminalWorkflowRunStatus;
   reason?: 'terminal-retention' | 'maximum-age' | 'manual';
   dueAt: Date;
-  queueShards: number;
   phase: CleanupPhase;
   /** Optimistic-concurrency token for alarm/RPC work that awaits another cell. */
   generation: number;
@@ -30,7 +29,8 @@ export interface CleanupRecord {
   tombstonedAt?: Date;
   deletedPayloadKeys: number;
   deletedStreams: number;
-  deletedQueueMessages: number;
+  /** Queue payload objects removed from R2 during run cleanup. */
+  deletedQueuePayloads: number;
 }
 
 export interface RunTombstone {
@@ -106,30 +106,8 @@ export interface ExpireStreamResult {
   done: boolean;
 }
 
-export interface QueueExpiryReceipt {
-  expiredAt: number;
-  deleted: number;
-}
-
-export type ExpireQueueRunResult = {
-  /** Cumulative messages removed for this run in this queue shard. */
-  deleted: number;
-} & (
-  | { done: false }
-  | {
-      done: true;
-      /** Durable receipt which the cleanup coordinator must acknowledge. */
-      receipt: QueueExpiryReceipt;
-    }
-);
-
-export interface AcknowledgeQueueExpiryResult {
-  acknowledged: boolean;
-}
-
 export interface ScheduleCleanupRequest {
   retentionMs: number;
-  queueShards: number;
 }
 
 export interface EnforceRetentionRequest extends ScheduleCleanupRequest {

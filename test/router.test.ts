@@ -28,6 +28,7 @@ import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import { createRouter } from '../src/worker/router.js';
 import type { DONamespaceLike, WorkerEnv } from '../src/worker/router.js';
 import { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
+import { queueClaimName } from '../src/queue-protocol.js';
 
 const SECRET = 'test-secret';
 
@@ -520,7 +521,12 @@ describe('router auth and shape', () => {
       WORKFLOW_RUN_CATALOG: harness.fleet.namespace('run-catalog'),
       WORKFLOW_HOOK_TOKENS: harness.fleet.namespace('hook-tokens'),
       WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
-      WORKFLOW_QUEUE: harness.fleet.namespace('queue'),
+      WORKFLOW_QUEUE: { send: async () => undefined },
+      WORKFLOW_QUEUE_PAYLOADS: {
+        put: async () => undefined,
+        get: async () => null,
+        delete: async () => undefined,
+      },
       WORLD_SECRET: SECRET,
     });
     const request = new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
@@ -535,6 +541,237 @@ describe('router auth and shape', () => {
 
     const response = await router(request);
     expect(response.status).toBe(413);
+  });
+});
+
+describe('native Queue bridge', () => {
+  const request = (operation: 'send' | 'deliver', args: unknown[]) =>
+    new Request(`https://world.internal/v1/queue/${operation}`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${SECRET}`,
+        'content-type': 'application/json',
+      },
+      body: rpcStringify(args),
+    });
+
+  it('reserves an idempotency key before publishing a native message', async () => {
+    const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
+    const router = createRouter({
+      WORKFLOW_DB: harness.fleet.namespace('runs'),
+      WORKFLOW_QUEUE: { send },
+      WORLD_SECRET: SECRET,
+    } as WorkerEnv);
+    const first = {
+      version: 1 as const,
+      messageId: 'msg_router_dedup_first',
+      queueName: '__wkf_workflow_router_dedup',
+      targetBaseUrl: 'https://app.internal',
+      idempotencyKey: 'step-router-dedup',
+      body: rpcStringify({ stepId: 'step-router-dedup' }),
+    };
+    const second = { ...first, messageId: 'msg_router_dedup_second' };
+
+    const firstResponse = await router(request('send', [first]));
+    const secondResponse = await router(request('send', [second]));
+
+    expect(firstResponse.status).toBe(200);
+    expect(secondResponse.status).toBe(200);
+    expect(rpcParse(await firstResponse.text())).toEqual({ messageId: first.messageId });
+    expect(rpcParse(await secondResponse.text())).toEqual({ messageId: first.messageId });
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it('deletes an R2 put that loses the run-retention finalization race', async () => {
+    const putStarted = Promise.withResolvers<void>();
+    const releasePut = Promise.withResolvers<void>();
+    const queuePayloads = new Map<string, string>();
+    const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
+    const run = {
+      registerQueuePayload: vi
+        .fn<(registration: unknown) => Promise<{ ok: true }>>()
+        .mockResolvedValue({ ok: true }),
+      finalizeQueuePayload: vi
+        .fn<(messageId: string) => Promise<{ ok: false; message: string }>>()
+        .mockResolvedValue({
+          ok: false,
+          message: 'Workflow run expired during queue payload publication',
+        }),
+      unregisterQueuePayload: vi
+        .fn<(messageId: string) => Promise<void>>()
+        .mockResolvedValue(undefined),
+    };
+    const orphan = {
+      scheduleQueuePayloadOrphan: vi
+        .fn<(orphan: unknown) => Promise<void>>()
+        .mockResolvedValue(undefined),
+      cancelQueuePayloadOrphan: vi
+        .fn<(messageId: string) => Promise<void>>()
+        .mockResolvedValue(undefined),
+    };
+    const namespace: DONamespaceLike = {
+      idFromName: (name) => ({ toString: () => name }),
+      get: (id) => (id.toString().startsWith('queue-orphan:') ? orphan : run),
+    };
+    const bucket = {
+      async put(key: string, value: string) {
+        putStarted.resolve();
+        await releasePut.promise;
+        queuePayloads.set(key, value);
+      },
+      async get() {
+        return null;
+      },
+      async delete(keys: string | string[]) {
+        for (const key of Array.isArray(keys) ? keys : [keys]) queuePayloads.delete(key);
+      },
+    };
+    const router = createRouter({
+      WORKFLOW_DB: namespace,
+      WORKFLOW_QUEUE: { send },
+      WORKFLOW_QUEUE_PAYLOADS: bucket,
+      WORLD_SECRET: SECRET,
+    } as WorkerEnv);
+    const envelope = {
+      version: 1 as const,
+      messageId: 'msg_router_retention_race',
+      queueName: '__wkf_workflow_router_retention_race',
+      targetBaseUrl: 'https://app.internal',
+      runId: 'wrun_router_retention_race',
+      body: rpcStringify({ runId: 'wrun_router_retention_race' }),
+    };
+
+    const sending = router(request('send', [envelope]));
+    await putStarted.promise;
+    releasePut.resolve();
+    const response = await sending;
+
+    expect(response.status).toBe(410);
+    expect(run.finalizeQueuePayload).toHaveBeenCalledWith(envelope.messageId);
+    expect(run.unregisterQueuePayload).toHaveBeenCalledWith(envelope.messageId);
+    expect(orphan.cancelQueuePayloadOrphan).toHaveBeenCalledWith(envelope.messageId);
+    expect(queuePayloads.size).toBe(0);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('accepts a successful callback without buffering its response body', async () => {
+    const router = createRouter({
+      WORKFLOW_DB: harness.fleet.namespace('runs'),
+      WORLD_SECRET: SECRET,
+    } as WorkerEnv);
+    const callback = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(new Response('x'.repeat(64 * 1024 + 1), { status: 200 }));
+    vi.stubGlobal('fetch', callback);
+    try {
+      const response = await router(
+        request('deliver', [
+          {
+            version: 1,
+            messageId: 'msg_router_large_success',
+            queueName: '__wkf_workflow_router_large_success',
+            targetBaseUrl: 'https://app.internal',
+            body: rpcStringify({ type: 'success' }),
+          },
+          1,
+        ]),
+      );
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(callback).toHaveBeenCalledOnce();
+  });
+
+  it('offloads a run payload to R2, delivers it, and clears payload plus claim state', async () => {
+    const queuePayloads = new Map<string, string>();
+    const send = vi
+      .fn<
+        (
+          body: string,
+          options?: { contentType?: 'text'; delaySeconds?: number },
+        ) => Promise<unknown>
+      >()
+      .mockResolvedValue(undefined);
+    const bucket = {
+      put: vi.fn<(key: string, value: string) => Promise<void>>(async (key, value) => {
+        queuePayloads.set(key, value);
+      }),
+      get: vi.fn<(key: string) => Promise<{ text(): Promise<string> } | null>>(async (key) => {
+        const value = queuePayloads.get(key);
+        return value === undefined ? null : { text: async () => value };
+      }),
+      delete: vi.fn<(keys: string | string[]) => Promise<void>>(async (keys) => {
+        for (const key of Array.isArray(keys) ? keys : [keys]) queuePayloads.delete(key);
+      }),
+    };
+    const env: WorkerEnv = {
+      WORKFLOW_DB: harness.fleet.namespace('runs'),
+      WORKFLOW_STREAMS: harness.fleet.namespace('streams'),
+      WORKFLOW_RUN_CATALOG: harness.fleet.namespace('run-catalog'),
+      WORKFLOW_HOOK_TOKENS: harness.fleet.namespace('hook-tokens'),
+      WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
+      WORKFLOW_QUEUE: { send },
+      WORKFLOW_QUEUE_PAYLOADS: bucket,
+      WORLD_SECRET: SECRET,
+      WORKFLOW_CALLBACK_SECRET: 'callback-secret',
+    };
+    const router = createRouter(env);
+    const envelope = {
+      version: 1 as const,
+      messageId: 'msg_router_native',
+      queueName: '__wkf_workflow_router_native',
+      targetBaseUrl: 'https://app.internal/',
+      runId: 'wrun_router_native',
+      idempotencyKey: 'router-native-key',
+      body: rpcStringify({
+        runId: 'wrun_router_native',
+        stepId: 'step_router',
+        padding: 'x'.repeat(200_000),
+      }),
+    };
+    expect((await router(request('send', [envelope, { delaySeconds: 9 }]))).status).toBe(200);
+    expect(new TextEncoder().encode(envelope.body).byteLength).toBeGreaterThan(128_000);
+    expect(send).toHaveBeenCalledOnce();
+    const [brokerBody, options] = send.mock.calls[0] as [string, unknown];
+    const brokerEnvelope = JSON.parse(brokerBody);
+    expect(brokerEnvelope).toMatchObject({
+      messageId: envelope.messageId,
+      runId: envelope.runId,
+      payloadKey: 'workflow-queue/wrun_router_native/msg_router_native',
+    });
+    expect(brokerEnvelope).not.toHaveProperty('body');
+    expect(options).toEqual({ contentType: 'text', delaySeconds: 9 });
+    expect(queuePayloads.get(brokerEnvelope.payloadKey)).toBe(envelope.body);
+
+    const callback = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', callback);
+    try {
+      expect((await router(request('deliver', [brokerEnvelope, 2]))).status).toBe(204);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+
+    expect(callback).toHaveBeenCalledOnce();
+    const [callbackUrl, callbackInit] = callback.mock.calls[0];
+    expect(callbackUrl).toBe('https://app.internal/.well-known/workflow/v1/flow');
+    expect(callbackInit?.body).toBe(envelope.body);
+    expect(new Headers(callbackInit?.headers).get('x-vqs-message-attempt')).toBe('2');
+    expect(new Headers(callbackInit?.headers).get('x-workflow-callback-secret')).toBe(
+      'callback-secret',
+    );
+    expect(queuePayloads.size).toBe(0);
+    expect(
+      harness.fleet
+        .cell('runs', queueClaimName(envelope.queueName, envelope.idempotencyKey))
+        .storage.data.has('claim'),
+    ).toBe(false);
+    expect(
+      harness.fleet
+        .cell('runs', queueClaimName(envelope.queueName, envelope.idempotencyKey))
+        .storage.data.has('queue-reservation'),
+    ).toBe(false);
   });
 });
 
