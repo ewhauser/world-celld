@@ -29,7 +29,7 @@ export interface CleanupRecord {
   tombstonedAt?: Date;
   deletedPayloadKeys: number;
   deletedStreams: number;
-  /** Queue payload objects removed from R2 during run cleanup. */
+  /** Queue payload objects removed from object storage during run cleanup. */
   deletedQueuePayloads: number;
 }
 

@@ -50,6 +50,7 @@ import {
   type QueuePayloadRegistration,
 } from '../queue-protocol.js';
 import { queueDelayDeadline } from '../validation.js';
+import type { QueuePayloadStore } from './queue-payload-store.js';
 
 export const WORLD_NAME = 'world-celld';
 export const WORLD_VERSION = '0.1.0';
@@ -62,16 +63,6 @@ export interface DONamespaceLike {
 
 interface NativeQueueBindingLike {
   send(body: string, options?: { contentType?: 'text'; delaySeconds?: number }): Promise<unknown>;
-}
-
-interface QueuePayloadBucketLike {
-  put(
-    key: string,
-    value: string,
-    options?: { customMetadata?: Record<string, string> },
-  ): Promise<unknown>;
-  get(key: string): Promise<{ text(): Promise<string> } | null>;
-  delete(key: string | string[]): Promise<void>;
 }
 
 interface QueueRunStub {
@@ -107,7 +98,7 @@ export interface WorkerEnv {
   WORKFLOW_HOOK_TOKENS: DONamespaceLike;
   WORKFLOW_HOOK_IDS: DONamespaceLike;
   WORKFLOW_QUEUE: NativeQueueBindingLike;
-  WORKFLOW_QUEUE_PAYLOADS: QueuePayloadBucketLike;
+  WORKFLOW_QUEUE_PAYLOADS?: QueuePayloadStore;
   WORLD_SECRET?: string;
   WORKFLOW_CALLBACK_SECRET?: string;
   WORKFLOW_RETENTION_MS?: string | number;
@@ -381,13 +372,7 @@ export function createRouter(env: WorkerEnv) {
 
         try {
           const namespace = env.WORKFLOW_DB;
-          if (envelope.runId && !env.WORKFLOW_QUEUE_PAYLOADS) {
-            return errorResponse(
-              500,
-              'WorldMisconfigured',
-              'missing binding: WORKFLOW_QUEUE_PAYLOADS',
-            );
-          }
+          const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
           const payloadKey = envelope.runId
             ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
             : undefined;
@@ -424,6 +409,13 @@ export function createRouter(env: WorkerEnv) {
           }
 
           if (envelope.runId && payloadKey) {
+            if (!payloadStore) {
+              return errorResponse(
+                500,
+                'WorldMisconfigured',
+                'missing binding: WORKFLOW_QUEUE_PAYLOADS',
+              );
+            }
             const run = namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub;
             const orphanExpiresAt = reservationExpiresAt;
             const registered = await run.registerQueuePayload({
@@ -451,11 +443,9 @@ export function createRouter(env: WorkerEnv) {
               throw error;
             }
             try {
-              await env.WORKFLOW_QUEUE_PAYLOADS.put(payloadKey, envelope.body, {
-                customMetadata: {
-                  runId: envelope.runId,
-                  messageId: envelope.messageId,
-                },
+              await payloadStore.write(payloadKey, envelope.body, {
+                runId: envelope.runId,
+                messageId: envelope.messageId,
               });
             } catch (error) {
               await claim?.completeQueueMessage(envelope.messageId);
@@ -469,7 +459,7 @@ export function createRouter(env: WorkerEnv) {
               throw error;
             }
             if (!finalized.ok) {
-              await env.WORKFLOW_QUEUE_PAYLOADS.delete(payloadKey);
+              await payloadStore.delete(payloadKey);
               await run.unregisterQueuePayload(envelope.messageId);
               await orphan.cancelQueuePayloadOrphan(envelope.messageId);
               await claim?.completeQueueMessage(envelope.messageId);
@@ -506,6 +496,7 @@ export function createRouter(env: WorkerEnv) {
         }
 
         const namespace = env.WORKFLOW_DB;
+        const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
         let claim: QueueRunStub | undefined;
         if (envelope.idempotencyKey) {
           claim = namespace.get(
@@ -530,7 +521,7 @@ export function createRouter(env: WorkerEnv) {
 
         let body = envelope.body;
         if (envelope.payloadKey) {
-          if (!env.WORKFLOW_QUEUE_PAYLOADS) {
+          if (!payloadStore) {
             await claim?.releaseInflight(envelope.messageId);
             return errorResponse(
               500,
@@ -538,7 +529,7 @@ export function createRouter(env: WorkerEnv) {
               'missing binding: WORKFLOW_QUEUE_PAYLOADS',
             );
           }
-          body = await (await env.WORKFLOW_QUEUE_PAYLOADS.get(envelope.payloadKey))?.text();
+          body = (await payloadStore.read(envelope.payloadKey)) ?? undefined;
           if (body === undefined) {
             if (envelope.runId) {
               const run = namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub;
@@ -593,7 +584,10 @@ export function createRouter(env: WorkerEnv) {
         if (finished) {
           try {
             if (envelope.payloadKey) {
-              await env.WORKFLOW_QUEUE_PAYLOADS.delete(envelope.payloadKey);
+              if (!payloadStore) {
+                throw new Error('missing binding: WORKFLOW_QUEUE_PAYLOADS');
+              }
+              await payloadStore.delete(envelope.payloadKey);
               if (envelope.runId) {
                 const run = namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub;
                 const orphan = namespace.get(

@@ -523,8 +523,8 @@ describe('router auth and shape', () => {
       WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
       WORKFLOW_QUEUE: { send: async () => undefined },
       WORKFLOW_QUEUE_PAYLOADS: {
-        put: async () => undefined,
-        get: async () => null,
+        write: async () => undefined,
+        read: async () => null,
         delete: async () => undefined,
       },
       WORLD_SECRET: SECRET,
@@ -582,9 +582,9 @@ describe('native Queue bridge', () => {
     expect(send).toHaveBeenCalledOnce();
   });
 
-  it('deletes an R2 put that loses the run-retention finalization race', async () => {
-    const putStarted = Promise.withResolvers<void>();
-    const releasePut = Promise.withResolvers<void>();
+  it('deletes an object-store write that loses the run-retention finalization race', async () => {
+    const writeStarted = Promise.withResolvers<void>();
+    const releaseWrite = Promise.withResolvers<void>();
     const queuePayloads = new Map<string, string>();
     const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
     const run = {
@@ -613,13 +613,13 @@ describe('native Queue bridge', () => {
       idFromName: (name) => ({ toString: () => name }),
       get: (id) => (id.toString().startsWith('queue-orphan:') ? orphan : run),
     };
-    const bucket = {
-      async put(key: string, value: string) {
-        putStarted.resolve();
-        await releasePut.promise;
+    const store = {
+      async write(key: string, value: string) {
+        writeStarted.resolve();
+        await releaseWrite.promise;
         queuePayloads.set(key, value);
       },
-      async get() {
+      async read() {
         return null;
       },
       async delete(keys: string | string[]) {
@@ -629,7 +629,7 @@ describe('native Queue bridge', () => {
     const router = createRouter({
       WORKFLOW_DB: namespace,
       WORKFLOW_QUEUE: { send },
-      WORKFLOW_QUEUE_PAYLOADS: bucket,
+      WORKFLOW_QUEUE_PAYLOADS: store,
       WORLD_SECRET: SECRET,
     } as WorkerEnv);
     const envelope = {
@@ -642,8 +642,8 @@ describe('native Queue bridge', () => {
     };
 
     const sending = router(request('send', [envelope]));
-    await putStarted.promise;
-    releasePut.resolve();
+    await writeStarted.promise;
+    releaseWrite.resolve();
     const response = await sending;
 
     expect(response.status).toBe(410);
@@ -684,7 +684,7 @@ describe('native Queue bridge', () => {
     expect(callback).toHaveBeenCalledOnce();
   });
 
-  it('offloads a run payload to R2, delivers it, and clears payload plus claim state', async () => {
+  it('offloads a run payload to object storage, delivers it, and clears claim state', async () => {
     const queuePayloads = new Map<string, string>();
     const send = vi
       .fn<
@@ -694,14 +694,13 @@ describe('native Queue bridge', () => {
         ) => Promise<unknown>
       >()
       .mockResolvedValue(undefined);
-    const bucket = {
-      put: vi.fn<(key: string, value: string) => Promise<void>>(async (key, value) => {
+    const store = {
+      write: vi.fn<(key: string, value: string) => Promise<void>>(async (key, value) => {
         queuePayloads.set(key, value);
       }),
-      get: vi.fn<(key: string) => Promise<{ text(): Promise<string> } | null>>(async (key) => {
-        const value = queuePayloads.get(key);
-        return value === undefined ? null : { text: async () => value };
-      }),
+      read: vi.fn<(key: string) => Promise<string | null>>(
+        async (key) => queuePayloads.get(key) ?? null,
+      ),
       delete: vi.fn<(keys: string | string[]) => Promise<void>>(async (keys) => {
         for (const key of Array.isArray(keys) ? keys : [keys]) queuePayloads.delete(key);
       }),
@@ -713,7 +712,7 @@ describe('native Queue bridge', () => {
       WORKFLOW_HOOK_TOKENS: harness.fleet.namespace('hook-tokens'),
       WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
       WORKFLOW_QUEUE: { send },
-      WORKFLOW_QUEUE_PAYLOADS: bucket,
+      WORKFLOW_QUEUE_PAYLOADS: store,
       WORLD_SECRET: SECRET,
       WORKFLOW_CALLBACK_SECRET: 'callback-secret',
     };

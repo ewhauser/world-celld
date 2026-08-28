@@ -29,6 +29,8 @@
   "queues": {
     "producers": [{ "binding": "WORKFLOW_QUEUE", "queue": "workflow-world" }],
   },
+  // celld maps this Workers-compatible binding into the existing fleet bucket
+  // at r2/<bucket_name>/; it does not require a Cloudflare R2 deployment.
   "r2_buckets": [
     {
       "binding": "WORKFLOW_QUEUE_PAYLOADS",

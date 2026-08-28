@@ -5,7 +5,7 @@ The primary celld-deployable half of `@ewhauser/world-celld`: five cell classes
 authenticated HTTP router. Storage and control methods use fixed JSON RPC
 routes; stream chunks use bounded binary batch writes and binary long-poll
 reads. Queue producers use celld's native Queue binding, with run-bearing
-payload bodies stored in R2.
+payload bodies stored in the fleet's object store.
 
 ## Deploy
 
@@ -32,6 +32,11 @@ Requirements:
 - `WORLD_SECRET` injected at the node level (`CELLD_VAR_WORLD_SECRET=...`) —
   the router fails closed with 503 while it is empty.
 
+Queue payloads do not require another provider or another set of credentials.
+celld maps the `WORKFLOW_QUEUE_PAYLOADS` binding into the fleet bucket under
+`r2/workflow-world-queue-payloads/`. The `r2_buckets` key in `wrangler.jsonc`
+names the Workers-compatible binding API; it does not require Cloudflare R2.
+
 ## Fleet-wide retention
 
 The bundled `wrangler.jsonc` declares an hourly UTC cron trigger. It does no
@@ -46,7 +51,7 @@ celld --bucket s3://my-cells-bucket
 `7776000000` is 90 days. The policy includes pending and running workflows as
 well as terminal ones. Each cron occurrence admits at most
 `WORKFLOW_RETENTION_BATCH_SIZE` runs (default `128`); the existing per-run alarm
-state machine finishes bounded index, stream, R2 queue-payload, and run-payload
+state machine finishes bounded index, stream, object-store queue-payload, and run-payload
 cleanup. Edit `triggers.crons` in the copied config if hourly discovery is not
 the desired resolution.
 

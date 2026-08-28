@@ -55,6 +55,10 @@ import {
   type QueuePayloadOrphan,
   type QueuePayloadRegistration,
 } from '../../queue-protocol.js';
+import {
+  deleteQueuePayloadObjects,
+  type QueuePayloadObjectStorageBinding,
+} from '../queue-payload-store.js';
 
 interface CellId {
   toString(): string;
@@ -79,17 +83,13 @@ interface StreamCleanupStub {
   ): Promise<ExpireStreamResult>;
 }
 
-interface QueuePayloadBucket {
-  delete(keys: string | string[]): Promise<void>;
-}
-
 interface WorkflowRunDOEnv {
   WORKFLOW_DB?: CellNamespace<{ unregisterQueuePayload(messageId: string): Promise<void> }>;
   WORKFLOW_RUN_CATALOG?: CellNamespace<RunCatalogShardStub>;
   WORKFLOW_HOOK_TOKENS?: CellNamespace<HookTokenShardStub>;
   WORKFLOW_HOOK_IDS?: CellNamespace<HookIdShardStub>;
   WORKFLOW_STREAMS?: CellNamespace<StreamCleanupStub>;
-  WORKFLOW_QUEUE_PAYLOADS?: QueuePayloadBucket;
+  WORKFLOW_QUEUE_PAYLOADS?: Pick<QueuePayloadObjectStorageBinding, 'delete'>;
   /** Test seam; celld deployments use Date.now(). */
   clock?: () => number;
 }
@@ -696,7 +696,7 @@ export class WorkflowRunDO extends DurableObject {
       if (!bucket || !runs) {
         throw new Error('world-celld queue orphan cleanup is missing required bindings');
       }
-      await bucket.delete(leased.key);
+      await deleteQueuePayloadObjects(bucket, leased.key);
       const run = runs.get(runs.idFromName(leased.runId));
       await run.unregisterQueuePayload(leased.messageId);
       await this.ctx.storage.transaction(async (txn) => {
@@ -1002,7 +1002,10 @@ export class WorkflowRunDO extends DurableObject {
       throw new Error('world-celld retention missing binding WORKFLOW_QUEUE_PAYLOADS');
     }
     if (page.length > 0) {
-      await bucket.delete(page.map(([, registration]) => registration.key));
+      await deleteQueuePayloadObjects(
+        bucket,
+        page.map(([, registration]) => registration.key),
+      );
     }
 
     await this.ctx.storage.transaction(async (txn) => {

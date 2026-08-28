@@ -26,7 +26,7 @@ export interface QueuePayloadOrphan {
 /**
  * Small broker message carried by celld's native Queue.
  *
- * Run-bearing payload bytes live in R2 so the broker's 128 kB limit does not
+ * Run-bearing payload bytes live in object storage so the broker's 128 kB limit does not
  * narrow the Workflow World contract and run retention can delete those bytes
  * without waiting for the Queue's fixed four-day retention window.
  */

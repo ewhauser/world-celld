@@ -121,7 +121,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     expect(Array.from(run.input[0] as Uint8Array)).toEqual([0, 1, 2, 253, 254, 255]);
   });
 
-  it('expires terminal payloads across run, stream, index, and queue R2 storage', async () => {
+  it('expires terminal payloads across run, stream, index, and queue object storage', async () => {
     const w = createCelldWorld({
       fleetUrl: transport.fleetUrl,
       secret: transport.secret,

@@ -7,7 +7,7 @@
  * - Production publishes a small pointer through celld v0.4.0 native Queues.
  *   The deployed Queue consumer forwards deliveries to the same HTTP handler
  *   used by the in-process test pump.
- * - Run-bearing message bodies live in the worker's R2 binding. This preserves
+ * - Run-bearing message bodies live in the fleet object store. This preserves
  *   the World's larger payload contract and lets run retention delete payload
  *   bytes independently of the broker's fixed retention window.
  * - `createQueueHandler` has ONE dialect — the x-vqs wire format the test
@@ -383,7 +383,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
       }
 
       // Production: publish through celld's native Queue. The worker-side send
-      // route moves run-bearing payload bytes into R2 before it publishes this
+      // route moves run-bearing payload bytes into object storage before it publishes this
       // envelope, so only a bounded pointer reaches the broker.
       const messageId = MessageId.parse(`msg_${generateMessageId()}`);
       const body = stringify(parsedMessage.data);

@@ -10,6 +10,7 @@ import { HookTokenDO } from '../worker/durable-objects/HookTokenDO.js';
 import { RunCatalogDO } from '../worker/durable-objects/RunCatalogDO.js';
 import { StreamDO } from '../worker/durable-objects/StreamDO.js';
 import { WorkflowRunDO } from '../worker/durable-objects/WorkflowRunDO.js';
+import { createQueuePayloadStore } from '../worker/queue-payload-store.js';
 import { FakeFleet } from './fake-cell.js';
 
 export interface Harness {
@@ -83,7 +84,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     WORKFLOW_HOOK_TOKENS: fleet.namespace('hook-tokens'),
     WORKFLOW_HOOK_IDS: fleet.namespace('hook-ids'),
     WORKFLOW_QUEUE: nativeQueue,
-    WORKFLOW_QUEUE_PAYLOADS: queuePayloadBucket,
+    WORKFLOW_QUEUE_PAYLOADS: createQueuePayloadStore(queuePayloadBucket),
     WORLD_SECRET: options.secret,
   };
 

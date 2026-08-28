@@ -5,7 +5,7 @@ A [Workflow DevKit](https://useworkflow.dev) `World` backed by
 
 `world-celld` stores workflow runs, hooks, and streams in celld cells. Scheduled
 work is delivered through celld's native Queues, with run-bearing message bodies
-stored in R2. This gives Node applications a
+stored in the fleet's object store. This gives Node applications a
 self-hosted alternative to platform-specific Workflow backends.
 
 > [!WARNING]
@@ -81,6 +81,11 @@ object store that meets celld's conditional-write requirements. Refer to the
 [celld documentation](https://github.com/denoland/celld) for fleet and storage
 setup.
 
+No second storage service is required for queue payloads. celld v0.4.0 serves
+the `WORKFLOW_QUEUE_PAYLOADS` binding from the existing fleet bucket under
+`r2/workflow-world-queue-payloads/`. `r2_buckets` is the Wrangler-compatible
+configuration key for that binding; it does not require Cloudflare R2.
+
 Deploy the Queue consumer first, then the primary HTTP worker. The order matters:
 the consumer deploy creates the Queue attachment; the primary deploy must go last
 so it remains the fleet's public application.
@@ -142,7 +147,7 @@ celld worker router
   |-- HookTokenDO    32 stable token-ownership shards
   |-- HookIdDO       32 stable hook-id lookup shards
   |-- StreamDO       stream chunks and run/stream indexes
-  |-- R2             run-bearing queue payload bodies
+  |-- object storage run-bearing queue payload bodies in the fleet bucket
   `-- native Queue producer
           |
           v
@@ -225,7 +230,7 @@ The packaged worker declares an hourly UTC celld cron trigger. Each occurrence
 scans one bounded creation-time catalog page and asks the authoritative run
 cells to enforce the cutoff. A run cell immediately fences reads, writes, stream
 activity, and queue payload work, removes its catalog entry, then finishes the
-existing bounded stream, R2 queue-payload, and run-payload cleanup phases through
+existing bounded stream, object-store queue-payload, and run-payload cleanup phases through
 its durable alarm.
 Repeated cron invocations and alarm retries are idempotent.
 
@@ -243,9 +248,9 @@ step, hook, and stream data remains readable until that deadline. Active and
 pending runs are never eligible for automatic cleanup.
 
 At expiration, the run cell fences new writes and removes the run's derived
-indexes, stream chunks, R2 queue payload objects, and durable run payloads.
+indexes, stream chunks, object-store queue payloads, and durable run payloads.
 Native Queue pointer messages can remain until celld's fixed four-day retention
-expires; a pointer whose R2 body was removed is acknowledged as permanently gone
+expires; a pointer whose object-store body was removed is acknowledged as permanently gone
 and cannot resurrect the run. Cleanup is a persisted, idempotent state machine. Each alarm processes
 one bounded page, persists its progress, and re-arms the next alarm; an
 interrupted phase records its error and retries with capped backoff.
@@ -319,7 +324,7 @@ bucket-backed state. It checks that:
 - an accepted delayed queue message that becomes due while celld is down is
   delivered once after the native broker is restored;
 - the companion Queue consumer can call the primary worker through its service
-  binding and recover run-bearing payloads from R2;
+  binding and recover run-bearing payloads from the fleet object store;
 - multi-page retention cleanup continues from a persisted nonterminal phase;
 - cancelling an in-flight HTTP long poll leaves the stream writable and
   readable.

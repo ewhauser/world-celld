@@ -5,6 +5,10 @@
  */
 import { createRouter, type WorkerEnv } from './router.js';
 import { runRetentionSweep, type RetentionSweepEnv } from './retention-sweep.js';
+import {
+  createQueuePayloadStore,
+  type QueuePayloadObjectStorageBinding,
+} from './queue-payload-store.js';
 
 export { HookIdDO } from './durable-objects/HookIdDO.js';
 export { HookTokenDO } from './durable-objects/HookTokenDO.js';
@@ -18,7 +22,11 @@ interface ScheduledControllerLike {
   cron: string;
 }
 
-async function scheduled(controller: ScheduledControllerLike, env: WorkerEnv): Promise<void> {
+type CelldWorkerEnv = Omit<WorkerEnv, 'WORKFLOW_QUEUE_PAYLOADS'> & {
+  WORKFLOW_QUEUE_PAYLOADS?: QueuePayloadObjectStorageBinding;
+};
+
+async function scheduled(controller: ScheduledControllerLike, env: CelldWorkerEnv): Promise<void> {
   const result = await runRetentionSweep(
     controller.scheduledTime,
     env as unknown as RetentionSweepEnv,
@@ -32,8 +40,13 @@ async function scheduled(controller: ScheduledControllerLike, env: WorkerEnv): P
 }
 
 export default {
-  async fetch(request: Request, env: WorkerEnv): Promise<Response> {
-    return createRouter(env)(request);
+  async fetch(request: Request, env: CelldWorkerEnv): Promise<Response> {
+    return createRouter({
+      ...env,
+      WORKFLOW_QUEUE_PAYLOADS: env.WORKFLOW_QUEUE_PAYLOADS
+        ? createQueuePayloadStore(env.WORKFLOW_QUEUE_PAYLOADS)
+        : undefined,
+    })(request);
   },
   scheduled,
 };

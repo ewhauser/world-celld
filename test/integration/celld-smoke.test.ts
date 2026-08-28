@@ -331,9 +331,21 @@ describe.skipIf(!CONFIGURED)('real celld v0.4.0 native-services restart smoke', 
 
       const mcConfig = join(temporaryRoot, 'mc-config');
       const mcEnv = { ...process.env, MC_CONFIG_DIR: mcConfig };
-      await execFileAsync(MC_BIN!, ['alias', 'set', 'smoke', minioUrl, ACCESS_KEY, SECRET_KEY], {
-        env: mcEnv,
-      });
+      await waitFor(
+        async () => {
+          if (minio?.child.exitCode !== null || minio?.child.signalCode !== null) {
+            throw new Error(`minio exited during client initialization\n${minio?.logs() ?? ''}`);
+          }
+          await execFileAsync(
+            MC_BIN!,
+            ['alias', 'set', 'smoke', minioUrl, ACCESS_KEY, SECRET_KEY],
+            { env: mcEnv },
+          );
+          return true;
+        },
+        30_000,
+        'MinIO client readiness',
+      );
       await execFileAsync(MC_BIN!, ['mb', '--ignore-existing', `smoke/${BUCKET}`], { env: mcEnv });
 
       const workerDirectory = join(temporaryRoot, 'worker');

@@ -580,7 +580,7 @@ describe('terminal workflow retention', () => {
     ).resolves.toEqual({ admitted: true, messageId: 'msg_after_ack' });
   });
 
-  it('cleans an ambiguously published R2 payload through its dedicated orphan alarm', async () => {
+  it('cleans an ambiguously published object-store payload through its orphan alarm', async () => {
     const objects = new Map([['workflow-queue/wrun_orphan/msg_orphan', 'payload']]);
     const deleted: string[] = [];
     const cellEnv: Record<string, unknown> = {};
@@ -668,7 +668,7 @@ describe('terminal workflow retention', () => {
     expect(fleet.cell('runs', queueOrphanName(messageId)).storage.data.size).toBe(0);
   });
 
-  it('deletes R2 queue payloads in bounded, generation-safe pages', async () => {
+  it('deletes object-store queue payloads in bounded, generation-safe pages', async () => {
     let fleet!: FakeFleet;
     let releaseFirst!: () => void;
     const firstStarted = Promise.withResolvers<void>();
