@@ -303,7 +303,6 @@ describe('recorded origin/main IndexDO baseline', () => {
       env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
       deploymentId: 'index-main-retention',
       runRetentionMs: 1,
-      queueShards: 1,
     });
     const runId = 'wrun_main_retention';
     await storage.events.create(runId, {
@@ -336,7 +335,6 @@ describe('recorded origin/main IndexDO baseline', () => {
     try {
       await env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId)).cleanupNow({
         retentionMs: 1,
-        queueShards: 1,
       });
       for (let page = 0; page < 24; page++) {
         harness.fleet.advance(2);

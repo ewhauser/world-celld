@@ -49,7 +49,7 @@ PORT=3000 pnpm start
 curl -X POST http://127.0.0.1:3000/orders/order-1
 ```
 
-`WORKFLOW_BASE_URL` must be reachable **from the fleet** — queue cells push
+`WORKFLOW_BASE_URL` must be reachable **from the fleet** — the native Queue bridge pushes
 step/flow messages back to the app at that address.
 
 For a long-lived local emulated fleet instead: `pnpm fleet:local`.

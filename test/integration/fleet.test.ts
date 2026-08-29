@@ -13,7 +13,7 @@
  *  - storage.transaction + list options (startAfter/end/reverse/start) via
  *    applyEvent + paginated listEvents asc/desc
  *  - Date/Uint8Array fidelity across celld's DO RPC isolate boundary
- *  - alarm semantics via live QueueDO delivery, delay, and rearmAlarm
+ *  - native Queue delivery and delayed re-publication through the companion consumer
  *  - request body limits via a large stream chunk
  */
 import http from 'node:http';
@@ -21,8 +21,6 @@ import type { AddressInfo } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../../src/index.js';
-import { callDO } from '../../src/remote/rpc-client.js';
-import type { QueueStats } from '../../src/worker/durable-objects/QueueDO.js';
 import { RunExpiredError } from '@workflow/errors';
 
 const FLEET_URL = process.env.CELLD_FLEET_URL;
@@ -57,7 +55,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
   let callbackBaseUrl: string;
 
   beforeAll(async () => {
-    process.env.CELLD_QUEUE_MODE = 'cells';
+    process.env.CELLD_QUEUE_MODE = 'native';
 
     listener = http.createServer(async (req, res) => {
       const chunks: Buffer[] = [];
@@ -123,7 +121,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     expect(Array.from(run.input[0] as Uint8Array)).toEqual([0, 1, 2, 253, 254, 255]);
   });
 
-  it('expires terminal payloads across run, stream, index, and queue cells', async () => {
+  it('expires terminal payloads across run, stream, index, and queue object storage', async () => {
     const w = createCelldWorld({
       fleetUrl: transport.fleetUrl,
       secret: transport.secret,
@@ -162,7 +160,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
       'terminal retention cleanup',
     );
     expect(status.deletedStreams).toBe(1);
-    expect(status.deletedQueueMessages).toBe(1);
+    expect(status.deletedQueuePayloads).toBe(1);
     expect(status.deletedPayloadKeys).toBeGreaterThan(0);
     await expect(w.runs.get(runId)).rejects.toSatisfy((error) => RunExpiredError.is(error));
     await expect(w.writeToStream(streamName, runId, 'late')).rejects.toThrow(/expired/);
@@ -219,7 +217,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     expect(chunks.data[1].data[1024 * 1024 - 1]).toBe((1024 * 1024 - 1) % 251);
   });
 
-  it('queue delivery: live cell alarm posts x-vqs to the app', async () => {
+  it('queue delivery: native consumer posts x-vqs to the app', async () => {
     const w = world();
     const marker = randomUUID();
     const before = deliveries.length;
@@ -238,7 +236,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     expect(delivered.headers['x-vqs-message-attempt']).toBe('1');
   });
 
-  it('delayed delivery honors delaySeconds via the cell alarm', async () => {
+  it('delayed delivery honors delaySeconds via the native broker', async () => {
     const w = world();
     const marker = randomUUID();
     const before = deliveries.length;
@@ -280,53 +278,6 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     const mine = deliveries.slice(before).filter((d) => d.body.includes(marker));
     expect(mine[0].respondedWith).toBe(503);
     expect(mine[1].headers['x-vqs-message-attempt']).toBe('1'); // not a counted retry
-  });
-
-  it('dead-letters after max attempts and redrives (slow: ~40s of backoff)', async () => {
-    const w = world();
-    const marker = randomUUID();
-    // 5 permanent-500 responses -> DLQ.
-    for (let i = 0; i < 5; i++) responseQueue.push({ status: 500, body: { error: 'down' } });
-
-    const { messageId } = await w.queue(`__wkf_workflow_dlq_${marker.slice(0, 8)}`, {
-      __healthCheck: true,
-      correlationId: marker,
-    });
-
-    const stats = await waitFor(
-      async () => {
-        const s = await callDO<QueueStats>(transport, 'queue', 'q:0', 'stats', []);
-        return s.deadLetters > 0 ? s : null;
-      },
-      90_000,
-      'dead letter',
-    );
-    expect(stats.deadLetters).toBeGreaterThanOrEqual(1);
-
-    const before = deliveries.length;
-    const redriven = await callDO<{ ok: boolean }>(transport, 'queue', 'q:0', 'redriveDeadLetter', [
-      messageId,
-    ]);
-    expect(redriven.ok).toBe(true);
-
-    await waitFor(
-      async () => deliveries.slice(before).find((d) => d.body.includes(marker)),
-      30_000,
-      'redriven delivery',
-    );
-
-    await callDO(transport, 'queue', 'q:0', 'purgeDeadLetters', []);
-  }, 150_000);
-
-  it('rearmAlarm reports a coherent alarm state', async () => {
-    const { alarmAt } = await callDO<{ alarmAt: number | null }>(
-      transport,
-      'queue',
-      'q:0',
-      'rearmAlarm',
-      [],
-    );
-    expect(alarmAt === null || typeof alarmAt === 'number').toBe(true);
   });
 });
 

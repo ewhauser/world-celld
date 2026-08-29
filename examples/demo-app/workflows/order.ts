@@ -20,7 +20,7 @@ async function shipOrder(orderId: string) {
 
 /**
  * Demo workflow exercising the three world primitives on celld:
- * steps + sleep (queue cells), a hook (index + run cells), and the run's
+ * steps + sleep (native Queue), a hook (index + run cells), and the run's
  * output stream (stream cells).
  */
 export async function processOrder(orderId: string) {

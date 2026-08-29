@@ -12,7 +12,7 @@ vinnymac/worlds:
     src/apply-event.ts
     src/storage.ts
     src/streamer.ts
-    src/queue.ts               (modified: Cloudflare Queues replaced by QueueDO)
+    src/queue.ts               (modified: Cloudflare Queues adapted to celld Queues and R2)
     src/test-mocks.ts          (modified)
     src/util.ts
     src/worker/durable-objects/WorkflowRunDO.ts

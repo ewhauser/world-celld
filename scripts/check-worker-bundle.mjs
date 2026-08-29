@@ -11,37 +11,38 @@
  */
 import { build } from 'esbuild';
 
-const result = await build({
-  entryPoints: ['dist/worker.js'],
-  bundle: true,
-  format: 'esm',
-  platform: 'browser',
-  target: 'es2024',
-  conditions: ['workerd', 'worker', 'browser'],
-  external: ['cloudflare:*'],
-  write: false,
-  logLevel: 'silent',
-}).catch((error) => {
-  console.error('worker bundle check FAILED — dist/worker.js is not celld-deployable:');
-  for (const err of error.errors ?? [{ text: String(error) }]) {
-    console.error(`  ${err.text}`);
+for (const entryPoint of ['dist/worker.js', 'dist/queue-consumer.js']) {
+  const result = await build({
+    entryPoints: [entryPoint],
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    target: 'es2024',
+    conditions: ['workerd', 'worker', 'browser'],
+    external: ['cloudflare:*'],
+    write: false,
+    logLevel: 'silent',
+  }).catch((error) => {
+    console.error(`worker bundle check FAILED — ${entryPoint} is not celld-deployable:`);
+    for (const err of error.errors ?? [{ text: String(error) }]) {
+      console.error(`  ${err.text}`);
+    }
+    process.exit(1);
+  });
+
+  const bundled = result.outputFiles[0].text;
+  const nodeImport = bundled.match(/from\s*["']node:[^"']+["']/);
+  if (nodeImport) {
+    console.error(`worker bundle check FAILED — Node built-in survived bundling: ${nodeImport[0]}`);
+    process.exit(1);
   }
-  process.exit(1);
-});
 
-const bundled = result.outputFiles[0].text;
-const nodeImport = bundled.match(/from\s*["']node:[^"']+["']/);
-if (nodeImport) {
-  console.error(`worker bundle check FAILED — Node built-in survived bundling: ${nodeImport[0]}`);
-  process.exit(1);
+  // workerd has no Buffer global; catch references that esbuild cannot.
+  const bufferUse = bundled.match(/\bBuffer\.(from|byteLength|alloc|concat)\b/);
+  if (bufferUse) {
+    console.error(`worker bundle check FAILED — Buffer usage in worker bundle: ${bufferUse[0]}`);
+    process.exit(1);
+  }
 }
 
-// workerd has no Buffer global (eve-ambient's celld build check treats any
-// Buffer usage as a deploy blocker); catch references that esbuild can't.
-const bufferUse = bundled.match(/\bBuffer\.(from|byteLength|alloc|concat)\b/);
-if (bufferUse) {
-  console.error(`worker bundle check FAILED — Buffer usage in worker bundle: ${bufferUse[0]}`);
-  process.exit(1);
-}
-
-console.log('worker bundle check OK — dist/worker.js bundles cleanly under workerd conditions');
+console.log('worker bundle check OK — both celld workers bundle cleanly under workerd conditions');

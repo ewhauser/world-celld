@@ -4,7 +4,8 @@ A [Workflow DevKit](https://useworkflow.dev) `World` backed by
 [celld](https://github.com/denoland/celld).
 
 `world-celld` stores workflow runs, hooks, and streams in celld cells. Scheduled
-work is delivered with durable cell alarms. This gives Node applications a
+work is delivered through celld's native Queues, with run-bearing message bodies
+stored in the fleet's object store. This gives Node applications a
 self-hosted alternative to platform-specific Workflow backends.
 
 > [!WARNING]
@@ -15,7 +16,7 @@ self-hosted alternative to platform-specific Workflow backends.
 
 - Workflow run, step, event, and hook persistence
 - Durable streams
-- Delayed work, retries, deduplication, and dead-letter storage
+- Delayed work, retries, consumer-side deduplication, and dead-letter routing
 - Configurable cleanup of terminal workflow payloads
 - An authenticated HTTP connection between a Node application and a celld fleet
 - An in-process fleet for local development and conformance testing
@@ -70,20 +71,29 @@ const world = createCelldWorld({
 });
 ```
 
-`WORKFLOW_BASE_URL` (or `baseUrl`) is where queue cells deliver flow and step
+`WORKFLOW_BASE_URL` (or `baseUrl`) is where the native Queue bridge delivers flow
 requests. It must be reachable from every celld node.
 
 ## Deploy the worker
 
-Before deploying, you need a celld v0.3.0 fleet, `esbuild` on `PATH`, and an
-object store that meets celld's conditional-write requirements. v0.3.0 is the
-currently tested runtime baseline. Refer to the
+Before deploying, you need a celld v0.4.0 fleet, `esbuild` on `PATH`, and an
+object store that meets celld's conditional-write requirements. Refer to the
 [celld documentation](https://github.com/denoland/celld) for fleet and storage
 setup.
+
+No second storage service is required for queue payloads. celld v0.4.0 serves
+the `WORKFLOW_QUEUE_PAYLOADS` binding from the existing fleet bucket under
+`r2/workflow-world-queue-payloads/`. `r2_buckets` is the Wrangler-compatible
+configuration key for that binding; it does not require Cloudflare R2.
+
+Deploy the Queue consumer first, then the primary HTTP worker. The order matters:
+the consumer deploy creates the Queue attachment; the primary deploy must go last
+so it remains the fleet's public application.
 
 From a source checkout:
 
 ```sh
+celld deploy ./celld-queue-worker --bucket s3://my-cells-bucket
 celld deploy ./celld-worker --bucket s3://my-cells-bucket
 ```
 
@@ -91,8 +101,15 @@ From an installed package, first copy the deployable worker into your project:
 
 ```sh
 cp -R node_modules/@ewhauser/world-celld/celld-worker ./workflow-world
+cp -R node_modules/@ewhauser/world-celld/celld-queue-worker ./workflow-world-queue
+celld deploy ./workflow-world-queue --bucket s3://my-cells-bucket
 celld deploy ./workflow-world --bucket s3://my-cells-bucket
 ```
+
+This is a hard queue cutover. Existing `QueueDO` messages and dead letters are
+not migrated into celld's native Queue; drain or otherwise account for them
+before upgrading an existing fleet. The old QueueDO cell data becomes
+unreachable after the binding is removed.
 
 The worker rejects stateful requests unless `WORLD_SECRET` is configured. Pass
 the same secret to the fleet and the application:
@@ -113,7 +130,8 @@ the worker RPC routes, not celld's administrative endpoints.
 The example sets a fleet-wide maximum workflow age of 90 days. Leave
 `WORKFLOW_RETENTION_MS` at `0` to disable that policy.
 
-More deployment detail is in [`celld-worker/README.md`](./celld-worker/README.md).
+More deployment detail is in [`celld-worker/README.md`](./celld-worker/README.md)
+and [`celld-queue-worker/README.md`](./celld-queue-worker/README.md).
 
 ## How it works
 
@@ -129,11 +147,14 @@ celld worker router
   |-- HookTokenDO    32 stable token-ownership shards
   |-- HookIdDO       32 stable hook-id lookup shards
   |-- StreamDO       stream chunks and run/stream indexes
-  `-- QueueDO        delayed delivery, retries, and dead letters
+  |-- object storage run-bearing queue payload bodies in the fleet bucket
+  `-- native Queue producer
           |
-          | HTTP callbacks
           v
-Workflow application /.well-known/workflow/v1/flow
+native Queue --> companion consumer --> service binding --> worker router
+                                                        |
+                                                        v
+                         Workflow application /.well-known/workflow/v1/flow
 ```
 
 The application-side package implements the Workflow `World` interface and
@@ -147,8 +168,8 @@ Index routing is a versioned hard-cutover protocol. Run catalog writes hash the
 natural keys across 32 shards each. A single stateless worker request queries
 all 16 catalog shards in parallel and merges their lexicographic pages before
 authoritative RunDO reads. The RunDO is also the only permanent lifecycle
-authority: hook shards consult it directly, while queue and catalog expiry
-fences compact after bounded protocol leases. Token and hook-ID admission are
+authority: hook shards and queue idempotency claims consult it directly, while
+catalog expiry fences compact after bounded protocol leases. Token and hook-ID admission are
 each transactional inside their natural-key shards. Exact claim IDs plus a
 serialized cancellation fence resolve ambiguous delivery without pretending
 the two ownership shards form a cross-Durable-Object transaction. Stateless cohesive index routes keep
@@ -172,7 +193,6 @@ variable is shown below.
 | `secret`                | `CELLD_WORLD_SECRET`     | required with `fleetUrl` |
 | `baseUrl`               | `WORKFLOW_BASE_URL`      | `http://localhost:$PORT` |
 | `deploymentId`          | `CELLD_DEPLOYMENT_ID`    | `celld-default`          |
-| `queueShards`           | —                        | `1`                      |
 | `runRetentionMs`        | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
 | `streamLongPollMs`      | —                        | `20000`                  |
 | `streamFlushIntervalMs` | —                        | `0`                      |
@@ -180,30 +200,22 @@ variable is shown below.
 
 The deployed worker also accepts these celld variables:
 
-| Variable                          | Default  | Purpose                                              |
-| --------------------------------- | -------- | ---------------------------------------------------- |
-| `WORLD_SECRET`                    | none     | Required bearer secret for RPC routes                |
-| `WORKFLOW_CALLBACK_SECRET`        | none     | Sent with deliveries as `x-workflow-callback-secret` |
-| `QUEUE_MAX_ATTEMPTS`              | `5`      | Attempts before a message is dead-lettered           |
-| `QUEUE_MAX_INFLIGHT`              | `5`      | Concurrent deliveries per queue cell (maximum `128`) |
-| `QUEUE_DELIVERY_TIMEOUT_MS`       | `300000` | Callback timeout (maximum `300000`)                  |
-| `WORKFLOW_RETENTION_MS`           | `0`      | Maximum run age from creation; includes active runs  |
-| `WORKFLOW_RETENTION_BATCH_SIZE`   | `128`    | Runs admitted by each cron sweep (maximum `1000`)    |
-| `WORKFLOW_RETENTION_QUEUE_SHARDS` | `1`      | Queue-shard fallback for older runs                  |
-
-`queueShards` is part of queue placement and is pinned when a queue cell is
-first used. It may be any positive safe integer; the `128` storage-operation
-batch limit does not cap the fleet's total shard count. Drain pending work
-before changing it.
+| Variable                        | Default | Purpose                                              |
+| ------------------------------- | ------- | ---------------------------------------------------- |
+| `WORLD_SECRET`                  | none    | Required bearer secret for RPC routes                |
+| `WORKFLOW_CALLBACK_SECRET`      | none    | Sent with deliveries as `x-workflow-callback-secret` |
+| `WORKFLOW_RETENTION_MS`         | `0`     | Maximum run age from creation; includes active runs  |
+| `WORKFLOW_RETENTION_BATCH_SIZE` | `128`   | Runs admitted by each cron sweep (maximum `1000`)    |
 
 Queue deadlines use fixed-width 13-digit epoch-millisecond keys. A requested
 `delaySeconds` or handler redelivery timeout is accepted only when its deadline
-is at most `9999999669998`, leaving 330,001 ms for a fresh alarm edge and the
-maximum delivery lease. Every derived due, retry, inflight, and GC deadline is
-checked against the absolute `9999999999999` limit. A production retry which
-cannot preserve that headroom is dead-lettered instead of clamped or rescheduled;
-the test pump terminates the equivalent in-memory message. Long test-mode waits
-are chunked at the host timer limit without changing this deadline contract.
+leaves room for the 15-minute idempotency-claim window below the absolute
+`9999999999999` limit. A suspension that cannot preserve that headroom becomes
+a normal broker retry instead of being clamped. celld's native
+producer delay is capped at 86,400 seconds, so the consumer chains longer waits
+while preserving the absolute deadline and stable message identity. Long
+test-mode waits are chunked at the host timer limit without changing this
+deadline contract.
 
 ## Workflow retention
 
@@ -217,8 +229,9 @@ failed, and cancelled runs.
 The packaged worker declares an hourly UTC celld cron trigger. Each occurrence
 scans one bounded creation-time catalog page and asks the authoritative run
 cells to enforce the cutoff. A run cell immediately fences reads, writes, stream
-activity, and queue work, removes its catalog entry, then finishes the existing
-bounded stream, queue, and payload cleanup phases through its durable alarm.
+activity, and queue payload work, removes its catalog entry, then finishes the
+existing bounded stream, object-store queue-payload, and run-payload cleanup phases through
+its durable alarm.
 Repeated cron invocations and alarm retries are idempotent.
 
 One occurrence admits at most `WORKFLOW_RETENTION_BATCH_SIZE` runs (default
@@ -226,11 +239,6 @@ One occurrence admits at most `WORKFLOW_RETENTION_BATCH_SIZE` runs (default
 backlog, later occurrences continue with the next oldest entries. Edit
 `triggers.crons` in the copied `celld-worker/wrangler.jsonc` if hourly discovery
 does not provide the desired expiration resolution or catch-up rate.
-
-New runs persist the application's `queueShards` value for complete queue
-cleanup. `WORKFLOW_RETENTION_QUEUE_SHARDS` is the fallback for runs created
-before that metadata existed and must match the placement used by those runs.
-Both values may be any positive safe integer.
 
 ### Terminal payload retention
 
@@ -240,8 +248,10 @@ step, hook, and stream data remains readable until that deadline. Active and
 pending runs are never eligible for automatic cleanup.
 
 At expiration, the run cell fences new writes and removes the run's derived
-indexes, stream chunks, pending and dead-letter queue messages, and durable run
-payloads. Cleanup is a persisted, idempotent state machine. Each alarm processes
+indexes, stream chunks, object-store queue payloads, and durable run payloads.
+Native Queue pointer messages can remain until celld's fixed four-day retention
+expires; a pointer whose object-store body was removed is acknowledged as permanently gone
+and cannot resurrect the run. Cleanup is a persisted, idempotent state machine. Each alarm processes
 one bounded page, persists its progress, and re-arms the next alarm; an
 interrupted phase records its error and retries with capped backoff.
 
@@ -273,10 +283,8 @@ fleet-wide maximum age are both enabled, the earlier deadline wins.
 
 - Delivery is at least once. Workflow steps and other external side effects
   must be idempotent.
-- Queue cells expose `stats`, `listDeadLetters`, `redriveDeadLetter`,
-  `purgeDeadLetters`, and `rearmAlarm` through the authenticated RPC endpoint.
-  `purgeDeadLetters` deletes at most 128 entries per call; repeat it while its
-  result reports `hasMore`.
+- Native Queue operations are administered with celld's `queue info`, `peek`,
+  `pause`, `resume`, `purge`, and `redrive` commands.
 - Run cells expose retention status, scheduling, immediate cleanup, and alarm
   recovery through `world.retention`.
 - A new application URL applies to newly enqueued messages. Existing messages
@@ -307,14 +315,16 @@ pnpm test:integration
 
 ### Real celld restart smoke
 
-The required CI smoke owns native celld v0.3.0 and MinIO processes on loopback,
+The required CI smoke owns native celld v0.4.0 and MinIO processes on loopback,
 uses fresh temporary bucket and runtime state, and kills celld with `SIGKILL`
 before deleting its local working state and starting a new process against the
 bucket-backed state. It checks that:
 
 - acknowledged run and stream state survives the process restart;
 - an accepted delayed queue message that becomes due while celld is down is
-  delivered once after the alarm is restored;
+  delivered once after the native broker is restored;
+- the companion Queue consumer can call the primary worker through its service
+  binding and recover run-bearing payloads from the fleet object store;
 - multi-page retention cleanup continues from a persisted nonterminal phase;
 - cancelling an in-flight HTTP long poll leaves the stream writable and
   readable.
@@ -340,7 +350,8 @@ message reaches a successful callback, including forced `503` redeliveries. A
 second workload creates terminal runs with streams and delayed queue messages,
 then verifies complete payload cleanup without resurrection. Results include
 queue and cleanup throughput plus p50, p95, p99, and maximum latency and are
-saved under `.perf-results/`. The harness currently pins celld v0.3.0.
+saved under `.perf-results/`. The harness pins celld v0.4.0 and deploys the same
+two-script native Queue topology as the restart smoke.
 
 > MinIO Community is **not a supported celld production store**. It does not
 > implement the conditional writes celld needs for ownership fencing. This
@@ -354,43 +365,10 @@ With Docker and the Compose plugin installed, run:
 pnpm test:perf:minio
 ```
 
-The defaults send 1,000 messages with concurrency 32 across two queue cells,
-and force every twentieth message through one `503` redelivery.
-
-#### Reference result
-
-The following directional baseline was recorded on August 21, 2026. MinIO and
-celld ran as native arm64 processes because Docker was unavailable on the test
-machine; container results will differ.
-
-| Environment | Value                                                                                                    |
-| ----------- | -------------------------------------------------------------------------------------------------------- |
-| Machine     | MacBook Pro (Mac15,8), Apple M3 Max, 16 cores (12 performance, 4 efficiency), 64 GB RAM                  |
-| OS          | macOS 26.5.2 (25F84), arm64                                                                              |
-| Services    | celld v0.3.0; MinIO RELEASE.2025-09-07T16-13-09Z                                                         |
-| Workload    | 1,000 messages; concurrency 32; 2 queue shards; 256-byte target payload; every 20th message retried once |
-
-| Metric                  |                                                                            Result |
-| ----------------------- | --------------------------------------------------------------------------------: |
-| Delivery integrity      | 1,000 accepted, 1,000 delivered, 0 missing, 0 duplicate successes, 0 dead letters |
-| Callback attempts       |                                           1,050, including 50 forced redeliveries |
-| Enqueue throughput      |                                                                 865.66 messages/s |
-| Delivery throughput     |                                                                 794.60 messages/s |
-| Enqueue latency         |                          p50 26.06 ms; p95 70.72 ms; p99 146.59 ms; max 157.70 ms |
-| All delivery latency    |                         p50 65.05 ms; p95 184.47 ms; p99 225.10 ms; max 328.75 ms |
-| First-attempt latency   |                         p50 63.65 ms; p95 177.93 ms; p99 209.38 ms; max 226.86 ms |
-| Retried-message latency |                        p50 114.81 ms; p95 286.35 ms; p99 328.75 ms; max 328.75 ms |
-| Final queue state       |                         0 pending, 0 in flight, 0 dead letters across both shards |
-
-The retention workload in the same run tombstoned 100 of 100 terminal runs,
-expired all 100 reads, deleted 400 payload keys, 100 streams, and 100 delayed
-queue messages, and left both queue shards empty.
-
-Use these numbers as a smoke-test reference, not a portable performance
-guarantee. For regression tracking, compare repeated runs on the same machine
-and runtime configuration. Two shards gave the best latency balance for this
-workload; benchmark your own traffic before changing the shard count. A fleet
-pins its shard count on first use, so changing it requires draining the queues.
+The defaults send 1,000 messages with concurrency 32 and force every twentieth
+message through one `503` redelivery. The old QueueDO/shard baseline is not
+comparable to the native celld Queue path and was intentionally removed; record
+a fresh machine-specific baseline before enabling budgets.
 
 Override the workload or set machine-specific regression budgets with
 environment variables:
@@ -398,18 +376,17 @@ environment variables:
 ```sh
 PERF_MESSAGES=10000 \
 PERF_CONCURRENCY=64 \
-PERF_QUEUE_SHARDS=16 \
 PERF_MIN_DELIVERY_PER_SECOND=100 \
 PERF_MAX_DELIVERY_P99_MS=5000 \
 pnpm test:perf:minio
 ```
 
 Useful controls are `PERF_PAYLOAD_BYTES`, `PERF_RETRY_EVERY`,
-`PERF_TIMEOUT_MS`, `PERF_QUEUE_MAX_INFLIGHT`,
+`PERF_TIMEOUT_MS`,
 `PERF_MIN_ENQUEUE_PER_SECOND`, `PERF_MIN_DELIVERY_PER_SECOND`, and
 `PERF_MAX_DELIVERY_P99_MS`. Throughput and latency budgets default to disabled
-because local machines vary. Message-loss, dead-letter, message-ID, queue-drain,
-and duplicate-success checks are always enforced.
+because local machines vary. Message-loss, message-ID, callback validity, and
+duplicate-success checks are always enforced.
 
 Bug reports and focused pull requests are welcome. Please include a regression
 test for behavior changes and run the checks above before submitting a PR.

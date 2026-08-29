@@ -24,6 +24,7 @@ export default defineConfig([
   {
     entry: {
       worker: 'src/worker/worker.ts',
+      'queue-consumer': 'src/worker/queue-consumer.ts',
     },
     format: 'esm',
     dts: true,

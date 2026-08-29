@@ -31,8 +31,6 @@ export interface RetentionSweepEnv {
   WORKFLOW_RETENTION_MS?: string | number;
   /** Maximum catalog entries admitted by one cron occurrence. */
   WORKFLOW_RETENTION_BATCH_SIZE?: string | number;
-  /** Queue-shard fallback for runs created before placement was persisted. */
-  WORKFLOW_RETENTION_QUEUE_SHARDS?: string | number;
 }
 
 export interface RetentionSweepResult {
@@ -116,12 +114,6 @@ export async function runRetentionSweep(
     1,
     MAX_RETENTION_SWEEP_BATCH_SIZE,
   );
-  const queueShards = strictIntegerSetting(
-    'world-celld: WORKFLOW_RETENTION_QUEUE_SHARDS',
-    env.WORKFLOW_RETENTION_QUEUE_SHARDS,
-    1,
-    1,
-  );
   const cutoff = scheduledTime - retentionMs;
   const runNamespace = requireNamespace('WORKFLOW_DB', env.WORKFLOW_DB);
   const catalogNamespace = requireNamespace('WORKFLOW_RUN_CATALOG', env.WORKFLOW_RUN_CATALOG);
@@ -162,7 +154,7 @@ export async function runRetentionSweep(
           return { state: 'invalid', preserved: !deleted.deleted } as const;
         }
         const run = runNamespace.get(runNamespace.idFromName(runId));
-        const outcome = await run.enforceRetention({ retentionMs, queueShards, scheduledTime });
+        const outcome = await run.enforceRetention({ retentionMs, scheduledTime });
         if (outcome.state === 'missing' || outcome.state === 'not-due') {
           const deleted = await catalog.deleteStaleGlobalRun(runId, entry.name, entry.value);
           return { state: outcome.state, preserved: !deleted.deleted };

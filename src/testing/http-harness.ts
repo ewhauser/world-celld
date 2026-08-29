@@ -7,15 +7,17 @@ import type { AddressInfo } from 'node:net';
 import { createRouter, type WorkerEnv } from '../worker/router.js';
 import { HookIdDO } from '../worker/durable-objects/HookIdDO.js';
 import { HookTokenDO } from '../worker/durable-objects/HookTokenDO.js';
-import { QueueDO } from '../worker/durable-objects/QueueDO.js';
 import { RunCatalogDO } from '../worker/durable-objects/RunCatalogDO.js';
 import { StreamDO } from '../worker/durable-objects/StreamDO.js';
 import { WorkflowRunDO } from '../worker/durable-objects/WorkflowRunDO.js';
+import { createQueuePayloadStore } from '../worker/queue-payload-store.js';
 import { FakeFleet } from './fake-cell.js';
 
 export interface Harness {
   url: string;
   fleet: FakeFleet;
+  queueMessages: string[];
+  queuePayloads: ReadonlyMap<string, string>;
   close(): Promise<void>;
 }
 
@@ -23,7 +25,7 @@ export interface HarnessOptions {
   secret?: string;
   /** Use FakeFleet's manually advanced clock instead of wall-clock time. */
   virtualClock?: boolean;
-  /** Additional cell classes by binding key (e.g. { queue: QueueDO }). */
+  /** Additional cell classes by binding key. */
   extraClasses?: Record<string, new (ctx: unknown, env: unknown) => object>;
   /** env passed to cell constructors (celld `vars`). */
   cellEnv?: Record<string, unknown>;
@@ -31,6 +33,25 @@ export interface HarnessOptions {
 
 export async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
   const cellEnv = { ...options.cellEnv };
+  const queueMessages: string[] = [];
+  const queuePayloads = new Map<string, string>();
+  const queuePayloadBucket = {
+    async put(key: string, value: string) {
+      queuePayloads.set(key, value);
+    },
+    async get(key: string) {
+      const value = queuePayloads.get(key);
+      return value === undefined ? null : { text: async () => value };
+    },
+    async delete(keys: string | string[]) {
+      for (const key of Array.isArray(keys) ? keys : [keys]) queuePayloads.delete(key);
+    },
+  };
+  const nativeQueue = {
+    async send(body: string) {
+      queueMessages.push(body);
+    },
+  };
   const fleet = new FakeFleet(
     {
       runs: WorkflowRunDO as never,
@@ -38,7 +59,6 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
       'run-catalog': RunCatalogDO as never,
       'hook-tokens': HookTokenDO as never,
       'hook-ids': HookIdDO as never,
-      queue: QueueDO as never,
       ...options.extraClasses,
     },
     cellEnv,
@@ -54,7 +74,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     WORKFLOW_RUN_CATALOG: fleet.namespace('run-catalog'),
     WORKFLOW_HOOK_TOKENS: fleet.namespace('hook-tokens'),
     WORKFLOW_HOOK_IDS: fleet.namespace('hook-ids'),
-    WORKFLOW_QUEUE: fleet.namespace('queue'),
+    WORKFLOW_QUEUE_PAYLOADS: queuePayloadBucket,
   });
 
   const env: WorkerEnv = {
@@ -63,7 +83,8 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     WORKFLOW_RUN_CATALOG: fleet.namespace('run-catalog'),
     WORKFLOW_HOOK_TOKENS: fleet.namespace('hook-tokens'),
     WORKFLOW_HOOK_IDS: fleet.namespace('hook-ids'),
-    WORKFLOW_QUEUE: fleet.namespace('queue'),
+    WORKFLOW_QUEUE: nativeQueue,
+    WORKFLOW_QUEUE_PAYLOADS: createQueuePayloadStore(queuePayloadBucket),
     WORLD_SECRET: options.secret,
   };
 
@@ -113,6 +134,8 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   return {
     url: `http://127.0.0.1:${port}`,
     fleet,
+    queueMessages,
+    queuePayloads,
     close: () =>
       new Promise<void>((resolve, reject) => {
         // Test clients may retain an active keep-alive connection after their

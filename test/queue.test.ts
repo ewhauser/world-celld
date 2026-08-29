@@ -1,13 +1,13 @@
 /**
  * Queue tests, derived from world-cloudflare's queue.test.ts (Apache-2.0,
- * see NOTICE) and adapted for the celld design: the producer enqueues into
- * QueueDO cells instead of Cloudflare Queues, and the handler speaks the
+ * see NOTICE) and adapted for the celld design: the producer publishes into
+ * celld's native Queue binding, and the handler speaks the
  * single x-vqs dialect with permanent-error statuses.
  */
 import { SPEC_VERSION_CURRENT, type ValidQueueName } from '@workflow/world';
 import { WorkflowWorldError } from '@workflow/errors';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createQueue, shardFor } from '../src/queue.js';
+import { createQueue } from '../src/queue.js';
 import { parse, stringify } from '../src/vendor/shared/index.js';
 import { clearMockData, createMockEnv, recordedEnqueues } from '../src/test-mocks.js';
 import { MAX_QUEUE_SCHEDULE_TIMESTAMP_MS } from '../src/lifecycle.js';
@@ -32,7 +32,7 @@ function vqsRequest(
 
 type QueueMessageHandler = Parameters<ReturnType<typeof createQueue>['createQueueHandler']>[1];
 
-describe('Queue (celld QueueDO integration)', () => {
+describe('Queue (celld native Queue integration)', () => {
   let mockEnv: ReturnType<typeof createMockEnv>;
   let queue: ReturnType<typeof createQueue>;
 
@@ -53,8 +53,6 @@ describe('Queue (celld QueueDO integration)', () => {
   });
 
   it.each([
-    ['queueShards', 0],
-    ['queueShards', Number.MAX_SAFE_INTEGER + 1],
     ['httpTimeoutMs', 0],
     ['httpTimeoutMs', 300_001],
     ['maxAttempts', 0],
@@ -69,16 +67,6 @@ describe('Queue (celld QueueDO integration)', () => {
         [name]: value,
       }),
     ).toThrow(name);
-  });
-
-  it.each([129, Number.MAX_SAFE_INTEGER])('accepts queueShards=%s', (queueShards) => {
-    expect(() =>
-      createQueue({
-        env: { WORKFLOW_QUEUE: mockEnv.WORKFLOW_QUEUE },
-        deploymentId: 'test-deployment',
-        queueShards,
-      }),
-    ).not.toThrow();
   });
 
   it('requires the queue binding before constructing the queue', () => {
@@ -102,40 +90,39 @@ describe('Queue (celld QueueDO integration)', () => {
       });
     });
 
-    it('should enqueue into a queue cell with a tagged-JSON body', async () => {
+    it('publishes a native queue envelope with a tagged-JSON body', async () => {
       const queueName = '__wkf_workflow_test' as ValidQueueName;
       const message = { runId: 'wrun_test_message', stepId: 'step_test' };
 
       const result = await queue.queue(queueName, message);
 
       expect(recordedEnqueues).toHaveLength(1);
-      const enq = recordedEnqueues[0];
-      expect(enq.cellName).toBe('q:0');
+      const enq = recordedEnqueues[0].envelope;
+      expect(enq.version).toBe(1);
       expect(enq.queueName).toBe(queueName);
-      expect(enq.pathname).toBe('flow');
       expect(enq.messageId).toMatch(/^msg_/);
-      expect(parse(enq.body)).toEqual(message);
-      expect(enq.config).toEqual({
-        targetBaseUrl: 'http://app.internal:3000',
-        queueShards: 1,
-      });
+      expect(parse(enq.body!)).toEqual(message);
+      expect(enq.targetBaseUrl).toBe('http://app.internal:3000');
+      expect(enq.runId).toBe(message.runId);
       expect(result.messageId).toBe(enq.messageId);
     });
 
-    it('should route workflow queues to the flow pathname', async () => {
+    it('preserves the workflow queue name', async () => {
       await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD);
-      expect(recordedEnqueues[0].pathname).toBe('flow');
+      expect(recordedEnqueues[0].envelope.queueName).toBe('__wkf_workflow_test');
     });
 
     it('should include the idempotency key in the enqueue request', async () => {
       const idempotencyKey = 'unique-key-123';
       await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD, { idempotencyKey });
-      expect(recordedEnqueues[0].idempotencyKey).toBe(idempotencyKey);
+      expect(recordedEnqueues[0].envelope.idempotencyKey).toBe(idempotencyKey);
     });
 
-    it('should pass delaySeconds through to the queue cell', async () => {
+    it('passes native delay and preserves the absolute delivery deadline', async () => {
+      vi.useFakeTimers({ now: 1_000_000 });
       await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD, { delaySeconds: 42 });
-      expect(recordedEnqueues[0].delaySeconds).toBe(42);
+      expect(recordedEnqueues[0].options).toEqual({ delaySeconds: 42 });
+      expect(recordedEnqueues[0].envelope.notBefore).toBe(1_042_000);
     });
 
     it.each([-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_QUEUE_DELAY_SECONDS + 1])(
@@ -162,7 +149,7 @@ describe('Queue (celld QueueDO integration)', () => {
       expect(first.messageId).not.toBe(second.messageId);
     });
 
-    it('should return the original messageId when the cell dedups on idempotencyKey', async () => {
+    it('deduplicates production messages on idempotencyKey while inflight', async () => {
       const first = await queue.queue(
         '__wkf_workflow_a',
         { ...WORKFLOW_PAYLOAD, stepId: 'step_1' },
@@ -176,6 +163,7 @@ describe('Queue (celld QueueDO integration)', () => {
 
       expect(second.messageId).toBe(first.messageId);
       expect(recordedEnqueues).toHaveLength(1);
+      expect(recordedEnqueues[0].envelope.idempotencyKey).toBe('step-abc');
     });
 
     it('should round-trip Uint8Array payloads (binary-safe transport)', async () => {
@@ -190,25 +178,9 @@ describe('Queue (celld QueueDO integration)', () => {
         },
       });
 
-      const body = parse<{ runInput: { input: Uint8Array } }>(recordedEnqueues[0].body);
+      const body = parse<{ runInput: { input: Uint8Array } }>(recordedEnqueues[0].envelope.body!);
       expect(body.runInput.input).toBeInstanceOf(Uint8Array);
       expect(Array.from(body.runInput.input)).toEqual([0, 1, 2, 250, 251, 252]);
-    });
-
-    it('should shard on idempotencyKey so equal keys land on the same cell', async () => {
-      queue = createQueue({
-        env: { WORKFLOW_QUEUE: mockEnv.WORKFLOW_QUEUE },
-        deploymentId: 'test-deployment',
-        baseUrl: 'http://app.internal:3000',
-        queueShards: 4,
-      });
-
-      await queue.queue('__wkf_workflow_a', WORKFLOW_PAYLOAD, { idempotencyKey: 'k-1' });
-      await queue.queue('__wkf_workflow_b', WORKFLOW_PAYLOAD, { idempotencyKey: 'k-1' });
-
-      // Cell-level dedup on the same key means only the first enqueue lands.
-      expect(recordedEnqueues).toHaveLength(1);
-      expect(recordedEnqueues[0].cellName).toBe(`q:${shardFor('k-1', 4)}`);
     });
   });
 
@@ -221,7 +193,7 @@ describe('Queue (celld QueueDO integration)', () => {
       });
     });
 
-    it('should not enqueue into queue cells in test mode', async () => {
+    it('should not publish to the native Queue in test mode', async () => {
       await queue.queue('__wkf_workflow_q', WORKFLOW_PAYLOAD);
       expect(recordedEnqueues).toHaveLength(0);
     });
@@ -553,30 +525,6 @@ describe('Queue (celld QueueDO integration)', () => {
       });
       await expect(queue.start()).resolves.toBeUndefined();
       await queue.start();
-    });
-  });
-
-  describe('shardFor()', () => {
-    it('is stable and within range', () => {
-      for (const key of ['a', 'b', 'step-123', 'msg_x']) {
-        const shard = shardFor(key, 8);
-        expect(shard).toBe(shardFor(key, 8));
-        expect(shard).toBeGreaterThanOrEqual(0);
-        expect(shard).toBeLessThan(8);
-      }
-      expect(shardFor('anything', 1)).toBe(0);
-    });
-
-    it.each([0, 1.5, Number.MAX_SAFE_INTEGER + 1])(
-      'rejects an invalid shard count %s',
-      (shards) => {
-        expect(() => shardFor('anything', shards)).toThrow(/queueShards/);
-      },
-    );
-
-    it.each([129, Number.MAX_SAFE_INTEGER])('accepts a positive safe shard count %s', (shards) => {
-      expect(shardFor('anything', shards)).toBeGreaterThanOrEqual(0);
-      expect(shardFor('anything', shards)).toBeLessThan(shards);
     });
   });
 });

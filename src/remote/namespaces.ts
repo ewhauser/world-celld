@@ -11,7 +11,8 @@ import {
   type HookTokenShardStub,
   type RunCatalogShardStub,
 } from '../indexes.js';
-import type { QueueCellStub } from '../queue.js';
+import type { CelldQueueProducer } from '../queue.js';
+import type { NativeQueueSendResult } from '../queue-protocol.js';
 import type { WorkflowRunDOStub } from '../storage.js';
 import type { StreamDOStub } from '../streamer.js';
 import { callDO, callFleetRoute, type RpcTransport } from './rpc-client.js';
@@ -81,27 +82,6 @@ function makeStreamNamespace(transport: RpcTransport) {
     },
   };
 }
-
-const QUEUE: MethodSpec = {
-  methods: [
-    'enqueue',
-    'stats',
-    'listDeadLetters',
-    'redriveDeadLetter',
-    'purgeDeadLetters',
-    'rearmAlarm',
-    'expireRun',
-    'acknowledgeExpireRun',
-  ],
-  mutating: new Set([
-    'enqueue',
-    'redriveDeadLetter',
-    'purgeDeadLetters',
-    'rearmAlarm',
-    'expireRun',
-    'acknowledgeExpireRun',
-  ]),
-};
 
 function makeStub<T>(transport: RpcTransport, binding: string, name: string, spec: MethodSpec): T {
   const stub: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
@@ -185,6 +165,13 @@ export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
       releaseHookIndexes: (request) =>
         callFleetRoute(transport, '/v1/index/hooks/release', [request], { idempotent: true }),
     },
-    WORKFLOW_QUEUE: makeNamespace<QueueCellStub>(transport, 'queue', QUEUE),
+    WORKFLOW_QUEUE: {
+      send: (envelope, options) =>
+        callFleetRoute<NativeQueueSendResult>(transport, '/v1/queue/send', [envelope, options], {
+          // A lost response leaves Queue publication ambiguous. The broker and
+          // consumer are at-least-once; do not add a blind transport retry.
+          idempotent: false,
+        }),
+    } satisfies CelldQueueProducer,
   };
 }

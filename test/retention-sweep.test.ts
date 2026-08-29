@@ -4,17 +4,13 @@ import { createCelldWorld } from '../src/index.js';
 import { allRunCatalogShardNames, runCatalogShardName } from '../src/indexes.js';
 import { sortableTimestamp } from '../src/retention.js';
 import { startHarness, type Harness } from '../src/testing/http-harness.js';
-import type { QueueDO } from '../src/worker/durable-objects/QueueDO.js';
 import type { WorkflowRunDO } from '../src/worker/durable-objects/WorkflowRunDO.js';
 import type { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
 import { runRetentionSweep, type RetentionSweepEnv } from '../src/worker/retention-sweep.js';
 
 function sweepEnv(
   harness: Harness,
-  settings: Pick<
-    RetentionSweepEnv,
-    'WORKFLOW_RETENTION_MS' | 'WORKFLOW_RETENTION_BATCH_SIZE' | 'WORKFLOW_RETENTION_QUEUE_SHARDS'
-  >,
+  settings: Pick<RetentionSweepEnv, 'WORKFLOW_RETENTION_MS' | 'WORKFLOW_RETENTION_BATCH_SIZE'>,
 ): RetentionSweepEnv {
   return {
     WORKFLOW_DB: harness.fleet.namespace('runs') as RetentionSweepEnv['WORKFLOW_DB'],
@@ -101,40 +97,16 @@ describe('fleet-wide workflow retention sweep', () => {
     ['WORKFLOW_RETENTION_BATCH_SIZE', '2junk'],
     ['WORKFLOW_RETENTION_BATCH_SIZE', 0],
     ['WORKFLOW_RETENTION_BATCH_SIZE', 1001],
-    ['WORKFLOW_RETENTION_QUEUE_SHARDS', ''],
-    ['WORKFLOW_RETENTION_QUEUE_SHARDS', '2junk'],
-    ['WORKFLOW_RETENTION_QUEUE_SHARDS', 0],
-    ['WORKFLOW_RETENTION_QUEUE_SHARDS', 1.5],
-    ['WORKFLOW_RETENTION_QUEUE_SHARDS', Number.MAX_SAFE_INTEGER + 1],
   ] as const)('rejects malformed retention setting %s=%j', async (name, value) => {
     harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
     const env = sweepEnv(harness, {
       WORKFLOW_RETENTION_MS: 1,
       WORKFLOW_RETENTION_BATCH_SIZE: 1,
-      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
       [name]: value,
     });
     harness.fleet.advance(10);
     await expect(runRetentionSweep(harness.fleet.now, env)).rejects.toThrow(name);
   });
-
-  it.each([129, Number.MAX_SAFE_INTEGER])(
-    'accepts WORKFLOW_RETENTION_QUEUE_SHARDS=%s',
-    async (queueShards) => {
-      harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
-      harness.fleet.advance(10);
-      await expect(
-        runRetentionSweep(
-          harness.fleet.now,
-          sweepEnv(harness, {
-            WORKFLOW_RETENTION_MS: 1,
-            WORKFLOW_RETENTION_BATCH_SIZE: 1,
-            WORKFLOW_RETENTION_QUEUE_SHARDS: queueShards,
-          }),
-        ),
-      ).resolves.toMatchObject({ scanned: 0 });
-    },
-  );
 
   it('fails deterministically when an enabled sweep is missing a required binding', async () => {
     harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
@@ -147,14 +119,13 @@ describe('fleet-wide workflow retention sweep', () => {
   });
 
   it('expires pending, running, and terminal workflows by creation age', async () => {
-    process.env.CELLD_QUEUE_MODE = 'cells';
+    process.env.CELLD_QUEUE_MODE = 'native';
     harness = await startHarness({ secret: 'retention-sweep-secret', virtualClock: true });
     const world = createCelldWorld({
       fleetUrl: harness.url,
       secret: 'retention-sweep-secret',
       deploymentId: 'retention-sweep-tests',
       baseUrl: 'http://127.0.0.1:1',
-      queueShards: 2,
     });
     const pending = await createRun(world, 'pending', 'pending');
     const running = await createRun(world, 'running', 'running');
@@ -171,9 +142,6 @@ describe('fleet-wide workflow retention sweep', () => {
       harness.fleet.now,
       sweepEnv(harness, {
         WORKFLOW_RETENTION_MS: 1_000,
-        // New runs persist their application-side shard count, so this is
-        // only a fallback for runs created before the retention sweep exists.
-        WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
       }),
     );
 
@@ -204,16 +172,7 @@ describe('fleet-wide workflow retention sweep', () => {
     expect(
       harness.fleet.cell('runs', completed).storage.data.get('retention:tombstone'),
     ).toMatchObject({ status: 'completed', terminalStatus: 'completed' });
-    for (let shard = 0; shard < 2; shard++) {
-      const queue = harness.fleet.namespace('queue').get({
-        toString: () => `q:${shard}`,
-      }) as QueueDO;
-      await expect(queue.stats()).resolves.toMatchObject({
-        pending: 0,
-        inflight: 0,
-        deadLetters: 0,
-      });
-    }
+    expect(harness.queuePayloads.size).toBe(0);
   });
 
   it('makes progress across bounded cron occurrences', async () => {
@@ -230,7 +189,6 @@ describe('fleet-wide workflow retention sweep', () => {
     const env = sweepEnv(harness, {
       WORKFLOW_RETENTION_MS: 100,
       WORKFLOW_RETENTION_BATCH_SIZE: 2,
-      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
     });
 
     await expect(runRetentionSweep(harness.fleet.now, env)).resolves.toMatchObject({
@@ -270,7 +228,6 @@ describe('fleet-wide workflow retention sweep', () => {
       harness.fleet.now,
       sweepEnv(harness, {
         WORKFLOW_RETENTION_MS: 1_000,
-        WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
       }),
     );
     const status = await world.retention.getStatus(runId);
@@ -297,7 +254,6 @@ describe('fleet-wide workflow retention sweep', () => {
         harness.fleet.now,
         sweepEnv(harness, {
           WORKFLOW_RETENTION_MS: 1_000,
-          WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
         }),
       ),
     ).resolves.toMatchObject({ scanned: 1, notDue: 1, expired: 0 });
@@ -309,7 +265,6 @@ describe('fleet-wide workflow retention sweep', () => {
         harness.fleet.now,
         sweepEnv(harness, {
           WORKFLOW_RETENTION_MS: 1_000,
-          WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
         }),
       ),
     ).resolves.toMatchObject({ scanned: 0 });
@@ -344,7 +299,6 @@ describe('fleet-wide workflow retention sweep', () => {
     const env = sweepEnv(harness, {
       WORKFLOW_RETENTION_MS: 1_000,
       WORKFLOW_RETENTION_BATCH_SIZE: 2,
-      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
     });
 
     await expect(runRetentionSweep(harness.fleet.now, env)).resolves.toMatchObject({
@@ -385,7 +339,6 @@ describe('fleet-wide workflow retention sweep', () => {
     const env = sweepEnv(harness, {
       WORKFLOW_RETENTION_MS: 100,
       WORKFLOW_RETENTION_BATCH_SIZE: 2,
-      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
     });
     const retryRun = harness.fleet.cell('runs', retryRunId).instance as WorkflowRunDO;
     const originalEnforce = retryRun.enforceRetention.bind(retryRun);
@@ -442,7 +395,6 @@ describe('fleet-wide workflow retention sweep', () => {
         sweepEnv(harness, {
           WORKFLOW_RETENTION_MS: 100,
           WORKFLOW_RETENTION_BATCH_SIZE: 4,
-          WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
         }),
       ),
     ).resolves.toMatchObject({ scanned: 4, invalid: 3, expired: 1 });
@@ -479,7 +431,6 @@ describe('fleet-wide workflow retention sweep', () => {
     const env = sweepEnv(harness, {
       WORKFLOW_RETENTION_MS: 100,
       WORKFLOW_RETENTION_BATCH_SIZE: 1,
-      WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
     });
 
     await expect(runRetentionSweep(harness.fleet.now, env)).resolves.toMatchObject({
@@ -528,7 +479,6 @@ describe('fleet-wide workflow retention sweep', () => {
         sweepEnv(harness, {
           WORKFLOW_RETENTION_MS: 100,
           WORKFLOW_RETENTION_BATCH_SIZE: 2,
-          WORKFLOW_RETENTION_QUEUE_SHARDS: 1,
         }),
       ),
     ).resolves.toMatchObject({

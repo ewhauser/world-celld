@@ -26,14 +26,12 @@ import {
   WAIT_KEY_PREFIX,
 } from '../../apply-event.js';
 import {
-  type AcknowledgeQueueExpiryResult,
   CLEANUP_RECORD_KEY,
   type CleanupRecord,
   cleanupFromTombstone,
   cleanupTombstone,
   type EnforceRetentionRequest,
   type EnforceRetentionResult,
-  type ExpireQueueRunResult,
   type ExpireRunStreamsResult,
   type ExpireStreamResult,
   type FinalizeRunStreamsResult,
@@ -43,7 +41,6 @@ import {
   hookMarkerKey,
   type RunReadOutcome,
   type RunLifecycleStatus,
-  type QueueExpiryReceipt,
   type RunTombstone,
   type ScheduleCleanupRequest,
   TERMINAL_CLEANUP_KEY,
@@ -52,6 +49,16 @@ import {
 } from '../../retention.js';
 import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../../lifecycle.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../validation.js';
+import {
+  QUEUE_PAYLOAD_REGISTRY_PREFIX,
+  queuePayloadRegistryKey,
+  type QueuePayloadOrphan,
+  type QueuePayloadRegistration,
+} from '../../queue-protocol.js';
+import {
+  deleteQueuePayloadObjects,
+  type QueuePayloadObjectStorageBinding,
+} from '../queue-payload-store.js';
 
 interface CellId {
   toString(): string;
@@ -76,24 +83,13 @@ interface StreamCleanupStub {
   ): Promise<ExpireStreamResult>;
 }
 
-interface QueueCleanupStub {
-  expireRun(
-    runId: string,
-    expiredAt: number,
-    options?: { limit?: number },
-  ): Promise<ExpireQueueRunResult>;
-  acknowledgeExpireRun(
-    runId: string,
-    receipt: QueueExpiryReceipt,
-  ): Promise<AcknowledgeQueueExpiryResult>;
-}
-
 interface WorkflowRunDOEnv {
+  WORKFLOW_DB?: CellNamespace<{ unregisterQueuePayload(messageId: string): Promise<void> }>;
   WORKFLOW_RUN_CATALOG?: CellNamespace<RunCatalogShardStub>;
   WORKFLOW_HOOK_TOKENS?: CellNamespace<HookTokenShardStub>;
   WORKFLOW_HOOK_IDS?: CellNamespace<HookIdShardStub>;
   WORKFLOW_STREAMS?: CellNamespace<StreamCleanupStub>;
-  WORKFLOW_QUEUE?: CellNamespace<QueueCleanupStub>;
+  WORKFLOW_QUEUE_PAYLOADS?: Pick<QueuePayloadObjectStorageBinding, 'delete'>;
   /** Test seam; celld deployments use Date.now(). */
   clock?: () => number;
 }
@@ -106,11 +102,11 @@ const TERMINAL_WAIT_PAGE_SIZE = STORAGE_BATCH_SIZE;
 const STREAMS_PER_CLEANUP_PAGE = 16;
 const STREAM_CHUNKS_PER_CLEANUP_PAGE = STORAGE_BATCH_SIZE;
 const STREAM_BYTES_PER_CLEANUP_PAGE = 16 * 1024 * 1024;
-const QUEUE_REFERENCES_PER_CLEANUP_PAGE = 64;
+const QUEUE_PAYLOADS_PER_CLEANUP_PAGE = STORAGE_BATCH_SIZE;
 const CLEANUP_RETRY_MAX_MS = 60 * 60 * 1000;
-const CLEANUP_PROGRESS_KEY = 'retention:progress';
-const RUN_QUEUE_SHARDS_KEY = 'retention:queue-shards';
 const MAX_DATE_MS = 8_640_000_000_000_000;
+const QUEUE_ORPHAN_KEY = 'queue-orphan';
+const QUEUE_RESERVATION_KEY = 'queue-reservation';
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
 
 function validateCleanupRequest(request: unknown, allowDisabled: boolean): ScheduleCleanupRequest {
@@ -124,9 +120,6 @@ function validateCleanupRequest(request: unknown, allowDisabled: boolean): Sched
     throw new Error(
       `world-celld retentionMs must be a ${allowDisabled ? 'non-negative' : 'positive'} safe integer`,
     );
-  }
-  if (!isPositiveSafeInteger(request.queueShards)) {
-    throw new Error('world-celld retention queueShards must be a positive safe integer');
   }
   return request as unknown as ScheduleCleanupRequest;
 }
@@ -142,7 +135,6 @@ function retentionDeadline(baseMs: number, retentionMs: number, runId: string): 
 function cleanupRecord(
   run: WorkflowRun,
   dueAt: Date,
-  queueShards: number,
   reason: NonNullable<CleanupRecord['reason']>,
 ): CleanupRecord {
   const terminal = isTerminalWorkflowRunStatus(run.status) ? (run as TerminalRun) : undefined;
@@ -156,22 +148,12 @@ function cleanupRecord(
     terminalStatus: terminal?.status,
     reason,
     dueAt,
-    queueShards,
     phase: 'retained',
     generation: 0,
     attempts: 0,
     deletedPayloadKeys: 0,
     deletedStreams: 0,
-    deletedQueueMessages: 0,
-  };
-}
-
-interface CleanupProgress {
-  queueShard: number;
-  queueShardDeleted: number;
-  pendingAck?: {
-    queueShard: number;
-    receipt: QueueExpiryReceipt;
+    deletedQueuePayloads: 0,
   };
 }
 
@@ -208,7 +190,15 @@ async function putStorageEntries(
 
 interface InflightClaim {
   messageId: string;
-  claimedAt: number;
+  expiresAt: number;
+  retryAt?: number;
+}
+
+type QueueMessageReservation = InflightClaim;
+
+interface QueuePayloadOrphanState extends QueuePayloadOrphan {
+  generation: number;
+  deleting: boolean;
 }
 
 /**
@@ -218,8 +208,8 @@ interface InflightClaim {
  * storage transaction: guard checks, the event append, and the entity
  * mutation are atomic even if the DO is evicted mid-operation.
  *
- * Instances named `claim:<queueName>:<idempotencyKey>` are used purely as
- * queue-message dedup claims (see claimInflight/releaseInflight).
+ * Instances named `claim:<queueName>:<idempotencyKey>` reserve one message ID
+ * at publication time and serialize its deliveries until completion.
  */
 export class WorkflowRunDO extends DurableObject {
   private now(): number {
@@ -304,10 +294,6 @@ export class WorkflowRunDO extends DurableObject {
       });
       if (!outcome.ok) return outcome;
 
-      if (outcome.runCreated && request.cleanup) {
-        await txn.put(RUN_QUEUE_SHARDS_KEY, request.cleanup.queueShards);
-      }
-
       await txn.put('event_sequence', eventSequence);
       const hookReferences: HookIndexReference[] = outcome.hookToIndex
         ? [
@@ -335,12 +321,7 @@ export class WorkflowRunDO extends DurableObject {
           retentionDeadline(terminalRun.completedAt.getTime(), retentionMs, terminalRun.runId),
         );
         const run = WorkflowRunSchema.parse({ ...terminalRun, expiredAt: dueAt }) as TerminalRun;
-        const cleanup = cleanupRecord(
-          run,
-          dueAt,
-          request.cleanup?.queueShards ?? 1,
-          'terminal-retention',
-        );
+        const cleanup = cleanupRecord(run, dueAt, 'terminal-retention');
         await txn.put('run', run);
         await txn.put(CLEANUP_RECORD_KEY, cleanup);
         await txn.setAlarm(dueAt);
@@ -501,7 +482,7 @@ export class WorkflowRunDO extends DurableObject {
         ),
       );
       const run = WorkflowRunSchema.parse({ ...terminalRun, expiredAt: dueAt }) as TerminalRun;
-      const cleanup = cleanupRecord(run, dueAt, request.queueShards, 'manual');
+      const cleanup = cleanupRecord(run, dueAt, 'manual');
       await txn.put('run', run);
       await txn.put(CLEANUP_RECORD_KEY, cleanup);
       await txn.setAlarm(
@@ -525,10 +506,9 @@ export class WorkflowRunDO extends DurableObject {
     }
 
     const result = await this.ctx.storage.transaction(async (txn) => {
-      const values = await txn.get<CleanupRecord | RunTombstone | WorkflowRun | number>([
+      const values = await txn.get<CleanupRecord | RunTombstone | WorkflowRun>([
         CLEANUP_RECORD_KEY,
         TOMBSTONE_KEY,
-        RUN_QUEUE_SHARDS_KEY,
         'run',
       ]);
       const tombstone = values.get(TOMBSTONE_KEY) as RunTombstone | undefined;
@@ -548,14 +528,9 @@ export class WorkflowRunDO extends DurableObject {
 
       const dueAt = new Date(dueAtMs);
       const existing = values.get(CLEANUP_RECORD_KEY) as CleanupRecord | undefined;
-      const storedQueueShards = values.get(RUN_QUEUE_SHARDS_KEY) as number | undefined;
-      const queueShards =
-        Number.isSafeInteger(storedQueueShards) && (storedQueueShards as number) > 0
-          ? (storedQueueShards as number)
-          : request.queueShards;
       let cleanup = existing;
       if (!cleanup) {
-        cleanup = cleanupRecord(run, dueAt, queueShards, 'maximum-age');
+        cleanup = cleanupRecord(run, dueAt, 'maximum-age');
         await txn.put('run', WorkflowRunSchema.parse({ ...run, expiredAt: dueAt }));
         await txn.put(CLEANUP_RECORD_KEY, cleanup);
       } else if (cleanup.phase === 'retained' && dueAtMs < cleanup.dueAt.getTime()) {
@@ -682,12 +657,86 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   private async executeScheduledCleanupPage(): Promise<void> {
-    const values = await this.ctx.storage.get<CleanupRecord | TerminalCleanupRecord>([
+    const values = await this.ctx.storage.get<
+      CleanupRecord | TerminalCleanupRecord | InflightClaim | QueuePayloadOrphanState | WorkflowRun
+    >([
       CLEANUP_RECORD_KEY,
       TERMINAL_CLEANUP_KEY,
+      'claim',
+      QUEUE_RESERVATION_KEY,
+      QUEUE_ORPHAN_KEY,
+      'run',
     ]);
     const cleanup = values.get(CLEANUP_RECORD_KEY) as CleanupRecord | undefined;
     const terminalCleanup = values.get(TERMINAL_CLEANUP_KEY) as TerminalCleanupRecord | undefined;
+    const claim = values.get('claim') as InflightClaim | undefined;
+    const reservation = values.get(QUEUE_RESERVATION_KEY) as QueueMessageReservation | undefined;
+    const queueOrphan = values.get(QUEUE_ORPHAN_KEY) as QueuePayloadOrphanState | undefined;
+
+    if (queueOrphan) {
+      const leased = await this.ctx.storage.transaction(async (txn) => {
+        const current = await txn.get<QueuePayloadOrphanState>(QUEUE_ORPHAN_KEY);
+        if (!current) return null;
+        if (current.expiresAt > this.now()) {
+          await txn.setAlarm(current.expiresAt);
+          return null;
+        }
+        if (current.deleting) return current;
+        const next: QueuePayloadOrphanState = {
+          ...current,
+          generation: current.generation + 1,
+          deleting: true,
+        };
+        await txn.put(QUEUE_ORPHAN_KEY, next);
+        return next;
+      });
+      if (!leased) return;
+      const bucket = (this.env as WorkflowRunDOEnv)?.WORKFLOW_QUEUE_PAYLOADS;
+      const runs = (this.env as WorkflowRunDOEnv)?.WORKFLOW_DB;
+      if (!bucket || !runs) {
+        throw new Error('world-celld queue orphan cleanup is missing required bindings');
+      }
+      await deleteQueuePayloadObjects(bucket, leased.key);
+      const run = runs.get(runs.idFromName(leased.runId));
+      await run.unregisterQueuePayload(leased.messageId);
+      await this.ctx.storage.transaction(async (txn) => {
+        const current = await txn.get<QueuePayloadOrphanState>(QUEUE_ORPHAN_KEY);
+        if (
+          current?.messageId !== leased.messageId ||
+          current.generation !== leased.generation ||
+          !current.deleting
+        ) {
+          return;
+        }
+        await txn.delete(QUEUE_ORPHAN_KEY);
+        await txn.deleteAlarm();
+      });
+      return;
+    }
+
+    if (claim || reservation) {
+      await this.ctx.storage.transaction(async (txn) => {
+        const current = await txn.get<InflightClaim>(['claim', QUEUE_RESERVATION_KEY]);
+        let nextClaim = current.get('claim');
+        let nextReservation = current.get(QUEUE_RESERVATION_KEY);
+        const now = this.now();
+        if (nextClaim && nextClaim.expiresAt <= now) {
+          await txn.delete('claim');
+          nextClaim = undefined;
+        }
+        if (nextReservation && nextReservation.expiresAt <= now) {
+          await txn.delete(QUEUE_RESERVATION_KEY);
+          nextReservation = undefined;
+        }
+        const nextAlarm = Math.min(
+          nextClaim?.expiresAt ?? Number.POSITIVE_INFINITY,
+          nextReservation?.expiresAt ?? Number.POSITIVE_INFINITY,
+        );
+        if (Number.isFinite(nextAlarm)) await txn.setAlarm(nextAlarm);
+        else await txn.deleteAlarm();
+      });
+      return;
+    }
 
     // Once retention is due it is the lifecycle authority. Do not make an
     // expired run wait behind terminal hook/wait disposal; payload cleanup
@@ -943,98 +992,35 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   private async deleteQueuePage(cleanup: CleanupRecord): Promise<void> {
-    const queues = this.namespace<QueueCleanupStub>('WORKFLOW_QUEUE');
-    const progress =
-      (await this.ctx.storage.get<CleanupProgress>(CLEANUP_PROGRESS_KEY)) ??
-      ({ queueShard: 0, queueShardDeleted: 0 } satisfies CleanupProgress);
-
-    if (progress.pendingAck) {
-      const { queueShard, receipt } = progress.pendingAck;
-      const queue = queues.get(queues.idFromName(`q:${queueShard}`));
-      const result = await queue.acknowledgeExpireRun(cleanup.runId, receipt);
-      if (!result.acknowledged) {
-        throw new Error(`queue shard ${queueShard} rejected expiry receipt for ${cleanup.runId}`);
-      }
-      await this.ctx.storage.transaction(async (txn) => {
-        const current = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
-        if (current?.phase !== 'queues' || current.generation !== cleanup.generation) return;
-        const persisted = await txn.get<CleanupProgress>(CLEANUP_PROGRESS_KEY);
-        if (
-          persisted?.pendingAck?.queueShard !== queueShard ||
-          persisted.pendingAck.receipt.expiredAt !== receipt.expiredAt ||
-          persisted.pendingAck.receipt.deleted !== receipt.deleted
-        ) {
-          return;
-        }
-        await txn.put(CLEANUP_RECORD_KEY, {
-          ...current,
-          generation: current.generation + 1,
-          attempts: 0,
-          lastError: undefined,
-        });
-        await txn.put<CleanupProgress>(CLEANUP_PROGRESS_KEY, {
-          queueShard: queueShard + 1,
-          queueShardDeleted: 0,
-        });
-        await txn.setAlarm(this.now() + 1);
-      });
-      return;
+    const entries = await this.ctx.storage.list<QueuePayloadRegistration>({
+      prefix: QUEUE_PAYLOAD_REGISTRY_PREFIX,
+      limit: QUEUE_PAYLOADS_PER_CLEANUP_PAGE + 1,
+    });
+    const page = Array.from(entries).slice(0, QUEUE_PAYLOADS_PER_CLEANUP_PAGE);
+    const bucket = (this.env as WorkflowRunDOEnv)?.WORKFLOW_QUEUE_PAYLOADS;
+    if (!bucket) {
+      throw new Error('world-celld retention missing binding WORKFLOW_QUEUE_PAYLOADS');
     }
-
-    if (progress.queueShard < cleanup.queueShards) {
-      const requestedShard = progress.queueShard;
-      const queue = queues.get(queues.idFromName(`q:${requestedShard}`));
-      const result = await queue.expireRun(cleanup.runId, cleanup.dueAt.getTime(), {
-        limit: QUEUE_REFERENCES_PER_CLEANUP_PAGE,
-      });
-      await this.ctx.storage.transaction(async (txn) => {
-        const current = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
-        if (current?.phase !== 'queues' || current.generation !== cleanup.generation) return;
-        const persisted =
-          (await txn.get<CleanupProgress>(CLEANUP_PROGRESS_KEY)) ??
-          ({ queueShard: 0, queueShardDeleted: 0 } satisfies CleanupProgress);
-        if (persisted.queueShard !== requestedShard || persisted.pendingAck) return;
-        if (result.deleted < persisted.queueShardDeleted) {
-          throw new Error(
-            `queue shard ${requestedShard} regressed expiry receipt for ${cleanup.runId}`,
-          );
-        }
-        const delta = result.deleted - persisted.queueShardDeleted;
-        const next: CleanupProgress = result.done
-          ? {
-              queueShard: requestedShard,
-              queueShardDeleted: result.deleted,
-              pendingAck: { queueShard: requestedShard, receipt: result.receipt },
-            }
-          : { queueShard: requestedShard, queueShardDeleted: result.deleted };
-        await txn.put(CLEANUP_RECORD_KEY, {
-          ...current,
-          deletedQueueMessages: current.deletedQueueMessages + delta,
-          generation: current.generation + 1,
-          attempts: 0,
-          lastError: undefined,
-        });
-        await txn.put(CLEANUP_PROGRESS_KEY, next);
-        await txn.setAlarm(this.now() + 1);
-      });
-      return;
+    if (page.length > 0) {
+      await deleteQueuePayloadObjects(
+        bucket,
+        page.map(([, registration]) => registration.key),
+      );
     }
 
     await this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
       if (current?.phase !== 'queues' || current.generation !== cleanup.generation) return;
-      const persisted =
-        (await txn.get<CleanupProgress>(CLEANUP_PROGRESS_KEY)) ??
-        ({ queueShard: 0, queueShardDeleted: 0 } satisfies CleanupProgress);
-      if (persisted.queueShard >= current.queueShards && !persisted.pendingAck) {
-        await txn.put(CLEANUP_RECORD_KEY, {
-          ...current,
-          phase: 'payload',
-          generation: current.generation + 1,
-        });
-        await txn.delete(CLEANUP_PROGRESS_KEY);
-        await txn.setAlarm(this.now() + 1);
-      }
+      if (page.length > 0) await txn.delete(page.map(([key]) => key));
+      await txn.put(CLEANUP_RECORD_KEY, {
+        ...current,
+        deletedQueuePayloads: current.deletedQueuePayloads + page.length,
+        phase: entries.size <= QUEUE_PAYLOADS_PER_CLEANUP_PAGE ? 'payload' : 'queues',
+        generation: current.generation + 1,
+        attempts: 0,
+        lastError: undefined,
+      });
+      await txn.setAlarm(this.now() + 1);
     });
   }
 
@@ -1126,26 +1112,240 @@ export class WorkflowRunDO extends DurableObject {
     });
   }
 
+  async registerQueuePayload(
+    registration: QueuePayloadRegistration,
+  ): Promise<{ ok: true } | { ok: false; message: string }> {
+    if (
+      !registration ||
+      typeof registration.messageId !== 'string' ||
+      registration.messageId.length === 0 ||
+      typeof registration.key !== 'string' ||
+      registration.key.length === 0 ||
+      !isNonNegativeSafeInteger(registration.orphanExpiresAt)
+    ) {
+      throw new TypeError('world-celld queue payload registration is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const { tombstone } = await this.retentionState(txn);
+      if (tombstone) {
+        return {
+          ok: false,
+          message: `Workflow run "${tombstone.runId}" expired at ${tombstone.expiredAt.toISOString()}`,
+        };
+      }
+      await txn.put(queuePayloadRegistryKey(registration.messageId), registration);
+      return { ok: true };
+    });
+  }
+
+  async finalizeQueuePayload(
+    messageId: string,
+  ): Promise<{ ok: true } | { ok: false; message: string }> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new TypeError('world-celld queue payload messageId must be a non-empty string');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const { tombstone } = await this.retentionState(txn);
+      if (tombstone) {
+        return {
+          ok: false,
+          message: `Workflow run "${tombstone.runId}" expired at ${tombstone.expiredAt.toISOString()}`,
+        };
+      }
+      const registration = await txn.get<QueuePayloadRegistration>(
+        queuePayloadRegistryKey(messageId),
+      );
+      return registration
+        ? { ok: true }
+        : {
+            ok: false,
+            message: 'workflow queue payload registration was removed before publication',
+          };
+    });
+  }
+
+  async unregisterQueuePayload(messageId: string): Promise<void> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new TypeError('world-celld queue payload messageId must be a non-empty string');
+    }
+    await this.ctx.storage.delete(queuePayloadRegistryKey(messageId));
+  }
+
+  async scheduleQueuePayloadOrphan(orphan: QueuePayloadOrphan): Promise<void> {
+    if (
+      !orphan ||
+      typeof orphan.messageId !== 'string' ||
+      orphan.messageId.length === 0 ||
+      typeof orphan.runId !== 'string' ||
+      orphan.runId.length === 0 ||
+      typeof orphan.key !== 'string' ||
+      orphan.key.length === 0 ||
+      !isNonNegativeSafeInteger(orphan.expiresAt)
+    ) {
+      throw new TypeError('world-celld queue payload orphan is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const existing = await txn.get<QueuePayloadOrphanState>(QUEUE_ORPHAN_KEY);
+      if (existing && existing.messageId !== orphan.messageId) {
+        throw new Error('world-celld queue payload orphan identity mismatch');
+      }
+      if (existing?.deleting) {
+        throw new Error('world-celld queue payload orphan deletion is in progress');
+      }
+      const next: QueuePayloadOrphanState = {
+        ...orphan,
+        expiresAt: Math.max(existing?.expiresAt ?? 0, orphan.expiresAt),
+        generation: (existing?.generation ?? 0) + 1,
+        deleting: false,
+      };
+      await txn.put<QueuePayloadOrphanState>(QUEUE_ORPHAN_KEY, next);
+      await txn.setAlarm(next.expiresAt);
+    });
+  }
+
+  async cancelQueuePayloadOrphan(messageId: string): Promise<void> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new TypeError('world-celld queue payload orphan messageId must be a non-empty string');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const existing = await txn.get<QueuePayloadOrphanState>(QUEUE_ORPHAN_KEY);
+      if (!existing || existing.messageId !== messageId) return;
+      await txn.delete(QUEUE_ORPHAN_KEY);
+      await txn.deleteAlarm();
+    });
+  }
+
+  async reserveQueueMessage(params: {
+    messageId: string;
+    expiresAt: number;
+  }): Promise<{ admitted: boolean; messageId: string }> {
+    if (
+      typeof params?.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.expiresAt)
+    ) {
+      throw new TypeError('world-celld queue message reservation is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<InflightClaim>([QUEUE_RESERVATION_KEY, 'claim']);
+      const existing = values.get(QUEUE_RESERVATION_KEY);
+      const claim = values.get('claim');
+      const now = this.now();
+      if (existing && existing.expiresAt > now && existing.messageId !== params.messageId) {
+        await txn.setAlarm(Math.min(existing.expiresAt, claim?.expiresAt ?? existing.expiresAt));
+        return { admitted: false, messageId: existing.messageId };
+      }
+      const reservation: QueueMessageReservation = {
+        messageId: params.messageId,
+        expiresAt: Math.max(existing?.expiresAt ?? 0, params.expiresAt),
+      };
+      await txn.put(QUEUE_RESERVATION_KEY, reservation);
+      await txn.setAlarm(
+        Math.min(reservation.expiresAt, claim?.expiresAt ?? reservation.expiresAt),
+      );
+      return { admitted: true, messageId: params.messageId };
+    });
+  }
+
+  async completeQueueMessage(messageId: string): Promise<void> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new TypeError('world-celld queue messageId must be a non-empty string');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<InflightClaim>([QUEUE_RESERVATION_KEY, 'claim']);
+      let reservation = values.get(QUEUE_RESERVATION_KEY);
+      let claim = values.get('claim');
+      if (reservation?.messageId === messageId) {
+        await txn.delete(QUEUE_RESERVATION_KEY);
+        reservation = undefined;
+      }
+      if (claim?.messageId === messageId) {
+        await txn.delete('claim');
+        claim = undefined;
+      }
+      const nextAlarm = Math.min(
+        reservation?.expiresAt ?? Number.POSITIVE_INFINITY,
+        claim?.expiresAt ?? Number.POSITIVE_INFINITY,
+      );
+      if (Number.isFinite(nextAlarm)) await txn.setAlarm(nextAlarm);
+      else await txn.deleteAlarm();
+    });
+  }
+
   async claimInflight(params: {
     messageId: string;
     staleMs: number;
-  }): Promise<{ claimed: boolean }> {
+  }): Promise<{ claimed: boolean; retryAt?: number }> {
+    if (
+      typeof params?.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isPositiveSafeInteger(params.staleMs)
+    ) {
+      throw new TypeError('world-celld queue claim is invalid');
+    }
     return await this.ctx.storage.transaction(async (txn) => {
-      const existing = await txn.get<InflightClaim>('claim');
+      const values = await txn.get<InflightClaim>(['claim', QUEUE_RESERVATION_KEY]);
+      const existing = values.get('claim');
+      const reservation = values.get(QUEUE_RESERVATION_KEY);
       const now = this.now();
-      if (
-        existing &&
-        existing.messageId !== params.messageId &&
-        now - existing.claimedAt < params.staleMs
-      ) {
-        return { claimed: false };
+      if (existing && existing.expiresAt > now) {
+        if (existing.messageId !== params.messageId) return { claimed: false };
+        if (existing.retryAt === undefined || existing.retryAt > now) {
+          return { claimed: false, retryAt: existing.retryAt ?? existing.expiresAt };
+        }
       }
-      await txn.put<InflightClaim>('claim', { messageId: params.messageId, claimedAt: now });
+      const expiresAt = now + params.staleMs;
+      await txn.put<InflightClaim>('claim', { messageId: params.messageId, expiresAt });
+      await txn.setAlarm(Math.min(expiresAt, reservation?.expiresAt ?? expiresAt));
       return { claimed: true };
     });
   }
 
-  async releaseInflight(): Promise<void> {
-    await this.ctx.storage.delete('claim');
+  async holdInflight(params: {
+    messageId: string;
+    retryAt: number;
+    expiresAt: number;
+    reservationExpiresAt?: number;
+  }): Promise<{ held: boolean }> {
+    if (
+      typeof params?.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.retryAt) ||
+      !isNonNegativeSafeInteger(params.expiresAt) ||
+      (params.reservationExpiresAt !== undefined &&
+        !isNonNegativeSafeInteger(params.reservationExpiresAt))
+    ) {
+      throw new TypeError('world-celld queue claim hold is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<InflightClaim>(['claim', QUEUE_RESERVATION_KEY]);
+      const existing = values.get('claim');
+      let reservation = values.get(QUEUE_RESERVATION_KEY);
+      if (!existing || existing.messageId !== params.messageId) return { held: false };
+      const expiresAt = Math.max(existing.expiresAt, params.expiresAt);
+      await txn.put<InflightClaim>('claim', { ...existing, retryAt: params.retryAt, expiresAt });
+      if (
+        reservation?.messageId === params.messageId &&
+        params.reservationExpiresAt !== undefined &&
+        params.reservationExpiresAt > reservation.expiresAt
+      ) {
+        reservation = { ...reservation, expiresAt: params.reservationExpiresAt };
+        await txn.put(QUEUE_RESERVATION_KEY, reservation);
+      }
+      await txn.setAlarm(Math.min(expiresAt, reservation?.expiresAt ?? expiresAt));
+      return { held: true };
+    });
+  }
+
+  async releaseInflight(messageId?: string): Promise<void> {
+    await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<InflightClaim>(['claim', QUEUE_RESERVATION_KEY]);
+      const existing = values.get('claim');
+      const reservation = values.get(QUEUE_RESERVATION_KEY);
+      if (!existing || (messageId !== undefined && existing.messageId !== messageId)) return;
+      await txn.delete('claim');
+      if (reservation) await txn.setAlarm(reservation.expiresAt);
+      else await txn.deleteAlarm();
+    });
   }
 }

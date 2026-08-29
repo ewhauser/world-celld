@@ -9,26 +9,11 @@ import { createRemoteEnv } from '../../src/remote/namespaces.js';
 import { createStorage } from '../../src/storage.js';
 import type { FakeStorage, FakeStorageOperationCounts } from '../../src/testing/fake-cell.js';
 import { startHarness, type Harness } from '../../src/testing/http-harness.js';
-import { QUEUE_FENCE_GRACE_MS } from '../../src/lifecycle.js';
-import type { EnqueueRequest } from '../../src/queue.js';
-import type { QueueDO } from '../../src/worker/durable-objects/QueueDO.js';
 
 const SECRET = 'index-scalability-secret';
 const WORKLOAD = 48;
 const CONCURRENCY = 16;
 const SYNTHETIC_TRANSACTION_MS = 2;
-
-function queueRequest(messageId: string, runId: string): EnqueueRequest {
-  return {
-    messageId,
-    runId,
-    queueName: '__wkf_workflow_lifecycle_evidence',
-    pathname: 'flow',
-    body: JSON.stringify({ runId }),
-    delaySeconds: 3_600,
-    config: { targetBaseUrl: 'http://app.invalid', queueShards: 1 },
-  };
-}
 
 interface PublicMetric {
   publicRpcs: number;
@@ -119,19 +104,9 @@ function resultMetric(workload: number, elapsedMs: number, latencies: number[]) 
 
 describe('sharded index scalability evidence', () => {
   let harness: Harness;
-  let callbackFetches = 0;
 
   beforeAll(async () => {
-    harness = await startHarness({
-      secret: SECRET,
-      virtualClock: true,
-      cellEnv: {
-        fetch: async () => {
-          callbackFetches++;
-          return new Response(null, { status: 204 });
-        },
-      },
-    });
+    harness = await startHarness({ secret: SECRET, virtualClock: true });
   });
 
   afterAll(async () => {
@@ -469,149 +444,6 @@ describe('sharded index scalability evidence', () => {
     expect(distributedIndexStorage).toEqual(expectedStorage);
   });
 
-  it('separates steady-state queue cost from authoritative fallback after compaction', async () => {
-    let publicRpcs = 0;
-    const countedFetch: typeof fetch = async (input, init) => {
-      publicRpcs++;
-      return fetch(input, init);
-    };
-    const env = createRemoteEnv({ fleetUrl: harness.url, secret: SECRET, fetchImpl: countedFetch });
-    const activeRunId = 'wrun_queue_steady_state_evidence';
-    harness.fleet.cell('runs', activeRunId).storage.data.set('run', {
-      runId: activeRunId,
-      status: 'running',
-    });
-    const activeRunStorage = harness.fleet.cell('runs', activeRunId).storage;
-    const activeRunInstance = harness.fleet.cell('runs', activeRunId).instance as {
-      getLifecycleStatus(): Promise<unknown>;
-    };
-    const getActiveLifecycleStatus = activeRunInstance.getLifecycleStatus.bind(activeRunInstance);
-    let steadyAuthorityRpcs = 0;
-    activeRunInstance.getLifecycleStatus = async () => {
-      steadyAuthorityRpcs++;
-      return getActiveLifecycleStatus();
-    };
-    const steadyName = 'q:lifecycle-steady';
-    const steadyStorage = harness.fleet.cell('queue', steadyName).storage;
-    steadyStorage.resetOperationCounts();
-    activeRunStorage.resetOperationCounts();
-    publicRpcs = 0;
-    const steady = await env.WORKFLOW_QUEUE.get(env.WORKFLOW_QUEUE.idFromName(steadyName)).enqueue(
-      queueRequest('msg_queue_steady', activeRunId),
-    );
-    const steadyReport = {
-      publicRpcs,
-      internalAuthorityRpcs: steadyAuthorityRpcs,
-      queueStorage: storageCounts([steadyStorage]),
-      authorityStorage: storageCounts([activeRunStorage]),
-    };
-
-    const expiredRunId = 'wrun_queue_fallback_evidence';
-    const expiredRunStorage = harness.fleet.cell('runs', expiredRunId).storage;
-    expiredRunStorage.data.set('retention:tombstone', { runId: expiredRunId });
-    const fallbackName = 'q:lifecycle-fallback';
-    const fallback = harness.fleet.namespace('queue').get({
-      toString: () => fallbackName,
-    }) as QueueDO;
-    const expiry = await fallback.expireRun(expiredRunId, harness.fleet.now);
-    if (!expiry.done) throw new Error('expected final queue expiry receipt');
-    await fallback.acknowledgeExpireRun(expiredRunId, expiry.receipt);
-    harness.fleet.advance(QUEUE_FENCE_GRACE_MS);
-    await fallback.alarm();
-    const fallbackStorage = harness.fleet.cell('queue', fallbackName).storage;
-    expect(fallbackStorage.data.has(`expired-run:${expiredRunId}`)).toBe(false);
-
-    const runInstance = harness.fleet.cell('runs', expiredRunId).instance as {
-      getLifecycleStatus(): Promise<unknown>;
-    };
-    const getLifecycleStatus = runInstance.getLifecycleStatus.bind(runInstance);
-    let authorityRpcs = 0;
-    runInstance.getLifecycleStatus = async () => {
-      authorityRpcs++;
-      return getLifecycleStatus();
-    };
-    fallbackStorage.resetOperationCounts();
-    expiredRunStorage.resetOperationCounts();
-    publicRpcs = 0;
-    const rejected = await env.WORKFLOW_QUEUE.get(
-      env.WORKFLOW_QUEUE.idFromName(fallbackName),
-    ).enqueue(queueRequest('msg_queue_fallback', expiredRunId));
-    const fallbackReport = {
-      publicRpcs,
-      internalAuthorityRpcs: authorityRpcs,
-      queueStorage: storageCounts([fallbackStorage]),
-      authorityStorage: storageCounts([expiredRunStorage]),
-    };
-
-    const deliveryRunId = 'wrun_queue_delivery_evidence';
-    const deliveryRunStorage = harness.fleet.cell('runs', deliveryRunId).storage;
-    deliveryRunStorage.data.set('run', { runId: deliveryRunId, status: 'running' });
-    const deliveryRunInstance = harness.fleet.cell('runs', deliveryRunId).instance as {
-      getLifecycleStatus(): Promise<unknown>;
-    };
-    const getDeliveryLifecycleStatus =
-      deliveryRunInstance.getLifecycleStatus.bind(deliveryRunInstance);
-    let deliveryAuthorityRpcs = 0;
-    deliveryRunInstance.getLifecycleStatus = async () => {
-      deliveryAuthorityRpcs++;
-      return getDeliveryLifecycleStatus();
-    };
-    const deliveryName = 'q:lifecycle-delivery';
-    const deliveryQueue = harness.fleet.namespace('queue').get({
-      toString: () => deliveryName,
-    }) as QueueDO;
-    await env.WORKFLOW_QUEUE.get(env.WORKFLOW_QUEUE.idFromName(deliveryName)).enqueue({
-      ...queueRequest('msg_queue_delivery', deliveryRunId),
-      delaySeconds: 0,
-    });
-    const deliveryStorage = harness.fleet.cell('queue', deliveryName).storage;
-    deliveryStorage.resetOperationCounts();
-    deliveryRunStorage.resetOperationCounts();
-    deliveryAuthorityRpcs = 0;
-    callbackFetches = 0;
-    await deliveryQueue.alarm();
-    await harness.fleet.settle();
-    const deliveryReport = {
-      externalCallbackFetches: callbackFetches,
-      internalAuthorityRpcs: deliveryAuthorityRpcs,
-      queueStorage: storageCounts([deliveryStorage]),
-      authorityStorage: storageCounts([deliveryRunStorage]),
-    };
-    console.log(
-      `LIFECYCLE_COMPACTION_COST ${JSON.stringify({ steady: steadyReport, fallback: fallbackReport, delivery: deliveryReport })}`,
-    );
-
-    expect(steady).toMatchObject({ ok: true });
-    expect(steadyReport.publicRpcs).toBe(1);
-    expect(steadyReport).toEqual({
-      publicRpcs: 1,
-      internalAuthorityRpcs: 1,
-      queueStorage: { ...emptyCounts(), get: 2, put: 4, transaction: 1 },
-      authorityStorage: { ...emptyCounts(), getMany: 1, transaction: 1 },
-    });
-    expect(rejected).toMatchObject({ ok: false, code: 'RUN_EXPIRED' });
-    expect(fallbackReport).toEqual({
-      publicRpcs: 1,
-      internalAuthorityRpcs: 1,
-      queueStorage: { ...emptyCounts(), get: 1, transaction: 1 },
-      authorityStorage: { ...emptyCounts(), getMany: 1, transaction: 1 },
-    });
-    expect(deliveryReport).toEqual({
-      externalCallbackFetches: 1,
-      internalAuthorityRpcs: 1,
-      queueStorage: {
-        ...emptyCounts(),
-        getMany: 1,
-        list: 10,
-        putMany: 1,
-        delete: 3,
-        deleteMany: 1,
-        transaction: 2,
-      },
-      authorityStorage: { ...emptyCounts(), getMany: 1, transaction: 1 },
-    });
-  });
-
   it('records retention cleanup public and internal sharded-index work', async () => {
     let publicRpcs = 0;
     const paths = new Map<string, number>();
@@ -629,7 +461,6 @@ describe('sharded index scalability evidence', () => {
       env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
       deploymentId: 'index-retention-evidence',
       runRetentionMs: 1,
-      queueShards: 1,
     });
     const runId = 'wrun_sharded_retention_evidence';
     const created = await storage.events.create(runId, {
@@ -662,7 +493,6 @@ describe('sharded index scalability evidence', () => {
     try {
       await env.WORKFLOW_DB.get(env.WORKFLOW_DB.idFromName(runId)).cleanupNow({
         retentionMs: 1,
-        queueShards: 1,
       });
       for (let page = 0; page < 24; page++) {
         harness.fleet.advance(2);

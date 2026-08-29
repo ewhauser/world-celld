@@ -4,9 +4,7 @@ import http from 'node:http';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../../src/index.js';
-import { callDO } from '../../src/remote/rpc-client.js';
 import { parse } from '../../src/vendor/shared/index.js';
-import type { QueueStats } from '../../src/worker/durable-objects/QueueDO.js';
 import { RunExpiredError } from '@workflow/errors';
 import type { CleanupRecord } from '../../src/retention.js';
 
@@ -118,7 +116,6 @@ interface PerfResult {
     firstAttemptDeliveryLatencyMs: LatencySummary;
     retriedDeliveryLatencyMs: LatencySummary;
   };
-  queueStats: QueueStats[];
   budgets: Record<string, number>;
 }
 
@@ -126,17 +123,14 @@ interface RetentionPerfResult {
   schemaVersion: 1;
   recordedAt: string;
   backend: { name: 'minio'; version: string; celldVersion: string };
-  workload: { runs: number; concurrency: number; queueShards: number; retentionMs: number };
+  workload: { runs: number; concurrency: number; retentionMs: number };
   correctness: {
     created: number;
     tombstoned: number;
     expiredReads: number;
     deletedPayloadKeys: number;
     deletedStreams: number;
-    deletedQueueMessages: number;
-    pending: number;
-    inflight: number;
-    deadLetters: number;
+    deletedQueuePayloads: number;
   };
   performance: {
     setupDurationMs: number;
@@ -154,7 +148,6 @@ describe('MinIO single-node queue performance and loss', () => {
   const callbackPort = positiveInteger('PERF_CALLBACK_PORT', 3000);
   const messageCount = positiveInteger('PERF_MESSAGES', 1000);
   const concurrency = positiveInteger('PERF_CONCURRENCY', 32);
-  const queueShards = positiveInteger('PERF_QUEUE_SHARDS', 2);
   const payloadBytes = positiveInteger('PERF_PAYLOAD_BYTES', 256);
   const retryEvery = nonNegativeInteger('PERF_RETRY_EVERY', 20);
   const timeoutMs = positiveInteger('PERF_TIMEOUT_MS', 180_000);
@@ -180,7 +173,7 @@ describe('MinIO single-node queue performance and loss', () => {
   let listener: http.Server;
 
   beforeAll(async () => {
-    process.env.CELLD_QUEUE_MODE = 'cells';
+    process.env.CELLD_QUEUE_MODE = 'native';
     if (!fleetUrl || !secret) {
       throw new Error('CELLD_FLEET_URL and CELLD_WORLD_SECRET are required');
     }
@@ -260,7 +253,6 @@ describe('MinIO single-node queue performance and loss', () => {
       secret,
       baseUrl: process.env.CELLD_CALLBACK_BASE_URL,
       deploymentId: `perf-${runId}`,
-      queueShards,
       rpcTimeoutMs: timeoutMs,
     });
     const queueName = `__wkf_workflow_perf_${runId.replaceAll('-', '')}`;
@@ -287,30 +279,14 @@ describe('MinIO single-node queue performance and loss', () => {
       () => Array.from(accepted.keys()).every((sequence) => successful.has(sequence)),
       timeoutMs,
     );
-    const drained = await waitUntil(async () => {
-      const stats = await Promise.all(
-        Array.from({ length: queueShards }, (_, shard) =>
-          callDO<QueueStats>({ fleetUrl, secret }, 'queue', `q:${shard}`, 'stats', []),
-        ),
-      );
-      return stats.every((entry) => entry.pending === 0 && entry.inflight === 0);
-    }, timeoutMs);
     const workloadEnd = performance.now();
 
-    const queueStats = await Promise.all(
-      Array.from({ length: queueShards }, (_, shard) =>
-        callDO<QueueStats>({ fleetUrl, secret }, 'queue', `q:${shard}`, 'stats', []),
-      ),
-    );
     const missing = Array.from(accepted.keys()).filter((sequence) => !successful.has(sequence));
     const mismatchedMessageIds = Array.from(successful, ([sequence, delivery]) => ({
       sequence,
       accepted: accepted.get(sequence),
       delivered: delivery.messageId,
     })).filter((entry) => entry.accepted !== entry.delivered);
-    const deadLetters = queueStats.reduce((sum, entry) => sum + entry.deadLetters, 0);
-    const pending = queueStats.reduce((sum, entry) => sum + entry.pending, 0);
-    const inflight = queueStats.reduce((sum, entry) => sum + entry.inflight, 0);
     const enqueueDurationMs = enqueueEnd - workloadStart;
     const totalDurationMs = workloadEnd - workloadStart;
     const enqueuePerSecond = rate(accepted.size, enqueueDurationMs);
@@ -334,13 +310,11 @@ describe('MinIO single-node queue performance and loss', () => {
       workload: {
         messages: messageCount,
         concurrency,
-        queueShards,
         payloadBytes,
         retryEvery,
       },
       correctness: {
         allDelivered,
-        drained,
         accepted: accepted.size,
         delivered: successful.size,
         missing: missing.length,
@@ -352,9 +326,6 @@ describe('MinIO single-node queue performance and loss', () => {
           0,
         ),
         successfulDuplicates,
-        pending,
-        inflight,
-        deadLetters,
       },
       performance: {
         enqueueDurationMs: Number(enqueueDurationMs.toFixed(2)),
@@ -366,7 +337,6 @@ describe('MinIO single-node queue performance and loss', () => {
         firstAttemptDeliveryLatencyMs: summarizeLatency(firstAttemptDeliveryLatencies),
         retriedDeliveryLatencyMs: summarizeLatency(retriedDeliveryLatencies),
       },
-      queueStats,
       budgets: {
         minEnqueuePerSecond,
         minDeliveryPerSecond,
@@ -387,11 +357,6 @@ describe('MinIO single-node queue performance and loss', () => {
     expect(invalidCallbacks, 'invalid callbacks').toEqual([]);
     expect(mismatchedMessageIds, 'accepted and delivered message IDs').toEqual([]);
     expect(successfulDuplicates, 'duplicate successful deliveries').toBe(0);
-    expect(drained, 'queues did not drain before the timeout').toBe(true);
-    expect(pending, 'pending messages after drain').toBe(0);
-    expect(inflight, 'inflight messages after drain').toBe(0);
-    expect(deadLetters, 'dead letters').toBe(0);
-
     expect(
       minEnqueuePerSecond === 0 || enqueuePerSecond >= minEnqueuePerSecond,
       `enqueue throughput ${enqueuePerSecond}/s is below ${minEnqueuePerSecond}/s`,
@@ -412,7 +377,6 @@ describe('MinIO single-node queue performance and loss', () => {
       secret,
       baseUrl: process.env.CELLD_CALLBACK_BASE_URL,
       deploymentId: `retention-perf-${runId}`,
-      queueShards,
       runRetentionMs: retentionMs,
       rpcTimeoutMs: timeoutMs,
     });
@@ -473,11 +437,6 @@ describe('MinIO single-node queue performance and loss', () => {
         }),
       )
     ).filter(Boolean).length;
-    const queueStats = await Promise.all(
-      Array.from({ length: queueShards }, (_, shard) =>
-        callDO<QueueStats>({ fleetUrl, secret }, 'queue', `q:${shard}`, 'stats', []),
-      ),
-    );
     const cleanupLag = completedStatuses.map(
       (status) => status.tombstonedAt!.getTime() - status.dueAt.getTime(),
     );
@@ -487,9 +446,6 @@ describe('MinIO single-node queue performance and loss', () => {
     );
     const setupDurationMs = setupEnd - setupStart;
     const cleanupDurationMs = Math.max(0, cleanupEnd - cleanupStart);
-    const pending = queueStats.reduce((sum, entry) => sum + entry.pending, 0);
-    const inflight = queueStats.reduce((sum, entry) => sum + entry.inflight, 0);
-    const deadLetters = queueStats.reduce((sum, entry) => sum + entry.deadLetters, 0);
 
     const result: RetentionPerfResult = {
       schemaVersion: 1,
@@ -502,7 +458,6 @@ describe('MinIO single-node queue performance and loss', () => {
       workload: {
         runs: retentionRuns,
         concurrency: retentionConcurrency,
-        queueShards,
         retentionMs,
       },
       correctness: {
@@ -514,13 +469,10 @@ describe('MinIO single-node queue performance and loss', () => {
           0,
         ),
         deletedStreams: completedStatuses.reduce((sum, status) => sum + status.deletedStreams, 0),
-        deletedQueueMessages: completedStatuses.reduce(
-          (sum, status) => sum + status.deletedQueueMessages,
+        deletedQueuePayloads: completedStatuses.reduce(
+          (sum, status) => sum + status.deletedQueuePayloads,
           0,
         ),
-        pending,
-        inflight,
-        deadLetters,
       },
       performance: {
         setupDurationMs: Number(setupDurationMs.toFixed(2)),
@@ -541,9 +493,6 @@ describe('MinIO single-node queue performance and loss', () => {
     expect(expiredReads).toBe(retentionRuns);
     expect(result.correctness.deletedPayloadKeys).toBeGreaterThan(0);
     expect(result.correctness.deletedStreams).toBe(retentionRuns);
-    expect(result.correctness.deletedQueueMessages).toBe(retentionRuns);
-    expect(pending).toBe(0);
-    expect(inflight).toBe(0);
-    expect(deadLetters).toBe(0);
+    expect(result.correctness.deletedQueuePayloads).toBe(retentionRuns);
   });
 });

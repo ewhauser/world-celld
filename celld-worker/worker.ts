@@ -5,7 +5,6 @@
 export {
   HookIdDO,
   HookTokenDO,
-  QueueDO,
   RunCatalogDO,
   StreamDO,
   WorkflowRunDO,

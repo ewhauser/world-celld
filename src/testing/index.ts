@@ -3,8 +3,8 @@
  * worker router and the real cell classes over Map-backed fake state, behind
  * node:http — the full wire protocol without a celld fleet.
  *
- * `startDevFleet()` additionally drives cell alarms on real time, so QueueDO
- * deliveries flow — a drop-in local stand-in for a deployed fleet.
+ * `startDevFleet()` additionally drives cell alarms on real time. Native Queue
+ * publications are exposed through `queueMessages` for local inspection.
  */
 export { FakeFleet, FakeStorage } from './fake-cell.js';
 export { startHarness, type Harness, type HarnessOptions } from './http-harness.js';

@@ -27,7 +27,6 @@ describe('runtime configuration validation', () => {
   it('resolves intentional defaults explicitly', () => {
     expect(resolveConfig()).toMatchObject({
       deploymentId: 'celld-default',
-      queueShards: 1,
       runRetentionMs: 0,
       rpcTimeoutMs: 30_000,
       streamLongPollMs: MAX_STREAM_LONG_POLL_MS,
@@ -35,19 +34,7 @@ describe('runtime configuration validation', () => {
     });
   });
 
-  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1])(
-    'rejects invalid queueShards %s',
-    (queueShards) => {
-      expect(() => resolveConfig({ queueShards })).toThrow(/queueShards/);
-    },
-  );
-
-  it.each([129, Number.MAX_SAFE_INTEGER])('accepts positive safe queueShards %s', (queueShards) => {
-    expect(resolveConfig({ queueShards }).queueShards).toBe(queueShards);
-  });
-
   it('does not coerce numeric strings in typed configuration options', () => {
-    expect(() => resolveConfig({ queueShards: '5' as unknown as number })).toThrow(/queueShards/);
     expect(() => resolveConfig({ runRetentionMs: '5' as unknown as number })).toThrow(
       /runRetentionMs/,
     );
