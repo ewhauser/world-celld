@@ -18,8 +18,8 @@ importers:
         specifier: 5.0.0-beta.17
         version: 5.0.0-beta.17
       '@workflow/world':
-        specifier: 5.0.0-beta.27
-        version: 5.0.0-beta.27
+        specifier: 5.0.0-beta.29
+        version: 5.0.0-beta.29
       ulid:
         specifier: ^3.0.2
         version: 3.0.2
@@ -1447,6 +1447,9 @@ packages:
 
   '@workflow/world@5.0.0-beta.27':
     resolution: {integrity: sha512-6+cpxAKgKuIO7khpTZFs9WVTTt8CVXWL8+QTz8VQJFtjg9QF1Kfc3bHPpzj1j6jjQCW6X0pF7CsQGSpLKuL9gw==}
+
+  '@workflow/world@5.0.0-beta.29':
+    resolution: {integrity: sha512-3z5GHEJgvb2AFfznQ4JfT1rm5U9jNupuG4YtrUUrtJ+807JkcjhP85fMN7Jo30975CcPPgnZmlnYI4sM0Y1d/w==}
 
   '@xhmikosr/archive-type@8.1.0':
     resolution: {integrity: sha512-EXOjEbnZFE5c/nFMf4FOrEURVanzHpnkPYmnmr78u02/8hAhE0FMq8p9TK1IM0/bFr5VcyBUY0gfLm8f7dKy+Q==}
@@ -4969,6 +4972,11 @@ snapshots:
       - utf-8-validate
 
   '@workflow/world@5.0.0-beta.27':
+    dependencies:
+      ulid: 3.0.2
+      zod: 4.3.6
+
+  '@workflow/world@5.0.0-beta.29':
     dependencies:
       ulid: 3.0.2
       zod: 4.3.6
