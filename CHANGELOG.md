@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.4.2 (2026-09-12)
+
+## What's Changed
+* Adopt celld 0.4 native Queues and fleet object storage by @ewhauser in https://github.com/ewhauser/world-celld/pull/43
+* chore(deps): bump zizmorcore/zizmor-action from 0.6.2 to 0.6.3 in the github-actions group by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/52
+* chore(deps-dev): bump the development-dependencies group across 1 directory with 6 updates by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/51
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.4.1...v0.4.2
+
 ## 0.4.1 (2026-08-24)
 
 ## What's Changed
