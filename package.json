@@ -76,7 +76,7 @@
     "prepack": "pnpm build"
   },
   "dependencies": {
-    "@workflow/errors": "5.0.0-beta.17",
+    "@workflow/errors": "5.0.0-beta.20",
     "@workflow/world": "5.0.0-beta.27",
     "ulid": "^3.0.2"
   },
