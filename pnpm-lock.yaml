@@ -15,8 +15,8 @@ importers:
   .:
     dependencies:
       '@workflow/errors':
-        specifier: 5.0.0-beta.17
-        version: 5.0.0-beta.17
+        specifier: 5.0.0-beta.20
+        version: 5.0.0-beta.20
       '@workflow/world':
         specifier: 5.0.0-beta.27
         version: 5.0.0-beta.27
@@ -1373,6 +1373,9 @@ packages:
   '@workflow/errors@5.0.0-beta.17':
     resolution: {integrity: sha512-orc86yllgOKpss/o5YD4kuhRbng+4aq8i4pPJR4uZCFeNpn4I4A+ek83lelQf31EJ5tyf12ikceOjabQxp317A==}
 
+  '@workflow/errors@5.0.0-beta.20':
+    resolution: {integrity: sha512-unNjhxAgwjZB54DasFvtG3U1BXKJS+qjyR47d7y34hs1uhTVNkq9HJ4uEgNCVgmyH7NzvieOC03Fkkp8cMF/3A==}
+
   '@workflow/nest@5.0.0-beta.42':
     resolution: {integrity: sha512-u5R3OoJ2xB0VRIHvIgBfLt531Dyv3ddZJ0pInZ53+yXroO7CMuvgM3j9KosDNyAMR6W9uvlk3VmKcOTPVJrwSA==}
     hasBin: true
@@ -1417,6 +1420,9 @@ packages:
     peerDependenciesMeta:
       typescript:
         optional: true
+
+  '@workflow/utils@5.0.0-beta.10':
+    resolution: {integrity: sha512-LVypRMbZG3z1GHSSyChhR/7WaDFjjlIpeGcysX5eI3/1sOVv8NHNOfCxXConvqGj9fSkM1oBlieS/eLO5kDaow==}
 
   '@workflow/utils@5.0.0-beta.8':
     resolution: {integrity: sha512-dDiQ/LT05g9HyOicqWNNX/Gw/fmO7Ma2kZ+ddUXXpm/EFTMRS9eiI69suSe1+1NnhMzdV6ObI8wrO5lvQqPIbg==}
@@ -4664,6 +4670,11 @@ snapshots:
       '@workflow/utils': 5.0.0-beta.8
       ms: 2.1.3
 
+  '@workflow/errors@5.0.0-beta.20':
+    dependencies:
+      '@workflow/utils': 5.0.0-beta.10
+      ms: 2.1.3
+
   '@workflow/nest@5.0.0-beta.42(@nestjs/common@11.1.28(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@10.2.2))(@nestjs/core@11.1.28(@nestjs/common@11.1.28(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@10.2.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(@swc/cli@0.8.1(@swc/core@1.15.3)(chokidar@5.0.0)(supports-color@10.2.2))(@swc/core@1.15.3)(supports-color@10.2.2)(ws@8.21.3)':
     dependencies:
       '@nestjs/common': 11.1.28(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@10.2.2)
@@ -4872,6 +4883,10 @@ snapshots:
   '@workflow/typescript-plugin@5.0.0-beta.5(typescript@7.0.2)':
     optionalDependencies:
       typescript: 7.0.2
+
+  '@workflow/utils@5.0.0-beta.10':
+    dependencies:
+      ms: 2.1.3
 
   '@workflow/utils@5.0.0-beta.8':
     dependencies:
