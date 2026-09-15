@@ -10,7 +10,7 @@
  * Constant-time string comparison via SHA-256 digests (digest-then-compare
  * is length-independent). crypto.subtle is global in both workerd and Node.
  */
-async function timingSafeEqual(a: string, b: string): Promise<boolean> {
+export async function timingSafeEqual(a: string, b: string): Promise<boolean> {
   const enc = new TextEncoder();
   const [da, db] = await Promise.all([
     crypto.subtle.digest('SHA-256', enc.encode(a)),

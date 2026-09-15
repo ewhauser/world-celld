@@ -101,7 +101,10 @@ the `WORKFLOW_QUEUE_PAYLOADS` binding from the existing fleet bucket under
 `r2/workflow-world-queue-payloads/`. `r2_buckets` is the Wrangler-compatible
 configuration key for that binding; it does not require Cloudflare R2.
 
-Deploy the Queue consumer first, then the primary HTTP worker. The order matters:
+Deploy the Queue consumer first, then the primary HTTP worker. The consumer
+binds the primary worker's `QueueDeliveryRpc` named entrypoint; deploy matching
+versions of both scripts during a maintenance window. The former internal
+`/v1/queue/deliver` route is removed. The order matters:
 the consumer deploy creates the Queue attachment; the primary deploy must go last
 so it remains the fleet's public application.
 
@@ -169,7 +172,7 @@ celld worker router
   `-- native Queue producer
           |
           v
-native Queue --> companion consumer --> service binding --> worker router
+native Queue --> companion consumer --> QueueDeliveryRpc.deliver()
                                                         |
                                                         v
                          Workflow application /.well-known/workflow/v1/flow
@@ -342,8 +345,12 @@ bucket-backed state. It checks that:
 - acknowledged run and stream state survives the process restart;
 - an accepted delayed queue message that becomes due while celld is down is
   delivered once after the native broker is restored;
-- the companion Queue consumer can call the primary worker through its service
-  binding and recover run-bearing payloads from the fleet object store;
+- the companion Queue consumer can call the named `QueueDeliveryRpc` service
+  entrypoint and recover run-bearing payloads from the fleet object store;
+- transient callbacks increment attempts while suspension preserves the attempt
+  count and message identity;
+- invalid credentials, envelopes, and attempts are rejected across real RPC;
+- the former HTTP delivery route returns 404;
 - multi-page retention cleanup continues from a persisted nonterminal phase;
 - cancelling an in-flight HTTP long poll leaves the stream writable and
   readable.

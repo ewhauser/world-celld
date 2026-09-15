@@ -3,6 +3,7 @@
 // application's node_modules so the deployed bundle stays in step with the
 // installed @ewhauser/world-celld version.
 export {
+  QueueDeliveryRpc,
   HookIdDO,
   HookTokenDO,
   RunCatalogDO,

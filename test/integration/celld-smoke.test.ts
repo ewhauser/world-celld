@@ -143,7 +143,50 @@ async function prepareWorker(
     logLevel: 'silent',
   });
 
-  const source = await readFile(configPath, 'utf8');
+  let source = await readFile(configPath, 'utf8');
+  if (configPath === 'celld-worker/wrangler.jsonc') {
+    // Test-only HTTP driver for the named RPC boundary. Never packaged or deployed
+    // outside this temporary fixture; normal delivery uses the companion script.
+    await writeFile(
+      join(destination, 'implementation.js'),
+      await readFile(join(destination, 'index.js')),
+    );
+    await writeFile(
+      join(destination, 'index.js'),
+      `
+      export * from './implementation.js';
+      import worker from './implementation.js';
+      export default {
+        ...worker,
+        async fetch(request, env) {
+          if (new URL(request.url).pathname !== '/__test/queue-rpc') return worker.fetch(request, env);
+          const [secret, envelope, attempt] = await request.json();
+          try {
+            return Response.json(await env.TEST_QUEUE_RPC.deliver(secret, envelope, attempt));
+          } catch (error) {
+            return Response.json({error: String(error)}, {status: 400});
+          }
+        },
+      };
+    `,
+    );
+    const wrapped = await build({
+      entryPoints: [join(destination, 'index.js')],
+      bundle: true,
+      format: 'esm',
+      platform: 'browser',
+      target: 'es2024',
+      conditions: ['workerd', 'worker', 'browser'],
+      external: ['cloudflare:*'],
+      write: false,
+      logLevel: 'silent',
+    });
+    await writeFile(join(destination, 'index.js'), wrapped.outputFiles[0].contents);
+    source = source.replace(
+      '"vars": {',
+      '"services": [{"binding":"TEST_QUEUE_RPC","service":"workflow-world","entrypoint":"QueueDeliveryRpc"}],\n  "vars": {',
+    );
+  }
   const main = '"main": "worker.ts",';
   if (!source.includes(main)) throw new Error(`${configPath} main entry changed`);
   await writeFile(
@@ -407,6 +450,18 @@ describe.skipIf(!CONFIGURED)('real celld v0.5.0 native-services restart smoke', 
           headers: request.headers,
           receivedAt: Date.now(),
         });
+        const queueName = String(request.headers['x-vqs-queue-name'] ?? '');
+        const matching = deliveries.filter((d) => d.headers['x-vqs-queue-name'] === queueName);
+        if (matching.length === 1 && queueName.includes('rpc_suspend')) {
+          response.writeHead(503, { 'content-type': 'application/json' });
+          response.end('{"timeoutSeconds":1}');
+          return;
+        }
+        if (matching.length === 1 && queueName.includes('rpc_retry')) {
+          response.writeHead(500);
+          response.end('transient');
+          return;
+        }
         response.writeHead(200, { 'content-type': 'application/json' });
         response.end('{"ok":true}');
       });
@@ -457,6 +512,67 @@ describe.skipIf(!CONFIGURED)('real celld v0.5.0 native-services restart smoke', 
       ...options,
     });
   }
+
+  it.each([
+    ['wrong-secret', { version: 1 }, 1, 'Unauthorized'],
+    [SECRET, {}, 1, 'version'],
+    [
+      SECRET,
+      {
+        version: 1,
+        messageId: 'msg_invalid_rpc',
+        queueName: '__wkf_workflow_invalid_rpc',
+        targetBaseUrl: 'https://app.invalid',
+        body: '{}',
+      },
+      0,
+      'attempt',
+    ],
+  ])(
+    'rejects invalid requests across the actual RPC boundary %#',
+    async (secret, envelope, attempt, expected) => {
+      const before = deliveries.length;
+      const response = await fetch(`${runtime!.url}/__test/queue-rpc`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify([secret, envelope, attempt]),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.text()).toContain(expected);
+      expect(deliveries.length).toBe(before);
+    },
+  );
+
+  it('does not expose the removed HTTP delivery route', async () => {
+    const response = await fetch(`${runtime!.url}/v1/queue/deliver`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${SECRET}` },
+      body: '[]',
+    });
+    expect(response.status).toBe(404);
+    await response.arrayBuffer();
+  });
+
+  it.each(['suspend', 'retry'])('preserves RPC %s delivery semantics', async (mode) => {
+    const w = world({ deploymentId: `rpc-${randomUUID()}` });
+    const queueName = `__wkf_workflow_rpc_${mode}_${randomUUID().slice(0, 8)}`;
+    await w.queue(
+      queueName,
+      { __healthCheck: true, correlationId: queueName },
+      { idempotencyKey: queueName },
+    );
+    const observed = await waitFor(
+      async () => {
+        const found = deliveries.filter((d) => d.headers['x-vqs-queue-name'] === queueName);
+        return found.length >= 2 ? found : null;
+      },
+      20_000,
+      `RPC ${mode} second callback`,
+    );
+    expect(observed[0].headers['x-vqs-message-attempt']).toBe('1');
+    expect(observed[1].headers['x-vqs-message-attempt']).toBe(mode === 'suspend' ? '1' : '2');
+    expect(observed[0].headers['x-vqs-message-id']).toBe(observed[1].headers['x-vqs-message-id']);
+  });
 
   it('persists opt-in runtime telemetry in the fleet bucket', async () => {
     const response = await fetch(`${runtime!.url}/v1/health`);
