@@ -106,8 +106,8 @@ unbounded namespace scan.
 | run index publication    |         1,200,900 ms | apply response plus idempotent catalog publication |
 | queue callback           |           300,000 ms | application delivery timeout                       |
 | queue claim stale window |           900,000 ms | crash recovery and duplicate suppression           |
-| native producer delay    |             86,400 s | celld v0.4.0 per-publication maximum               |
-| native broker retention  |               4 days | fixed celld v0.4.0 message lifetime                |
+| native producer delay    |             86,400 s | celld v0.5.0 per-publication maximum               |
+| native broker retention  |               4 days | fixed celld v0.5.0 message lifetime                |
 | orphan object grace      | `notBefore + 5 days` | outlives every valid native Queue pointer          |
 
 Queue deadlines remain fixed-width epoch-millisecond values. Validation leaves
@@ -127,7 +127,7 @@ Focused tests cover producer envelope validation, object-store offload and clean
 consumer success/permanent/transient decisions, suspension re-publication,
 long-delay chaining, exact idempotency claims, orphan cleanup, 128-object
 retention pages, generation races, maximum-age cleanup, and tombstone
-non-resurrection. The required real celld v0.4.0 smoke additionally proves the
+non-resurrection. The required real celld v0.5.0 smoke additionally proves the
 two-script Queue/service graph, delayed delivery across process loss, object-store-backed
 retention cleanup, durable run/stream recovery, and resumption of multi-page
 cleanup after `SIGKILL`.

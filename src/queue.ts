@@ -4,7 +4,7 @@
  * Vendored from vinnymac/worlds packages/world-cloudflare/src/queue.ts
  * (Apache-2.0, see NOTICE), modified for celld:
  *
- * - Production publishes a small pointer through celld v0.4.0 native Queues.
+ * - Production publishes a small pointer through celld v0.5.0 native Queues.
  *   The deployed Queue consumer forwards deliveries to the same HTTP handler
  *   used by the in-process test pump.
  * - Run-bearing message bodies live in the fleet object store. This preserves

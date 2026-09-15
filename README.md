@@ -76,12 +76,27 @@ requests. It must be reachable from every celld node.
 
 ## Deploy the worker
 
-Before deploying, you need a celld v0.4.0 fleet, `esbuild` on `PATH`, and an
+Before deploying, you need a celld v0.5.0 fleet, `esbuild` on `PATH`, and an
 object store that meets celld's conditional-write requirements. Refer to the
 [celld documentation](https://github.com/denoland/celld) for fleet and storage
 setup.
 
-No second storage service is required for queue payloads. celld v0.4.0 serves
+**world-celld 0.5.0 is a breaking release and requires celld v0.5.0.**
+Older runtimes and node-level worker-variable overrides are unsupported.
+
+For an existing fleet, follow the [v0.5.0 upgrade and feature review](docs/celld-v0.5-upgrade.md).
+Stop every old celld node before starting v0.5.0; this is not a rolling upgrade.
+
+Before either deploy, set `vars.WORLD_SECRET` in both copied Wrangler configs
+to the same secret from your secret manager. Set optional
+`vars.WORKFLOW_CALLBACK_SECRET` in the primary config and
+`vars.WORKFLOW_RETENTION_MS` there to the desired maximum workflow age
+(for example, `"7776000000"` for 90 days). Use private deployment copies outside
+source control: celld persists these variables in the deployment stored in the
+fleet bucket. v0.5.0 rejects `CELLD_VAR_*`; `.dev.vars` is read only by
+`celld dev`, not by `celld deploy`.
+
+No second storage service is required for queue payloads. celld v0.5.0 serves
 the `WORKFLOW_QUEUE_PAYLOADS` binding from the existing fleet bucket under
 `r2/workflow-world-queue-payloads/`. `r2_buckets` is the Wrangler-compatible
 configuration key for that binding; it does not require Cloudflare R2.
@@ -106,32 +121,35 @@ celld deploy ./workflow-world-queue --bucket s3://my-cells-bucket
 celld deploy ./workflow-world --bucket s3://my-cells-bucket
 ```
 
-This is a hard queue cutover. Existing `QueueDO` messages and dead letters are
+If upgrading from the former QueueDO implementation, this is a hard queue
+cutover. Existing `QueueDO` messages and dead letters are
 not migrated into celld's native Queue; drain or otherwise account for them
 before upgrading an existing fleet. The old QueueDO cell data becomes
 unreachable after the binding is removed.
 
-The worker rejects stateful requests unless `WORLD_SECRET` is configured. Pass
-the same secret to the fleet and the application:
+The worker rejects stateful requests unless `WORLD_SECRET` is configured in its
+deployment. Use that same secret for the application
+(`CELLD_WORLD_SECRET`). Start nodes with the storage and listener settings:
 
 ```sh
-CELLD_VAR_WORLD_SECRET="$CELLD_WORLD_SECRET" \
-CELLD_VAR_WORKFLOW_RETENTION_MS=7776000000 \
 celld --bucket s3://my-cells-bucket \
   --listen 0.0.0.0:8080 \
   --internal-listen 10.0.0.12:8081 \
   --advertise 10.0.0.12:8081
 ```
 
-Use a secret manager rather than putting the value in `wrangler.jsonc`. Keep
+Keep deployment configs containing secrets out of source control. Keep
 celld's internal listener on a trusted network; the World bearer token protects
 the worker RPC routes, not celld's administrative endpoints.
 
-The example sets a fleet-wide maximum workflow age of 90 days. Leave
-`WORKFLOW_RETENTION_MS` at `0` to disable that policy.
+Setting `vars.WORKFLOW_RETENTION_MS` to `"7776000000"` enables a fleet-wide
+maximum workflow age of 90 days. Leave `WORKFLOW_RETENTION_MS` at `0` to disable that policy.
 
 More deployment detail is in [`celld-worker/README.md`](./celld-worker/README.md)
 and [`celld-queue-worker/README.md`](./celld-queue-worker/README.md).
+
+For opt-in bucket or collector telemetry and local `.dev.vars` setup, see
+the [operational examples](docs/celld-v0.5-upgrade.md#adopt-telemetry).
 
 ## How it works
 
@@ -315,11 +333,12 @@ pnpm test:integration
 
 ### Real celld restart smoke
 
-The required CI smoke owns native celld v0.4.0 and MinIO processes on loopback,
+The required CI smoke owns native celld v0.5.0 and MinIO processes on loopback,
 uses fresh temporary bucket and runtime state, and kills celld with `SIGKILL`
 before deleting its local working state and starting a new process against the
 bucket-backed state. It checks that:
 
+- opt-in runtime telemetry is persisted as nonempty Parquet files in the fleet bucket;
 - acknowledged run and stream state survives the process restart;
 - an accepted delayed queue message that becomes due while celld is down is
   delivered once after the native broker is restored;
@@ -336,9 +355,8 @@ pnpm test:integration:celld-smoke
 ```
 
 The runner downloads celld and MinIO artifacts at pinned versions and verifies
-their SHA-256 digests before use. MinIO does not implement the conditional-write
-contract celld requires for production ownership fencing, so the smoke disables
-the storage probe and runs exactly one celld process at a time. It proves the
+their SHA-256 digests before use. celld performs its required storage-contract
+probe at startup; the smoke runs exactly one celld process at a time. It proves the
 single-process restart boundaries above, not multi-node ownership, handoff, or
 failover correctness.
 
@@ -350,14 +368,12 @@ message reaches a successful callback, including forced `503` redeliveries. A
 second workload creates terminal runs with streams and delayed queue messages,
 then verifies complete payload cleanup without resurrection. Results include
 queue and cleanup throughput plus p50, p95, p99, and maximum latency and are
-saved under `.perf-results/`. The harness pins celld v0.4.0 and deploys the same
+saved under `.perf-results/`. The harness pins celld v0.5.0 and deploys the same
 two-script native Queue topology as the restart smoke.
 
-> MinIO Community is **not a supported celld production store**. It does not
-> implement the conditional writes celld needs for ownership fencing. This
-> deliberately single-node harness disables celld's storage probe and tests
-> the queue's persistence, redelivery, and performance paths only; it does not
-> validate multi-node ownership or failover correctness.
+> This harness runs a single celld node and leaves the required storage-contract
+> probe enabled. Passing it does not establish multi-node fencing, ownership
+> handoff, or production suitability for a particular object-store deployment.
 
 With Docker and the Compose plugin installed, run:
 

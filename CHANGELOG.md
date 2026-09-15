@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.5.0 (unreleased)
+
+### Breaking changes
+
+- Require celld v0.5.0. Stop the entire old fleet before starting v0.5.0 nodes;
+  mixed-version fleets and older runtime compatibility are not supported.
+- Configure worker variables in deployment `vars`. Removed `CELLD_VAR_*` node
+  overrides are not supported; both scripts must deploy the same `WORLD_SECRET`.
+- Remove `CELLD_STORAGE_PROBE`, `CELLD_OUTPUT_GATE`, and `CELLD_OTEL_SINK` from
+  node environments. Use `CELLD_OTEL=1` for bucket telemetry or a collector base
+  URL for OTLP. Storage checks and durability gating are mandatory.
+
+### Improvements
+
+- Adopt the runtime's native Queue batching, alarm, storage, and recovery
+  improvements with the existing World retention and payload-storage design.
+- Document opt-in telemetry and development variables; verify persisted bucket
+  telemetry in the native runtime smoke.
+- Update runtime pins and verified downloads, and ship the
+  [upgrade guide](docs/celld-v0.5-upgrade.md) in the npm package.
+
 ## 0.4.1 (2026-08-24)
 
 ## What's Changed

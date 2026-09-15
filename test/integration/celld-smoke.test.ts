@@ -148,7 +148,9 @@ async function prepareWorker(
   if (!source.includes(main)) throw new Error(`${configPath} main entry changed`);
   await writeFile(
     join(destination, 'wrangler.jsonc'),
-    source.replace(main, '"main": "index.js",\n  "no_bundle": true,'),
+    source
+      .replace(main, '"main": "index.js",\n  "no_bundle": true,')
+      .replace('"WORLD_SECRET": ""', `"WORLD_SECRET": ${JSON.stringify(SECRET)}`),
   );
 }
 
@@ -172,12 +174,10 @@ class NativeCelldRuntime {
       CELLD_DURABILITY: 'bucket',
       CELLD_MAX_RSS_MB: '0',
       CELLD_NODE: 'world-celld-smoke-node',
+      CELLD_OTEL: '1',
+      CELLD_OTEL_FLUSH_MS: '1000',
       CELLD_OPERATION_DEADLINE_MS: '10000',
-      CELLD_STORAGE_PROBE: '0',
       CELLD_TTL_MS: '2000',
-      CELLD_VAR_QUEUE_DELIVERY_TIMEOUT_MS: '5000',
-      CELLD_VAR_QUEUE_MAX_INFLIGHT: '1',
-      CELLD_VAR_WORLD_SECRET: SECRET,
       CELLD_WAKER_TICK_MS: '50',
       CELLD_WATCH: watchDirectory,
       RUST_LOG: 'info',
@@ -266,7 +266,7 @@ class NativeCelldRuntime {
   }
 }
 
-describe.skipIf(!CONFIGURED)('real celld v0.4.0 native-services restart smoke', () => {
+describe.skipIf(!CONFIGURED)('real celld v0.5.0 native-services restart smoke', () => {
   const deliveries: CapturedDelivery[] = [];
   let temporaryRoot: string;
   let minio: ManagedProcess | undefined;
@@ -364,8 +364,8 @@ describe.skipIf(!CONFIGURED)('real celld v0.4.0 native-services restart smoke', 
         AWS_EC2_METADATA_DISABLED: 'true',
       };
       const version = await execFileAsync(CELLD_BIN!, ['--version'], { env: storageClientEnv });
-      if (!/\b0\.4\.0\b/.test(version.stdout)) {
-        throw new Error(`expected celld v0.4.0, got ${version.stdout.trim()}`);
+      if (!/\b0\.5\.0\b/.test(version.stdout)) {
+        throw new Error(`expected celld v0.5.0, got ${version.stdout.trim()}`);
       }
       // The consumer deploy establishes the Queue attachment and its named
       // script pointer. The primary deploy goes last so it remains the public
@@ -457,6 +457,30 @@ describe.skipIf(!CONFIGURED)('real celld v0.4.0 native-services restart smoke', 
       ...options,
     });
   }
+
+  it('persists opt-in runtime telemetry in the fleet bucket', async () => {
+    const response = await fetch(`${runtime!.url}/v1/health`);
+    expect(response.ok).toBe(true);
+    await response.arrayBuffer();
+    await waitFor(
+      async () => {
+        const { stdout } = await execFileAsync(
+          MC_BIN!,
+          ['ls', '--recursive', '--json', `smoke/${BUCKET}/telemetry/`],
+          { env: { ...process.env, MC_CONFIG_DIR: join(temporaryRoot, 'mc-config') } },
+        );
+        return stdout
+          .split('\n')
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as { key?: string; size?: number })
+          .some((object) => object.key?.endsWith('.parquet') && (object.size ?? 0) > 0)
+          ? true
+          : null;
+      },
+      15_000,
+      'persisted runtime telemetry',
+    );
+  });
 
   it('recovers durable state and one accepted native Queue delivery after a process restart', async () => {
     const deploymentId = `restart-${randomUUID()}`;
