@@ -5,7 +5,8 @@
  * worker through a service binding, keeping the Queue attachment independent
  * of the public HTTP worker.
  */
-import { rpcStringify } from '../codec.js';
+
+import type { QueueDeliveryResult } from './queue-delivery.js';
 import {
   MAX_QUEUE_SUSPENSIONS,
   QUEUE_CLAIM_STALE_MS,
@@ -31,7 +32,11 @@ interface QueueProducerBinding {
 }
 
 interface ServiceBinding {
-  fetch(request: Request): Promise<Response>;
+  deliver(
+    secret: string,
+    envelope: NativeQueueEnvelope,
+    attempt: number,
+  ): Promise<QueueDeliveryResult>;
 }
 
 export interface QueueConsumerEnv {
@@ -39,8 +44,6 @@ export interface QueueConsumerEnv {
   WORLD_SERVICE: ServiceBinding;
   WORLD_SECRET?: string;
 }
-
-const PERMANENT_STATUSES = new Set([404, 409, 410, 422]);
 
 function backoffSeconds(attempt: number): number {
   return Math.min(60, 2 ** Math.min(attempt, 30));
@@ -89,36 +92,25 @@ async function consume(message: NativeQueueMessage, env: QueueConsumerEnv): Prom
     return;
   }
 
-  let response: Response;
+  let response: Awaited<ReturnType<ServiceBinding['deliver']>>;
   try {
-    response = await env.WORLD_SERVICE.fetch(
-      new Request('https://workflow-world.internal/v1/queue/deliver', {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${env.WORLD_SECRET}`,
-          'content-type': 'application/json',
-        },
-        body: rpcStringify([envelope, attempt]),
-      }),
-    );
+    response = await env.WORLD_SERVICE.deliver(env.WORLD_SECRET, envelope, attempt);
   } catch (error) {
     console.error('world-celld Queue consumer could not reach the world service', error);
     message.retry({ delaySeconds: backoffSeconds(attempt) });
     return;
   }
 
-  if (response.ok || PERMANENT_STATUSES.has(response.status)) {
-    await response.body?.cancel().catch(() => undefined);
+  if (response?.kind === 'complete') {
     message.ack();
     return;
   }
 
-  if (response.status === 503) {
+  if (response?.kind === 'suspend') {
     try {
-      const parsed = (await response.json()) as { timeoutSeconds?: unknown };
       const notBefore = queueDelayDeadline(
         Date.now(),
-        parsed.timeoutSeconds,
+        response.timeoutSeconds,
         1,
         QUEUE_CLAIM_STALE_MS,
       );
@@ -136,8 +128,6 @@ async function consume(message: NativeQueueMessage, env: QueueConsumerEnv): Prom
     } catch (error) {
       console.error('world-celld Queue consumer received an invalid suspension response', error);
     }
-  } else {
-    await response.body?.cancel().catch(() => undefined);
   }
 
   message.retry({ delaySeconds: backoffSeconds(attempt) });
