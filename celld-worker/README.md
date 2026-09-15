@@ -11,7 +11,10 @@ payload bodies stored in the fleet's object store.
 
 Copy this directory and the companion Queue consumer out of `node_modules` so
 `celld deploy` can bundle them. Deploy the consumer first and this primary
-worker last:
+worker last. Before deploying, set `vars.WORLD_SECRET` in both copied
+Wrangler configs to the same secret from your secret manager. Keep those
+private deployment copies out of source control; celld stores their variables
+in the fleet bucket. Stop the whole old fleet before starting v0.5.0 nodes:
 
 ```sh
 cp -r node_modules/@ewhauser/world-celld/celld-worker ./workflow-world
@@ -26,10 +29,10 @@ to the native Queue.
 
 Requirements:
 
-- celld v0.4.0 (the currently tested runtime baseline).
+- celld v0.5.0 (the currently tested runtime baseline).
 - `esbuild` on PATH (celld shells out to it).
 - A bucket with conditional-write support (celld's fencing requirement).
-- `WORLD_SECRET` injected at the node level (`CELLD_VAR_WORLD_SECRET=...`) —
+- `WORLD_SECRET` set in the deployment config (`vars.WORLD_SECRET`) —
   the router fails closed with 503 while it is empty.
 
 Queue payloads do not require another provider or another set of credentials.
@@ -40,13 +43,10 @@ names the Workers-compatible binding API; it does not require Cloudflare R2.
 ## Fleet-wide retention
 
 The bundled `wrangler.jsonc` declares an hourly UTC cron trigger. It does no
-catalog work by default. Set `CELLD_VAR_WORKFLOW_RETENTION_MS` on every node to
-enable a maximum workflow age measured from run creation:
-
-```sh
-CELLD_VAR_WORKFLOW_RETENTION_MS=7776000000 \
-celld --bucket s3://my-cells-bucket
-```
+catalog work by default. Set `vars.WORKFLOW_RETENTION_MS` to `"7776000000"`
+in the primary Wrangler config and redeploy to enable a maximum workflow age
+measured from run creation. v0.5.0 rejects `CELLD_VAR_*` node overrides.
+`.dev.vars` overrides apply only to `celld dev`, not production deployments.
 
 `7776000000` is 90 days. The policy includes pending and running workflows as
 well as terminal ones. Each cron occurrence admits at most

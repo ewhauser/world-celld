@@ -3,7 +3,7 @@ import { MAX_QUEUE_SCHEDULE_TIMESTAMP_MS } from './lifecycle.js';
 
 export { QUEUE_CLAIM_STALE_MS } from './lifecycle.js';
 
-/** celld v0.4.0 follows this native Queue producer-delay ceiling. */
+/** celld v0.5.0 follows this native Queue producer-delay ceiling. */
 export const NATIVE_QUEUE_MAX_DELAY_SECONDS = 86_400;
 export const NATIVE_QUEUE_MAX_MESSAGE_BYTES = 128_000;
 export const MAX_QUEUE_SUSPENSIONS = 256;

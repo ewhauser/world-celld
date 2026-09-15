@@ -44,7 +44,7 @@
   "vars": {
     // REQUIRED: bearer secret for the world's RPC and binary stream surface.
     // Authenticated routes fail closed with 503 while this is empty. Inject the real value
-    // at the node level with CELLD_VAR_WORLD_SECRET instead of committing it.
+    // into vars in a private deployment copy of this config; never commit secrets.
     "WORLD_SECRET": "",
     // Optional: forwarded as x-workflow-callback-secret on queue deliveries.
     "WORKFLOW_CALLBACK_SECRET": "",

@@ -18,7 +18,7 @@
   },
   "vars": {
     // REQUIRED. Inject the same value used by the primary worker through
-    // CELLD_VAR_WORLD_SECRET rather than committing it here.
+    // vars in a private deployment copy of this config; never commit secrets.
     "WORLD_SECRET": "",
   },
 }

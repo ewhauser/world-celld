@@ -48,6 +48,7 @@ services:
     entrypoint: ['/bin/sh', '-c']
     command:
       - >-
+        node test/perf/minio/configure.mjs &&
         celld deploy celld-queue-worker --bucket s3://world-celld-perf
         --endpoint http://minio:9000 --region us-east-1 &&
         celld deploy celld-worker --bucket s3://world-celld-perf
@@ -60,10 +61,6 @@ services:
         condition: service_completed_successfully
     environment:
       <<: *storage-environment
-      # MinIO Community does not enforce the conditional writes celld needs
-      # for multi-node fencing. This harness is deliberately single-node.
-      CELLD_STORAGE_PROBE: '0'
-      CELLD_VAR_WORLD_SECRET: world-celld-perf-secret
       CELLD_WATCH: /var/lib/celld/state
     command:
       - celld
@@ -112,7 +109,7 @@ services:
       PERF_RETENTION_CONCURRENCY: '${PERF_RETENTION_CONCURRENCY:-16}'
       PERF_RUN_RETENTION_MS: '${PERF_RUN_RETENTION_MS:-1000}'
       PERF_RETENTION_RESULT_PATH: /workspace/.perf-results/minio-retention-latest.json
-      PERF_CELLD_VERSION: v0.4.0
+      PERF_CELLD_VERSION: v0.5.0
       PERF_MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
     command: pnpm vitest run --config vitest.perf.config.ts
     volumes:

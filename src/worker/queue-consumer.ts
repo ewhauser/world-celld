@@ -1,9 +1,9 @@
 /**
  * celld native Queue consumer.
  *
- * celld v0.4.0 does not allow one script to export both `fetch` and `queue`,
- * so this small companion script consumes the broker and calls the primary
- * world worker through a service binding.
+ * This companion script consumes the broker and calls the primary world
+ * worker through a service binding, keeping the Queue attachment independent
+ * of the public HTTP worker.
  */
 import { rpcStringify } from '../codec.js';
 import {
