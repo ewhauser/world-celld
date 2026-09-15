@@ -2,7 +2,8 @@
 
 The primary celld-deployable half of `@ewhauser/world-celld`: five cell classes
 (WorkflowRunDO, RunCatalogDO, HookTokenDO, HookIdDO, and StreamDO) behind an
-authenticated HTTP router. Storage and control methods use fixed JSON RPC
+authenticated HTTP router, plus the `QueueDeliveryRpc` named entrypoint
+for the companion consumer. Storage and control methods use fixed JSON RPC
 routes; stream chunks use bounded binary batch writes and binary long-poll
 reads. Queue producers use celld's native Queue binding, with run-bearing
 payload bodies stored in the fleet's object store.

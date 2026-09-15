@@ -2,7 +2,9 @@
   "name": "workflow-world-queue-consumer",
   "main": "worker.ts",
   "compatibility_date": "2026-01-01",
-  "services": [{ "binding": "WORLD_SERVICE", "service": "workflow-world" }],
+  "services": [
+    { "binding": "WORLD_SERVICE", "service": "workflow-world", "entrypoint": "QueueDeliveryRpc" },
+  ],
   "queues": {
     "producers": [{ "binding": "WORKFLOW_QUEUE", "queue": "workflow-world" }],
     "consumers": [

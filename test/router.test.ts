@@ -1,3 +1,4 @@
+import { deliverQueueMessage } from '../src/worker/queue-delivery.js';
 /**
  * Wire-protocol tests: real router + real DO classes (on fake cells) behind
  * node:http, driven by the real remote client. Everything except celld.
@@ -654,34 +655,9 @@ describe('native Queue bridge', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('accepts a successful callback without buffering its response body', async () => {
-    const router = createRouter({
-      WORKFLOW_DB: harness.fleet.namespace('runs'),
-      WORLD_SECRET: SECRET,
-    } as WorkerEnv);
-    const callback = vi
-      .fn<typeof fetch>()
-      .mockResolvedValue(new Response('x'.repeat(64 * 1024 + 1), { status: 200 }));
-    vi.stubGlobal('fetch', callback);
-    try {
-      const response = await router(
-        request('deliver', [
-          {
-            version: 1,
-            messageId: 'msg_router_large_success',
-            queueName: '__wkf_workflow_router_large_success',
-            targetBaseUrl: 'https://app.internal',
-            body: rpcStringify({ type: 'success' }),
-          },
-          1,
-        ]),
-      );
-      expect(response.status).toBe(200);
-      expect(await response.text()).toBe('');
-    } finally {
-      vi.unstubAllGlobals();
-    }
-    expect(callback).toHaveBeenCalledOnce();
+  it('does not expose the old HTTP delivery operation', async () => {
+    const router = createRouter({ WORLD_SECRET: SECRET } as WorkerEnv);
+    expect((await router(request('deliver', []))).status).toBe(404);
   });
 
   it('offloads a run payload to object storage, delivers it, and clears claim state', async () => {
@@ -747,7 +723,9 @@ describe('native Queue bridge', () => {
     const callback = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
     vi.stubGlobal('fetch', callback);
     try {
-      expect((await router(request('deliver', [brokerEnvelope, 2]))).status).toBe(204);
+      expect(await deliverQueueMessage(env, SECRET, brokerEnvelope, 2)).toEqual({
+        kind: 'complete',
+      });
     } finally {
       vi.unstubAllGlobals();
     }

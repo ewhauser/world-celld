@@ -3,6 +3,9 @@
  * default fetch router. This module (and everything it imports) must stay
  * free of Node built-ins — it runs inside celld's workerd runtime.
  */
+
+import { WorkerEntrypoint } from './do-base.js';
+import { deliverQueueMessage, type QueueDeliveryResult } from './queue-delivery.js';
 import { createRouter, type WorkerEnv } from './router.js';
 import { runRetentionSweep, type RetentionSweepEnv } from './retention-sweep.js';
 import {
@@ -50,3 +53,20 @@ export default {
   },
   scheduled,
 };
+
+/** Only the companion consumer binds this internal delivery entrypoint. */
+export class QueueDeliveryRpc extends WorkerEntrypoint<CelldWorkerEnv> {
+  deliver(secret: unknown, envelope: unknown, attempt: unknown): Promise<QueueDeliveryResult> {
+    return deliverQueueMessage(
+      {
+        ...this.env,
+        WORKFLOW_QUEUE_PAYLOADS: this.env.WORKFLOW_QUEUE_PAYLOADS
+          ? createQueuePayloadStore(this.env.WORKFLOW_QUEUE_PAYLOADS)
+          : undefined,
+      },
+      secret,
+      envelope,
+      attempt,
+    );
+  }
+}

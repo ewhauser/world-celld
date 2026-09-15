@@ -13,3 +13,11 @@ export class DurableObject<TEnv = unknown> {
     readonly env: TEnv,
   ) {}
 }
+
+/** Node-only base for testing named Worker entrypoints. */
+export class WorkerEntrypoint<TEnv = unknown> {
+  constructor(
+    readonly ctx: ExecutionContext,
+    readonly env: TEnv,
+  ) {}
+}

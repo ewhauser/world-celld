@@ -6,6 +6,10 @@ All notable changes to this project will be documented in this file.
 
 ### Breaking changes
 
+- Internal Queue delivery now requires the `QueueDeliveryRpc` named entrypoint.
+  Deploy matching consumer and primary worker scripts together; the former
+  `/v1/queue/deliver` route is removed with no fallback.
+
 - Require celld v0.5.0. Stop the entire old fleet before starting v0.5.0 nodes;
   mixed-version fleets and older runtime compatibility are not supported.
 - Configure worker variables in deployment `vars`. Removed `CELLD_VAR_*` node

@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from 'node:assert/strict';
+import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -148,6 +149,31 @@ try {
     ].join('\n'),
   );
   run(process.execPath, ['smoke.mjs'], { cwd: consumerDirectory });
+
+  // Exercise the shipped source entries through the installed tarball, not the
+  // workspace's dist files. In particular, the named RPC export must survive.
+  for (const directory of ['celld-worker', 'celld-queue-worker']) {
+    const result = await build({
+      absWorkingDir: consumerDirectory,
+      entryPoints: [`node_modules/${PACKAGE_NAME}/${directory}/worker.ts`],
+      bundle: true,
+      format: 'esm',
+      platform: 'browser',
+      target: 'es2024',
+      conditions: ['workerd', 'worker', 'browser'],
+      external: ['cloudflare:*'],
+      write: false,
+      metafile: true,
+      logLevel: 'silent',
+    });
+    const exports = new Set(
+      Object.values(result.metafile.outputs).flatMap((bundle) => bundle.exports),
+    );
+    assert(exports.has('default'), `${directory} is missing its default handler`);
+    if (directory === 'celld-worker') {
+      assert(exports.has('QueueDeliveryRpc'), 'installed worker is missing QueueDeliveryRpc');
+    }
+  }
 
   console.log(
     `package check OK — ${pack.id}, ${pack.entryCount} files, ${pack.size} compressed bytes`,
