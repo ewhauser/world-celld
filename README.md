@@ -12,6 +12,17 @@ self-hosted alternative to platform-specific Workflow backends.
 > `world-celld` is experimental and has not been proven in production. Its API
 > and storage layout may change before 1.0.
 
+## World protocol compatibility
+
+This adapter supports World spec v7 with the Workflow 5 beta packages. Event
+slots are allocated in the same transaction that stores each event, so reads
+see a dense log and failed writes leave no gaps. No background sealing or
+`noop` events are needed. Runs stamped with earlier spec versions are rejected
+when applying events; finish existing runs before upgrading.
+
+Run listing accepts either a single status or an array of statuses (OR matching).
+An empty status array matches no runs.
+
 ## What it provides
 
 - Workflow run, step, event, and hook persistence

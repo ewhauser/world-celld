@@ -217,6 +217,32 @@ describe('Storage regressions', () => {
     expect(page.data.map((event) => eventIdToSlot(event.eventId))).toEqual([1, 2, 3]);
   });
 
+  it('filters by any requested status across pages and matches nothing for an empty array', async () => {
+    const pending = await createRun('multi-status');
+    const completed = await createRun('multi-status');
+    await storage.events.create(completed.runId, {
+      eventType: 'run_completed',
+      eventData: { output: [] },
+    });
+    const cancelled = await createRun('multi-status');
+    await storage.events.create(cancelled.runId, { eventType: 'run_cancelled' });
+    const first = await storage.runs.list({
+      workflowName: 'multi-status',
+      status: ['pending', 'cancelled'],
+      pagination: { limit: 1, sortOrder: 'asc' },
+    });
+    expect(first.data.map((run) => run.runId)).toEqual([pending.runId]);
+    expect(first.hasMore).toBe(true);
+    const second = await storage.runs.list({
+      workflowName: 'multi-status',
+      status: ['pending', 'cancelled'],
+      pagination: { limit: 1, sortOrder: 'asc', cursor: first.cursor! },
+    });
+    expect(second.data.map((run) => run.runId)).toEqual([cancelled.runId]);
+    expect(second.hasMore).toBe(false);
+    expect((await storage.runs.list({ status: [] })).data).toEqual([]);
+  });
+
   it('orders runs by creation time in descending order', async () => {
     const first = await createRun('run-sort-order');
     await setTimeout(2);
