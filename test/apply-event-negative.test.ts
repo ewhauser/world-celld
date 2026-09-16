@@ -105,6 +105,30 @@ function applyOutcomeFetch(outcome: unknown): typeof fetch {
 }
 
 describe('negative apply-event contract', () => {
+  it('advertises v7 and commits concurrent events densely across rejections and restart', async () => {
+    const runId = 'wrun_sealed_log_v7';
+    const run = await createRun(runId);
+    expect(SPEC_VERSION_CURRENT).toBe(7);
+    expect(run.specVersion).toBe(7);
+    const writer = storage();
+    const write = (id: string) =>
+      writer.events.create(runId, {
+        eventType: 'step_created',
+        correlationId: id,
+        eventData: { stepName: id, input: [] },
+      });
+    await Promise.all(Array.from({ length: 8 }, (_, index) => write(`step-${index}`)));
+    await expect(write('step-0')).rejects.toSatisfy((error) => EntityConflictError.is(error));
+    harness.fleet.restartCell('runs', runId);
+    await write('after-restart');
+    const events = await writer.events.list({ runId, pagination: { sortOrder: 'asc' } });
+    expect(events.data.map((event) => event.eventId)).toEqual(
+      Array.from({ length: 10 }, (_, index) => slotToEventId(index + 1)),
+    );
+    expect(events.data.every((event) => event.specVersion === 7)).toBe(true);
+    expect(events.data.some((event) => event.eventType === 'noop')).toBe(false);
+  });
+
   it('reconstructs unknown structured failures without entering the success path', async () => {
     const details = {
       reason: 'new server-side failure mode',

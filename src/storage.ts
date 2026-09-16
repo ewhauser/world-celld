@@ -483,6 +483,12 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
       async list(
         params?: ListWorkflowRunsParams,
       ): Promise<PaginatedResponse<WorkflowRun | WorkflowRunWithoutData>> {
+        const statuses =
+          params?.status === undefined
+            ? undefined
+            : Array.isArray(params.status)
+              ? params.status
+              : [params.status];
         const limit = params?.pagination?.limit ?? 20;
         const prefix = params?.workflowName ? `run:${params.workflowName}:` : 'runall:';
         const reverse = params?.pagination?.sortOrder === 'desc';
@@ -514,7 +520,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             // Use monotonic status metadata as a conservative prefilter,
             // then still verify every candidate against the authoritative
             // RunDO below. Earlier metadata cannot exclude a later status.
-            if (indexStatusExcludes(metadata.status, params?.status)) {
+            if (statuses?.every((status) => indexStatusExcludes(metadata.status, status))) {
               continue;
             }
             candidates.push({ key: key.name, metadata });
@@ -531,7 +537,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
                   const run = await runsGet(metadata.runId, {
                     resolveData: params?.resolveData,
                   });
-                  return !params?.status || run.status === params.status ? { key, run } : null;
+                  return statuses === undefined || statuses.includes(run.status)
+                    ? { key, run }
+                    : null;
                 } catch (error) {
                   if (!WorkflowRunNotFoundError.is(error) && !RunExpiredError.is(error)) {
                     throw error;
