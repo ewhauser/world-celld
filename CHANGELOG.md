@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.0 (2026-09-16)
+
+## What's Changed
+* feat!: upgrade Workflow packages and require World spec v7 by @ewhauser in https://github.com/ewhauser/world-celld/pull/59
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.5.0...v0.6.0
+
 ## 0.5.0 (unreleased)
 
 ### Breaking changes
