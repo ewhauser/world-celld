@@ -24,7 +24,7 @@ updates:
         update-types:
           - minor
           - patch
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 0
 
   - package-ecosystem: github-actions
     directory: /
@@ -39,4 +39,4 @@ updates:
       github-actions:
         patterns:
           - '*'
-    open-pull-requests-limit: 5
+    open-pull-requests-limit: 0
