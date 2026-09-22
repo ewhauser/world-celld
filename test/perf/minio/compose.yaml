@@ -62,6 +62,8 @@ services:
     environment:
       <<: *storage-environment
       CELLD_WATCH: /var/lib/celld/state
+      CELLD_NODE: world-celld-perf-primary
+      CELLD_TTL_MS: '2000'
     command:
       - celld
       - --bucket
@@ -74,6 +76,8 @@ services:
       - 0.0.0.0:8080
       - --internal-listen
       - 0.0.0.0:8081
+      - --advertise
+      - celld:8081
     healthcheck:
       test:
         - CMD
@@ -85,6 +89,42 @@ services:
       retries: 90
     volumes:
       - celld-state:/var/lib/celld
+
+  celld-peer:
+    <<: *app
+    depends_on:
+      deploy:
+        condition: service_completed_successfully
+    environment:
+      <<: *storage-environment
+      CELLD_WATCH: /var/lib/celld/state
+      CELLD_NODE: world-celld-perf-peer
+      CELLD_TTL_MS: '2000'
+    command:
+      - celld
+      - --bucket
+      - s3://world-celld-perf
+      - --endpoint
+      - http://minio:9000
+      - --region
+      - us-east-1
+      - --listen
+      - 0.0.0.0:8080
+      - --internal-listen
+      - 0.0.0.0:8081
+      - --advertise
+      - celld-peer:8081
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/v1/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))
+      interval: 1s
+      timeout: 5s
+      retries: 90
+    volumes:
+      - celld-peer-state:/var/lib/celld
 
   perf:
     <<: *app
@@ -109,6 +149,18 @@ services:
       PERF_RETENTION_CONCURRENCY: '${PERF_RETENTION_CONCURRENCY:-16}'
       PERF_RUN_RETENTION_MS: '${PERF_RUN_RETENTION_MS:-1000}'
       PERF_RETENTION_RESULT_PATH: /workspace/.perf-results/minio-retention-latest.json
+      PERF_WORKFLOW_RUNS: '${PERF_WORKFLOW_RUNS:-25}'
+      PERF_WORKFLOW_CONCURRENCY: '${PERF_WORKFLOW_CONCURRENCY:-8}'
+      PERF_WORKFLOW_RESULT_PATH: /workspace/.perf-results/minio-workflow-latest.json
+      PERF_STEADY_SECONDS: '${PERF_STEADY_SECONDS:-0}'
+      PERF_STEADY_RATE: '${PERF_STEADY_RATE:-25}'
+      PERF_STEADY_RESULT_PATH: /workspace/.perf-results/minio-steady-latest.json
+      PERF_FAILOVER: '${PERF_FAILOVER:-0}'
+      CELLD_PEER_URL: http://celld-peer:8080
+      PERF_FAILOVER_READY_PATH: /workspace/.perf-results/failover-ready
+      PERF_FAILOVER_DONE_PATH: /workspace/.perf-results/failover-done
+      PERF_FAILOVER_RESULT_PATH: /workspace/.perf-results/minio-failover-latest.json
+      PERF_FAILOVER_MESSAGES: '${PERF_FAILOVER_MESSAGES:-32}'
       PERF_CELLD_VERSION: v0.5.0
       PERF_MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
     command: pnpm vitest run --config vitest.perf.config.ts
@@ -117,4 +169,5 @@ services:
 
 volumes:
   celld-state:
+  celld-peer-state:
   minio-data:

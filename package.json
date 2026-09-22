@@ -70,6 +70,8 @@
     "test:perf:index": "vitest run --config vitest.index-perf.config.ts",
     "test:perf:index:baseline": "node scripts/measure-index-main-baseline.mjs",
     "test:perf:minio": "bash test/perf/minio/run.sh",
+    "test:perf:minio:matrix": "node scripts/run-perf-matrix.mjs",
+    "test:perf:minio:failover": "bash test/perf/minio/run-multi.sh",
     "typecheck": "tsc --noEmit",
     "check:worker-bundle": "node scripts/check-worker-bundle.mjs",
     "pack:check": "node scripts/check-package.mjs",
