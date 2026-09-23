@@ -160,7 +160,29 @@ describe('MinIO single-node queue performance and loss', () => {
   const retentionMs = positiveInteger('PERF_RUN_RETENTION_MS', 1_000);
   const retentionResultPath =
     process.env.PERF_RETENTION_RESULT_PATH ?? '.perf-results/minio-retention-latest.json';
+  const workflowRuns = positiveInteger('PERF_WORKFLOW_RUNS', 25);
+  const workflowConcurrency = positiveInteger('PERF_WORKFLOW_CONCURRENCY', 8);
+  const workflowResultPath =
+    process.env.PERF_WORKFLOW_RESULT_PATH ?? '.perf-results/minio-workflow-latest.json';
+  const steadySeconds = nonNegativeInteger('PERF_STEADY_SECONDS');
+  const steadyRate = positiveInteger('PERF_STEADY_RATE', 25);
+  const steadyCount = steadySeconds * steadyRate;
+  if (!Number.isSafeInteger(steadyCount) || steadyCount > 100_000) {
+    throw new Error('PERF_STEADY_SECONDS * PERF_STEADY_RATE must be at most 100000');
+  }
+  const steadyResultPath =
+    process.env.PERF_STEADY_RESULT_PATH ?? '.perf-results/minio-steady-latest.json';
   const runId = randomUUID();
+  const workflowMarker = `workflow-${runId}`;
+  const steadyMarker = `steady-${runId}`;
+  const workflowStartedAt = new Map<number, number>();
+  const workflowAccepted = new Map<number, string>();
+  const workflowDelivered = new Map<number, Delivery>();
+  let workflowDuplicates = 0;
+  const steadyStartedAt = new Map<number, number>();
+  const steadyAccepted = new Map<number, string>();
+  const steadyDelivered = new Map<number, Delivery>();
+  let steadyDuplicates = 0;
   const startedAt = new Map<number, number>();
   const accepted = new Map<number, string>();
   const successful = new Map<number, Delivery>();
@@ -193,40 +215,59 @@ describe('MinIO single-node queue performance and loss', () => {
 
       const [payloadRunId, sequenceText] = payload.correlationId.split('|', 2);
       const sequence = /^\d+$/.test(sequenceText ?? '') ? Number(sequenceText) : Number.NaN;
+      const workflowCallback = payloadRunId === workflowMarker;
+      const steadyCallback = payloadRunId === steadyMarker;
       if (
         !payload['__healthCheck'] ||
-        payloadRunId !== runId ||
+        (payloadRunId !== runId && !workflowCallback && !steadyCallback) ||
         !Number.isSafeInteger(sequence) ||
-        sequence >= messageCount
+        sequence < 0 ||
+        sequence >= (workflowCallback ? workflowRuns : steadyCallback ? steadyCount : messageCount)
       ) {
         invalidCallbacks.push(`unexpected payload: ${JSON.stringify(payload)}`);
         response.writeHead(400).end();
         return;
       }
 
-      const attemptCount = (callbackAttempts.get(sequence) ?? 0) + 1;
-      callbackAttempts.set(sequence, attemptCount);
+      const attemptCount =
+        workflowCallback || steadyCallback ? 1 : (callbackAttempts.get(sequence) ?? 0) + 1;
+      if (!workflowCallback && !steadyCallback) callbackAttempts.set(sequence, attemptCount);
 
-      if (retryEvery > 0 && sequence % retryEvery === 0 && attemptCount === 1) {
+      if (
+        !workflowCallback &&
+        !steadyCallback &&
+        retryEvery > 0 &&
+        sequence % retryEvery === 0 &&
+        attemptCount === 1
+      ) {
         response.writeHead(503, { 'content-type': 'application/json' });
         response.end(JSON.stringify({ timeoutSeconds: 0 }));
         return;
       }
 
       const messageId = request.headers['x-vqs-message-id'];
-      const start = startedAt.get(sequence);
+      const start = (
+        workflowCallback ? workflowStartedAt : steadyCallback ? steadyStartedAt : startedAt
+      ).get(sequence);
       if (typeof messageId !== 'string' || start === undefined) {
         invalidCallbacks.push(`missing metadata for sequence ${sequence}`);
         response.writeHead(400).end();
         return;
       }
 
-      if (successful.has(sequence)) {
-        successfulDuplicates++;
+      const delivered = workflowCallback
+        ? workflowDelivered
+        : steadyCallback
+          ? steadyDelivered
+          : successful;
+      if (delivered.has(sequence)) {
+        if (workflowCallback) workflowDuplicates++;
+        else if (steadyCallback) steadyDuplicates++;
+        else successfulDuplicates++;
       } else {
         const latencyMs = performance.now() - start;
-        successful.set(sequence, { messageId, latencyMs, callbackAttempts: attemptCount });
-        deliveryLatencies.push(latencyMs);
+        delivered.set(sequence, { messageId, latencyMs, callbackAttempts: attemptCount });
+        if (!workflowCallback && !steadyCallback) deliveryLatencies.push(latencyMs);
       }
 
       response.writeHead(200, { 'content-type': 'application/json' });
@@ -242,6 +283,7 @@ describe('MinIO single-node queue performance and loss', () => {
   afterAll(async () => {
     delete process.env.CELLD_QUEUE_MODE;
     if (!listener) return;
+    listener.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
       listener.close((error) => (error ? reject(error) : resolve())),
     );
@@ -369,6 +411,244 @@ describe('MinIO single-node queue performance and loss', () => {
       maxDeliveryP99Ms === 0 || deliveryP99Ms <= maxDeliveryP99Ms,
       `delivery p99 ${deliveryP99Ms}ms exceeds ${maxDeliveryP99Ms}ms`,
     ).toBe(true);
+  });
+
+  it('measures a mixed workflow lifecycle through the real fleet', async () => {
+    const deploymentId = `workflow-perf-${runId}`;
+    const workflowName = `workflow-perf-${runId}`;
+    const world = createCelldWorld({
+      fleetUrl,
+      secret,
+      baseUrl: process.env.CELLD_CALLBACK_BASE_URL,
+      deploymentId,
+      rpcTimeoutMs: timeoutMs,
+    });
+    const stageMs: Record<string, number[]> = {
+      create: [],
+      step: [],
+      hook: [],
+      stream: [],
+      queue: [],
+      read: [],
+      complete: [],
+    };
+    const payload = 'x'.repeat(payloadBytes);
+    const failures: string[] = [];
+    const started = performance.now();
+    const measure = async (stage: string, action: () => Promise<void>) => {
+      const began = performance.now();
+      await action();
+      stageMs[stage].push(performance.now() - began);
+    };
+
+    await runPool(workflowRuns, workflowConcurrency, async (sequence) => {
+      try {
+        let workflowRunId = '';
+        await measure('create', async () => {
+          const created = await world.events.create(null, {
+            eventType: 'run_created',
+            eventData: { deploymentId, workflowName, input: [payload, sequence] },
+          });
+          workflowRunId = created.run.runId;
+          await world.events.create(workflowRunId, { eventType: 'run_started' });
+        });
+        const stepId = `step-${sequence}`;
+        await measure('step', async () => {
+          await world.events.create(workflowRunId, {
+            eventType: 'step_created',
+            correlationId: stepId,
+            eventData: { stepName: 'perf-step', input: [payload] },
+          });
+          await world.events.create(workflowRunId, {
+            eventType: 'step_completed',
+            correlationId: stepId,
+            eventData: { result: [sequence] },
+          });
+        });
+        const token = `perf-hook-${runId}-${sequence}`;
+        await measure('hook', async () => {
+          await world.events.create(workflowRunId, {
+            eventType: 'hook_created',
+            correlationId: `hook-${sequence}`,
+            eventData: { token },
+          });
+          const hook = await world.hooks.getByToken(token);
+          if (hook.runId !== workflowRunId) throw new Error('hook owner mismatch');
+        });
+        const streamName = `perf-stream-${workflowRunId}`;
+        await measure('stream', async () => {
+          await world.writeToStream(streamName, workflowRunId, payload);
+          await world.closeStream(streamName, workflowRunId);
+          const chunks = await world.getStreamChunks(streamName, workflowRunId, {});
+          if (new TextDecoder().decode(chunks.data[0]?.data) !== payload) {
+            throw new Error('stream payload mismatch');
+          }
+        });
+        await measure('read', async () => {
+          const [run, step] = await Promise.all([
+            world.runs.get(workflowRunId),
+            world.steps.get(workflowRunId, stepId),
+          ]);
+          if (run.runId !== workflowRunId || step.stepId !== stepId) {
+            throw new Error('run or step read mismatch');
+          }
+        });
+        await measure('queue', async () => {
+          workflowStartedAt.set(sequence, performance.now());
+          const queued = await world.queue(`__wkf_workflow_perf_${runId.replaceAll('-', '')}`, {
+            __healthCheck: true,
+            correlationId: `${workflowMarker}|${sequence}|${payload}`,
+          });
+          workflowAccepted.set(sequence, String(queued.messageId));
+        });
+        await measure('complete', async () => {
+          await world.events.create(workflowRunId, {
+            eventType: 'run_completed',
+            eventData: { output: [sequence] },
+          });
+        });
+      } catch (error) {
+        failures.push(`${sequence}: ${String(error)}`);
+      }
+    });
+
+    const listed = await world.runs.list({ workflowName, pagination: { limit: 20 } });
+    const delivered = await waitUntil(
+      () => workflowAccepted.size === workflowRuns && workflowDelivered.size === workflowRuns,
+      timeoutMs,
+    );
+    const elapsedMs = performance.now() - started;
+    const mismatched = Array.from(workflowAccepted, ([sequence, messageId]) => ({
+      sequence,
+      expected: messageId,
+      actual: workflowDelivered.get(sequence)?.messageId,
+    })).filter(({ expected, actual }) => expected !== actual);
+    const result = {
+      schemaVersion: 1,
+      recordedAt: new Date().toISOString(),
+      backend: { name: 'minio', celldVersion: process.env.PERF_CELLD_VERSION ?? 'unknown' },
+      workload: { runs: workflowRuns, concurrency: workflowConcurrency, payloadBytes },
+      correctness: {
+        completed: stageMs.complete.length,
+        accepted: workflowAccepted.size,
+        delivered: workflowDelivered.size,
+        duplicateCallbacks: workflowDuplicates,
+        mismatchedMessageIds: mismatched.length,
+        listReturned: listed.data.length,
+        failures,
+      },
+      performance: {
+        elapsedMs: Number(elapsedMs.toFixed(2)),
+        runsPerSecond: rate(stageMs.complete.length, elapsedMs),
+        queueDeliveryMs: summarizeLatency(
+          Array.from(workflowDelivered.values(), (delivery) => delivery.latencyMs),
+        ),
+        stages: Object.fromEntries(
+          Object.entries(stageMs).map(([name, samples]) => [name, summarizeLatency(samples)]),
+        ),
+      },
+    };
+    await mkdir(path.dirname(workflowResultPath), { recursive: true });
+    await writeFile(workflowResultPath, `${JSON.stringify(result, null, 2)}\n`);
+    console.log(`\nworld-celld MinIO workflow result\n${JSON.stringify(result, null, 2)}`);
+    expect(failures).toEqual([]);
+    expect(stageMs.complete).toHaveLength(workflowRuns);
+    expect(workflowAccepted.size).toBe(workflowRuns);
+    expect(delivered).toBe(true);
+    expect(workflowDuplicates).toBe(0);
+    expect(mismatched).toEqual([]);
+    expect(listed.data.length).toBeGreaterThan(0);
+  });
+
+  it.skipIf(steadySeconds === 0)('measures sustained queue latency and backlog', async () => {
+    const world = createCelldWorld({
+      fleetUrl,
+      secret,
+      baseUrl: process.env.CELLD_CALLBACK_BASE_URL,
+      deploymentId: `steady-perf-${runId}`,
+      rpcTimeoutMs: timeoutMs,
+    });
+    const queueName = `__wkf_workflow_steady_${runId.replaceAll('-', '')}`;
+    const padding = 'x'.repeat(Math.max(0, payloadBytes - 96));
+    const errors: string[] = [];
+    const scheduleLagMs: number[] = [];
+    const backlog: Array<{
+      elapsedMs: number;
+      accepted: number;
+      delivered: number;
+      pending: number;
+    }> = [];
+    const began = performance.now();
+    const sampler = setInterval(() => {
+      backlog.push({
+        elapsedMs: Math.round(performance.now() - began),
+        accepted: steadyAccepted.size,
+        delivered: steadyDelivered.size,
+        pending: Math.max(0, steadyAccepted.size - steadyDelivered.size),
+      });
+    }, 1_000);
+    try {
+      await runPool(steadyCount, concurrency, async (sequence) => {
+        const scheduledAt = began + (sequence * 1_000) / steadyRate;
+        const remainingMs = scheduledAt - performance.now();
+        if (remainingMs > 0) await new Promise((resolve) => setTimeout(resolve, remainingMs));
+        scheduleLagMs.push(Math.max(0, performance.now() - scheduledAt));
+        steadyStartedAt.set(sequence, performance.now());
+        try {
+          const queued = await world.queue(queueName, {
+            __healthCheck: true,
+            correlationId: `${steadyMarker}|${sequence}|${padding}`,
+          });
+          steadyAccepted.set(sequence, String(queued.messageId));
+        } catch (error) {
+          errors.push(`${sequence}: ${String(error)}`);
+        }
+      });
+      const producerFinishedMs = performance.now() - began;
+      const allDelivered = await waitUntil(
+        () => steadyAccepted.size === steadyCount && steadyDelivered.size === steadyCount,
+        timeoutMs,
+      );
+      const totalMs = performance.now() - began;
+      const mismatched = Array.from(steadyAccepted, ([sequence, messageId]) => ({
+        expected: messageId,
+        actual: steadyDelivered.get(sequence)?.messageId,
+      })).filter(({ expected, actual }) => expected !== actual);
+      const result = {
+        schemaVersion: 1,
+        recordedAt: new Date().toISOString(),
+        workload: { seconds: steadySeconds, ratePerSecond: steadyRate, concurrency, payloadBytes },
+        correctness: {
+          accepted: steadyAccepted.size,
+          delivered: steadyDelivered.size,
+          allDelivered,
+          duplicateCallbacks: steadyDuplicates,
+          mismatchedMessageIds: mismatched.length,
+          errors,
+        },
+        performance: {
+          producerFinishedMs: Number(producerFinishedMs.toFixed(2)),
+          totalMs: Number(totalMs.toFixed(2)),
+          achievedEnqueuePerSecond: rate(steadyAccepted.size, producerFinishedMs),
+          achievedDeliveryPerSecond: rate(steadyDelivered.size, totalMs),
+          scheduleLagMs: summarizeLatency(scheduleLagMs),
+          deliveryLatencyMs: summarizeLatency(
+            Array.from(steadyDelivered.values(), (delivery) => delivery.latencyMs),
+          ),
+          backlog,
+        },
+      };
+      await mkdir(path.dirname(steadyResultPath), { recursive: true });
+      await writeFile(steadyResultPath, `${JSON.stringify(result, null, 2)}\n`);
+      console.log(`\nworld-celld MinIO steady result\n${JSON.stringify(result, null, 2)}`);
+      expect(errors).toEqual([]);
+      expect(steadyAccepted.size).toBe(steadyCount);
+      expect(allDelivered).toBe(true);
+      expect(steadyDuplicates).toBe(0);
+      expect(mismatched).toEqual([]);
+    } finally {
+      clearInterval(sampler);
+    }
   });
 
   it('reclaims terminal run payloads without loss or resurrection', async () => {

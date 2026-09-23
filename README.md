@@ -382,12 +382,11 @@ failover correctness.
 
 The opt-in performance harness starts a fresh MinIO bucket and a single celld
 node with Docker Compose. Its queue workload verifies that every accepted
-message reaches a successful callback, including forced `503` redeliveries. A
-second workload creates terminal runs with streams and delayed queue messages,
-then verifies complete payload cleanup without resurrection. Results include
-queue and cleanup throughput plus p50, p95, p99, and maximum latency and are
-saved under `.perf-results/`. The harness pins celld v0.5.0 and deploys the same
-two-script native Queue topology as the restart smoke.
+message reaches a successful callback, including forced `503` redeliveries. It
+also measures a mixed run/step/hook/stream/queue lifecycle and terminal-run
+cleanup. Results include throughput plus p50, p95, p99, and maximum latency and
+are saved under `.perf-results/`. The harness pins celld v0.5.0 and deploys the
+same two-script native Queue topology as the restart smoke.
 
 > This harness runs a single celld node and leaves the required storage-contract
 > probe enabled. Passing it does not establish multi-node fencing, ownership
@@ -421,6 +420,23 @@ Useful controls are `PERF_PAYLOAD_BYTES`, `PERF_RETRY_EVERY`,
 `PERF_MAX_DELIVERY_P99_MS`. Throughput and latency budgets default to disabled
 because local machines vary. Message-loss, message-ID, callback validity, and
 duplicate-success checks are always enforced.
+
+`PERF_WORKFLOW_RUNS` and `PERF_WORKFLOW_CONCURRENCY` control the mixed workload.
+Set `PERF_STEADY_SECONDS` to enable a duration-based queue run at
+`PERF_STEADY_RATE` arrivals per second; its JSON records schedule lag and
+one-second backlog samples. For a repeatable concurrency/payload sweep, run
+`pnpm test:perf:minio:matrix`. It runs four isolated profiles and writes a
+manifest with the Git commit, hardware, workload settings, and result paths.
+`PERF_MATRIX_SOAK_SECONDS` changes the final steady profile's duration (60
+seconds by default). Compare runs on the same host with the same profile and
+without unrelated load; the harness does not set portable latency budgets.
+
+`pnpm test:perf:minio:failover` starts one celld node, seeds a run, stream, and
+queue workload (including accepted deliveries forced to retry), starts a peer
+against the same bucket, kills the first node, then measures peer recovery and
+delivery of both pending and new messages. Its output is
+`minio-failover-latest.json`. This is a two-node local handoff test, not a
+production object-store or fleet qualification.
 
 Bug reports and focused pull requests are welcome. Please include a regression
 test for behavior changes and run the checks above before submitting a PR.
