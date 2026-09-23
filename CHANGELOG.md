@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.6.1 (2026-09-23)
+
+## What's Changed
+* test(perf): cover mixed workflows, sustained load, and node failover by @ewhauser in https://github.com/ewhauser/world-celld/pull/64
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.6.0...v0.6.1
+
 ## 0.6.0 (2026-09-16)
 
 ## What's Changed
