@@ -40,6 +40,7 @@ import {
   type StreamWriteResult,
 } from '../stream-protocol.js';
 import { authenticate } from './auth.js';
+import { cellQueueClaim, runQueueClaim, type QueueClaimHandle } from './queue-claims.js';
 import { INDEX_OPERATIONS, type IndexOperation, validateIndexRequest } from './index-validation.js';
 import {
   NATIVE_QUEUE_MAX_MESSAGE_BYTES,
@@ -127,6 +128,22 @@ export interface WorkerEnv {
   WORKFLOW_CALLBACK_SECRET?: string;
   WORKFLOW_RETENTION_MS?: string | number;
   WORKFLOW_RETENTION_BATCH_SIZE?: string | number;
+}
+
+/**
+ * Per-isolate record of runs whose Queue idempotency claims stay in claim
+ * cells (created before run-scoped claims) or live in the run cell. A run's
+ * scope never changes, so the cache only saves the run-cell question.
+ */
+const runClaimScopes = new Map<string, 'cell' | 'run'>();
+const MAX_REMEMBERED_RUN_CLAIM_SCOPES = 4096;
+
+function rememberRunClaimScope(runId: string, scope: 'cell' | 'run'): void {
+  if (runClaimScopes.has(runId)) return;
+  if (runClaimScopes.size >= MAX_REMEMBERED_RUN_CLAIM_SCOPES) {
+    runClaimScopes.delete(runClaimScopes.keys().next().value!);
+  }
+  runClaimScopes.set(runId, scope);
 }
 
 function workflowIndex(env: WorkerEnv) {
@@ -421,11 +438,12 @@ export function createRouter(env: WorkerEnv) {
             envelope.runId && !inlineRunBody
               ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
               : undefined;
-          const brokerEnvelope: NativeQueueEnvelope = payloadKey
+          let brokerEnvelope: NativeQueueEnvelope = payloadKey
             ? { ...envelope, payloadKey, body: undefined }
             : envelope;
-          const encoded = JSON.stringify(brokerEnvelope);
-          if (new TextEncoder().encode(encoded).byteLength > NATIVE_QUEUE_MAX_MESSAGE_BYTES) {
+          // Sized with the claim scope a run-scoped claim may add.
+          const sized = JSON.stringify({ ...brokerEnvelope, claimScope: 'run' });
+          if (new TextEncoder().encode(sized).byteLength > NATIVE_QUEUE_MAX_MESSAGE_BYTES) {
             return errorResponse(
               413,
               'PayloadTooLarge',
@@ -439,30 +457,57 @@ export function createRouter(env: WorkerEnv) {
           const run = envelope.runId
             ? (namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub)
             : undefined;
-          // The read-only expiry check overlaps the reservation.
-          const admission = inlineRunBody ? run?.getQueueAdmission() : undefined;
-          admission?.catch(() => undefined);
-          let claim: QueueRunStub | undefined;
+          let claim: QueueClaimHandle | undefined;
+          let admission: Promise<{ ok: true } | { ok: false; message: string }> | undefined;
           if (envelope.idempotencyKey) {
-            claim = namespace.get(
-              namespace.idFromName(queueClaimName(envelope.queueName, envelope.idempotencyKey)),
-            ) as QueueRunStub;
-            const reservation = await claim.reserveQueueMessage({
-              messageId: envelope.messageId,
-              expiresAt: reservationExpiresAt,
-            });
+            const claimName = queueClaimName(envelope.queueName, envelope.idempotencyKey);
+            // A keyed run-bearing message asks its run cell first unless this
+            // isolate already knows the run keeps claims in claim cells. The
+            // run cell reserves in the same call when the run is run-scoped.
+            let scope = run && envelope.runId ? runClaimScopes.get(envelope.runId) : 'cell';
+            let reservation: { admitted: boolean; messageId: string } | undefined;
+            if (run && envelope.runId && scope !== 'cell') {
+              const reserved = await run.reserveRunQueueMessage({
+                claimName,
+                messageId: envelope.messageId,
+                expiresAt: reservationExpiresAt,
+              });
+              if (!reserved.ok) return errorResponse(410, 'RunExpiredError', reserved.message);
+              scope = reserved.scope;
+              rememberRunClaimScope(envelope.runId, reserved.scope);
+              if (reserved.scope === 'run') {
+                reservation = reserved;
+                claim = runQueueClaim(run, claimName);
+                brokerEnvelope = { ...brokerEnvelope, claimScope: 'run' };
+              }
+            } else if (inlineRunBody && run) {
+              // The read-only expiry check overlaps the claim-cell reservation.
+              admission = run.getQueueAdmission();
+              admission.catch(() => undefined);
+            }
+            if (!reservation) {
+              const cell = namespace.get(namespace.idFromName(claimName)) as QueueRunStub;
+              reservation = await cell.reserveQueueMessage({
+                messageId: envelope.messageId,
+                expiresAt: reservationExpiresAt,
+              });
+              claim = cellQueueClaim(cell);
+            }
             if (!reservation.admitted) {
               return new Response(rpcStringify({ messageId: reservation.messageId }), {
                 status: 200,
                 headers: { 'content-type': 'application/json' },
               });
             }
+          } else if (inlineRunBody && run) {
+            admission = run.getQueueAdmission();
           }
+          const encoded = JSON.stringify(brokerEnvelope);
 
           if (admission) {
             const admitted = await admission;
             if (!admitted.ok) {
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', admitted.message);
             }
           }
@@ -482,7 +527,7 @@ export function createRouter(env: WorkerEnv) {
               orphanExpiresAt,
             });
             if (!registered.ok) {
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', registered.message);
             }
             const orphan = namespace.get(
@@ -497,7 +542,7 @@ export function createRouter(env: WorkerEnv) {
               });
             } catch (error) {
               await run.unregisterQueuePayload(envelope.messageId);
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               throw error;
             }
             try {
@@ -506,21 +551,21 @@ export function createRouter(env: WorkerEnv) {
                 messageId: envelope.messageId,
               });
             } catch (error) {
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               throw error;
             }
             let finalized: Awaited<ReturnType<QueueRunStub['finalizeQueuePayload']>>;
             try {
               finalized = await run.finalizeQueuePayload(envelope.messageId);
             } catch (error) {
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               throw error;
             }
             if (!finalized.ok) {
               await payloadStore.delete(payloadKey);
               await run.unregisterQueuePayload(envelope.messageId);
               await orphan.cancelQueuePayloadOrphan(envelope.messageId);
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', finalized.message);
             }
           }
