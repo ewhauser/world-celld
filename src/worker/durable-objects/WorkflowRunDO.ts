@@ -94,6 +94,7 @@ interface WorkflowRunDOEnv {
   clock?: () => number;
 }
 
+const EVENT_SEQUENCE_KEY = 'event_sequence';
 const STORAGE_BATCH_SIZE = 128;
 const PAYLOAD_DELETE_BATCH = STORAGE_BATCH_SIZE;
 const HOOK_MARKER_PAGE_SIZE = 64;
@@ -231,14 +232,15 @@ export class WorkflowRunDO extends DurableObject {
   private async retentionState(
     storage: DurableObjectStorage | DurableObjectTransaction,
     now = this.now(),
-  ): Promise<{ cleanup?: CleanupRecord; tombstone: RunTombstone | null }> {
-    const values = await storage.get<RunTombstone | CleanupRecord>([
-      TOMBSTONE_KEY,
-      CLEANUP_RECORD_KEY,
-    ]);
+    options?: { withEventSequence?: boolean },
+  ): Promise<{ cleanup?: CleanupRecord; tombstone: RunTombstone | null; eventSequence: number }> {
+    const keys = [TOMBSTONE_KEY, CLEANUP_RECORD_KEY];
+    if (options?.withEventSequence) keys.push(EVENT_SEQUENCE_KEY);
+    const values = await storage.get<RunTombstone | CleanupRecord | number>(keys);
     return {
       cleanup: values.get(CLEANUP_RECORD_KEY) as CleanupRecord | undefined,
-      tombstone: this.tombstoneFrom(values, now),
+      tombstone: this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>, now),
+      eventSequence: (values.get(EVENT_SEQUENCE_KEY) as number | undefined) ?? 0,
     };
   }
 
@@ -276,7 +278,7 @@ export class WorkflowRunDO extends DurableObject {
     if (request.cleanup !== undefined) validateCleanupRequest(request.cleanup, true);
     return await this.ctx.storage.transaction(async (txn) => {
       const now = new Date(this.now());
-      const retention = await this.retentionState(txn, now.getTime());
+      const retention = await this.retentionState(txn, now.getTime(), { withEventSequence: true });
       const { tombstone } = retention;
       if (tombstone) {
         return {
@@ -286,7 +288,8 @@ export class WorkflowRunDO extends DurableObject {
         };
       }
 
-      let eventSequence = (await txn.get<number>('event_sequence')) ?? 0;
+      const storedSequence = retention.eventSequence;
+      let eventSequence = storedSequence;
       const outcome = await applyEvent(storeFrom(txn), {
         ...request,
         nextEventId: () => slotToEventId(++eventSequence),
@@ -294,7 +297,9 @@ export class WorkflowRunDO extends DurableObject {
       });
       if (!outcome.ok) return outcome;
 
-      await txn.put('event_sequence', eventSequence);
+      // An idempotent replay appends nothing; leaving the sequence untouched
+      // keeps its transaction read-only, so it skips the durable commit.
+      if (eventSequence !== storedSequence) await txn.put(EVENT_SEQUENCE_KEY, eventSequence);
       const hookReferences: HookIndexReference[] = outcome.hookToIndex
         ? [
             {

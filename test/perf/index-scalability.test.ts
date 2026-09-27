@@ -302,11 +302,16 @@ describe('sharded index scalability evidence', () => {
     });
     expect(createIndexOperations.runCatalog).toEqual({
       ...emptyCounts(),
-      get: 1,
+      getMany: 1,
       putMany: 1,
       transaction: 1,
     });
-    expect(updateIndexOperations.runCatalog).toEqual(createIndexOperations.runCatalog);
+    // attr_set republishes identical catalog metadata, which writes nothing.
+    expect(updateIndexOperations.runCatalog).toEqual({
+      ...emptyCounts(),
+      getMany: 1,
+      transaction: 1,
+    });
     expect(listIndexOperations.runCatalog).toEqual({ ...emptyCounts(), list: 16 });
     expect(hookCreateIndexOperations).toEqual({
       runCatalog: emptyCounts(),
@@ -357,7 +362,7 @@ describe('sharded index scalability evidence', () => {
     });
     expect(terminalIndexOperations.runCatalog).toEqual({
       ...emptyCounts(),
-      get: 1,
+      getMany: 1,
       putMany: 1,
       transaction: 1,
     });
@@ -436,7 +441,7 @@ describe('sharded index scalability evidence', () => {
     );
     const expectedStorage = {
       ...emptyCounts(),
-      get: WORKLOAD,
+      getMany: WORKLOAD,
       putMany: WORKLOAD,
       transaction: WORKLOAD,
     };
