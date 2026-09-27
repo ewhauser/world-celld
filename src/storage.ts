@@ -183,7 +183,7 @@ function validateOptionalRetryAfterMs(outcome: Record<string, unknown>): void {
 
 function parseSuccessEntity<T>(
   outcome: Record<string, unknown>,
-  key: 'event' | 'run' | 'step' | 'hook' | 'wait' | 'hookToIndex',
+  key: 'event' | 'run' | 'replayRun' | 'step' | 'hook' | 'wait' | 'hookToIndex',
   schema: {
     safeParse(value: unknown): { success: true; data: T } | { success: false };
   },
@@ -247,6 +247,7 @@ function parseApplyEventOutcome(value: unknown): ParsedApplyEventOutcome {
 
   const event = parseSuccessEntity(value, 'event', EventSchema);
   const run = parseSuccessEntity(value, 'run', WorkflowRunSchema);
+  const replayRun = parseSuccessEntity(value, 'replayRun', WorkflowRunSchema);
   const step = parseSuccessEntity(value, 'step', StepSchema);
   const hook = parseSuccessEntity(value, 'hook', HookSchema);
   const wait = parseSuccessEntity(value, 'wait', WaitSchema);
@@ -319,6 +320,7 @@ function parseApplyEventOutcome(value: unknown): ParsedApplyEventOutcome {
       ...value,
       event,
       run,
+      replayRun,
       step,
       hook,
       wait,
@@ -666,7 +668,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               };
         return {
           event: outcome.event,
-          run: outcome.run,
+          // A hook_received replay preload returns the run unchanged, so it
+          // is not published to the run catalog above.
+          run: outcome.run ?? outcome.replayRun,
           step: outcome.step,
           hook: outcome.hook,
           wait: outcome.wait,
