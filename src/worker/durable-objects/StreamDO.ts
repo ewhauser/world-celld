@@ -25,6 +25,19 @@ interface StreamMeta {
   expiredAt?: number;
   expiredChunkCount?: number;
   payloadDeleted?: boolean;
+  /**
+   * Storage layout, fixed when the stream is created. Absent: one payload row
+   * and one size row per chunk. 2: segment rows that each pack one write's
+   * chunks, with a small size row per segment.
+   */
+  layout?: typeof SEGMENT_LAYOUT;
+}
+
+interface SegmentSize {
+  /** Chunks packed in the segment. */
+  count: number;
+  /** Payload bytes of those chunks. */
+  bytes: number;
 }
 
 interface StreamWaiter {
@@ -54,6 +67,13 @@ const DELETE_BATCH_KEYS = 128;
 const DEFAULT_EXPIRE_BYTE_LIMIT = 16 * 1024 * 1024;
 const MAX_EXPIRE_BYTE_LIMIT = DEFAULT_EXPIRE_BYTE_LIMIT;
 const MAX_STREAM_INDEX = 0x7fffffff;
+const SEGMENT_LAYOUT = 2;
+const SEGMENT_KEY_PREFIX = 'seg:';
+const SEGMENT_SIZE_KEY_PREFIX = 'segsize:';
+/** Payload bytes per segment row, well below the 2 MiB per-value storage limit. */
+const MAX_SEGMENT_BYTES = 1024 * 1024;
+/** Layout of a stream's first write. Existing streams keep the layout they started with. */
+const NEW_STREAM_LAYOUT: StreamMeta['layout'] = undefined;
 /** One storage get or put call accepts at most 128 keys. */
 const STORAGE_BATCH_KEYS = 128;
 
@@ -77,7 +97,8 @@ function validateMeta(meta: unknown): StreamMeta {
     candidate.count! > MAX_STREAM_INDEX ||
     !['open', 'closed', 'errored', 'expired'].includes(candidate.state as StreamTerminalState) ||
     (candidate.ownerRunId !== undefined && typeof candidate.ownerRunId !== 'string') ||
-    (candidate.payloadDeleted !== undefined && typeof candidate.payloadDeleted !== 'boolean')
+    (candidate.payloadDeleted !== undefined && typeof candidate.payloadDeleted !== 'boolean') ||
+    (candidate.layout !== undefined && candidate.layout !== SEGMENT_LAYOUT)
   ) {
     throw new Error('Invalid persisted stream metadata');
   }
@@ -102,6 +123,107 @@ function chunkKey(index: number): string {
 
 function chunkSizeKey(index: number): string {
   return `${CHUNK_SIZE_KEY_PREFIX}${index.toString().padStart(12, '0')}`;
+}
+
+function segmentKey(start: number): string {
+  return `${SEGMENT_KEY_PREFIX}${start.toString().padStart(12, '0')}`;
+}
+
+function segmentSizeKey(start: number): string {
+  return `${SEGMENT_SIZE_KEY_PREFIX}${start.toString().padStart(12, '0')}`;
+}
+
+function startFromSegmentKey(key: string, prefix: string): number {
+  const suffix = key.slice(prefix.length);
+  const start = Number(suffix);
+  if (
+    !key.startsWith(prefix) ||
+    !/^\d{12}$/.test(suffix) ||
+    !Number.isSafeInteger(start) ||
+    start > MAX_STREAM_INDEX
+  ) {
+    throw new Error(`Invalid persisted stream segment key "${key}"`);
+  }
+  return start;
+}
+
+function validateSegmentSize(value: unknown, start: number): SegmentSize {
+  const size = value as Partial<SegmentSize> | undefined;
+  if (
+    !size ||
+    !Number.isSafeInteger(size.count) ||
+    size.count! < 1 ||
+    !Number.isSafeInteger(size.bytes) ||
+    size.bytes! < 0
+  ) {
+    throw new Error(`Invalid persisted stream segment size at index ${start}`);
+  }
+  return size as SegmentSize;
+}
+
+/** Pack chunks as `[u32 count][u32 length]*count` followed by the payloads. */
+function encodeSegment(chunks: Uint8Array[]): Uint8Array {
+  const payloadBytes = chunks.reduce((total, chunk) => total + chunk.byteLength, 0);
+  const header = 4 + 4 * chunks.length;
+  const encoded = new Uint8Array(header + payloadBytes);
+  const view = new DataView(encoded.buffer);
+  view.setUint32(0, chunks.length);
+  let offset = header;
+  for (let index = 0; index < chunks.length; index++) {
+    view.setUint32(4 + 4 * index, chunks[index].byteLength);
+    encoded.set(chunks[index], offset);
+    offset += chunks[index].byteLength;
+  }
+  return encoded;
+}
+
+function decodeSegment(value: unknown, start: number, size: SegmentSize): Uint8Array[] {
+  if (!(value instanceof Uint8Array) || value.byteLength < 4) {
+    throw new Error(`Invalid persisted stream segment at index ${start}`);
+  }
+  const view = new DataView(value.buffer, value.byteOffset, value.byteLength);
+  const count = view.getUint32(0);
+  const header = 4 + 4 * count;
+  if (count !== size.count || header + size.bytes !== value.byteLength) {
+    throw new Error(`Invalid persisted stream segment at index ${start}`);
+  }
+  const chunks: Uint8Array[] = [];
+  let offset = header;
+  for (let index = 0; index < count; index++) {
+    const length = view.getUint32(4 + 4 * index);
+    if (offset + length > value.byteLength) {
+      throw new Error(`Invalid persisted stream segment at index ${start}`);
+    }
+    chunks.push(value.subarray(offset, offset + length));
+    offset += length;
+  }
+  if (offset !== value.byteLength) {
+    throw new Error(`Invalid persisted stream segment at index ${start}`);
+  }
+  return chunks;
+}
+
+/** Group one write's chunks into segments of at most MAX_SEGMENT_BYTES payload bytes. */
+function packSegments(
+  startIndex: number,
+  chunks: Uint8Array[],
+): Array<{ start: number; chunks: Uint8Array[] }> {
+  const segments: Array<{ start: number; chunks: Uint8Array[] }> = [];
+  let current: Uint8Array[] = [];
+  let bytes = 0;
+  let start = startIndex;
+  for (const chunk of chunks) {
+    if (current.length > 0 && bytes + chunk.byteLength > MAX_SEGMENT_BYTES) {
+      segments.push({ start, chunks: current });
+      start += current.length;
+      current = [];
+      bytes = 0;
+    }
+    current.push(chunk);
+    bytes += chunk.byteLength;
+  }
+  if (current.length > 0) segments.push({ start, chunks: current });
+  return segments;
 }
 
 function indexFromChunkSizeKey(key: string): number {
@@ -142,6 +264,12 @@ function validateChunkSize(size: unknown, index: number): number {
     throw new Error(`Invalid persisted stream chunk size at index ${index}`);
   }
   return size;
+}
+
+async function deleteInBatches(txn: DurableObjectTransaction, keys: string[]): Promise<void> {
+  for (let offset = 0; offset < keys.length; offset += DELETE_BATCH_KEYS) {
+    await txn.delete(keys.slice(offset, offset + DELETE_BATCH_KEYS));
+  }
 }
 
 function compactChunk(chunk: Uint8Array): Uint8Array {
@@ -281,31 +409,12 @@ export class StreamDO extends DurableObject {
       meta.state === 'expired'
         ? 0
         : Math.max(0, Math.min(request.maxChunks, meta.count - request.startIndex));
-    const chunks: Uint8Array[] = [];
+    let chunks: Uint8Array[] = [];
     if (available > 0) {
-      const indexes = Array.from({ length: available }, (_, offset) => request.startIndex + offset);
-      const sizeKeys = indexes.map(chunkSizeKey);
-      const storedSizes = await this.getMany<number>(sizeKeys);
-      const selectedIndexes: number[] = [];
-      const selectedSizes: number[] = [];
-      let bytes = 0;
-      for (const index of indexes) {
-        const size = validateChunkSize(storedSizes.get(chunkSizeKey(index)), index);
-        if (bytes + size > request.maxBytes) break;
-        selectedIndexes.push(index);
-        selectedSizes.push(size);
-        bytes += size;
-      }
-
-      const payloadKeys = selectedIndexes.map(chunkKey);
-      const storedChunks = await this.getMany<Uint8Array>(payloadKeys);
-      for (let offset = 0; offset < payloadKeys.length; offset++) {
-        const chunk = storedChunks.get(payloadKeys[offset]);
-        if (!(chunk instanceof Uint8Array) || chunk.byteLength !== selectedSizes[offset]) {
-          throw new Error(`Invalid persisted stream chunk at index ${selectedIndexes[offset]}`);
-        }
-        chunks.push(chunk);
-      }
+      chunks =
+        meta.layout === SEGMENT_LAYOUT
+          ? await this.readSegmentRows(request.startIndex, available, request.maxBytes)
+          : await this.readChunkRows(request.startIndex, available, request.maxBytes);
     }
 
     return {
@@ -318,10 +427,105 @@ export class StreamDO extends DurableObject {
     };
   }
 
+  private async readChunkRows(
+    startIndex: number,
+    available: number,
+    maxBytes: number,
+  ): Promise<Uint8Array[]> {
+    const indexes = Array.from({ length: available }, (_, offset) => startIndex + offset);
+    const sizeKeys = indexes.map(chunkSizeKey);
+    const storedSizes = await this.getMany<number>(sizeKeys);
+    const selectedIndexes: number[] = [];
+    const selectedSizes: number[] = [];
+    let bytes = 0;
+    for (const index of indexes) {
+      const size = validateChunkSize(storedSizes.get(chunkSizeKey(index)), index);
+      if (bytes + size > maxBytes) break;
+      selectedIndexes.push(index);
+      selectedSizes.push(size);
+      bytes += size;
+    }
+
+    const payloadKeys = selectedIndexes.map(chunkKey);
+    const storedChunks = await this.getMany<Uint8Array>(payloadKeys);
+    const chunks: Uint8Array[] = [];
+    for (let offset = 0; offset < payloadKeys.length; offset++) {
+      const chunk = storedChunks.get(payloadKeys[offset]);
+      if (!(chunk instanceof Uint8Array) || chunk.byteLength !== selectedSizes[offset]) {
+        throw new Error(`Invalid persisted stream chunk at index ${selectedIndexes[offset]}`);
+      }
+      chunks.push(chunk);
+    }
+    return chunks;
+  }
+
+  /**
+   * Plan from the small segment size rows, then load only the segments that
+   * cover the requested range. A read that starts on a segment boundary (the
+   * common sequential case) needs one list and one multi-get.
+   */
+  private async readSegmentRows(
+    startIndex: number,
+    available: number,
+    maxBytes: number,
+  ): Promise<Uint8Array[]> {
+    const endIndex = startIndex + available;
+    const listed = await this.ctx.storage.list<SegmentSize>({
+      prefix: SEGMENT_SIZE_KEY_PREFIX,
+      start: segmentSizeKey(startIndex),
+      end: segmentSizeKey(endIndex),
+      limit: available,
+    });
+    const planned: Array<{ start: number; size: SegmentSize }> = [];
+    for (const [key, value] of listed) {
+      const start = startFromSegmentKey(key, SEGMENT_SIZE_KEY_PREFIX);
+      planned.push({ start, size: validateSegmentSize(value, start) });
+    }
+    if (planned[0]?.start !== startIndex) {
+      // The read starts inside a segment: find the segment that contains it.
+      const containing = await this.ctx.storage.list<SegmentSize>({
+        prefix: SEGMENT_SIZE_KEY_PREFIX,
+        end: segmentSizeKey(startIndex + 1),
+        reverse: true,
+        limit: 1,
+      });
+      const entry = containing.entries().next().value;
+      if (!entry) throw new Error(`Missing persisted stream segment at index ${startIndex}`);
+      const start = startFromSegmentKey(entry[0], SEGMENT_SIZE_KEY_PREFIX);
+      planned.unshift({ start, size: validateSegmentSize(entry[1], start) });
+    }
+
+    // Load segments until the byte budget is reached; per-chunk sizes are
+    // known only after decoding, so the final selection below trims exactly.
+    const selected: Array<{ start: number; size: SegmentSize }> = [];
+    let plannedBytes = 0;
+    for (const segment of planned) {
+      if (selected.length > 0 && plannedBytes >= maxBytes) break;
+      selected.push(segment);
+      plannedBytes += segment.size.bytes;
+    }
+    const values = await this.getMany<Uint8Array>(selected.map(({ start }) => segmentKey(start)));
+
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    let expected = startIndex;
+    for (const { start, size } of selected) {
+      if (start > expected)
+        throw new Error(`Missing persisted stream segment at index ${expected}`);
+      const segment = decodeSegment(values.get(segmentKey(start)), start, size);
+      for (let offset = expected - start; offset < segment.length; offset++) {
+        if (expected >= endIndex || bytes + segment[offset].byteLength > maxBytes) return chunks;
+        chunks.push(segment[offset]);
+        bytes += segment[offset].byteLength;
+        expected++;
+      }
+    }
+    return chunks;
+  }
+
   /** Append one bounded binary batch with contiguous indexes. */
   async writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult> {
     validateStreamWriteChunks(chunks);
-    const storedChunks = chunks.map(compactChunk);
     return await this.runMutation(async () => {
       const committed = await this.ctx.storage.transaction(async (txn) => {
         const stored = await txn.get<StreamMeta>(META_KEY);
@@ -331,16 +535,35 @@ export class StreamDO extends DurableObject {
         if (startIndex + chunks.length > MAX_STREAM_INDEX) {
           throw new Error('Stream offset limit exceeded');
         }
+        // A stream keeps the layout it was created with.
+        const layout = stored === undefined ? NEW_STREAM_LAYOUT : meta.layout;
         const nextMeta: StreamMeta = {
           count: startIndex + chunks.length,
           state: 'open',
           ownerRunId: runId,
+          ...(layout === undefined ? {} : { layout }),
         };
-        const entries: Array<[string, StreamMeta | Uint8Array | number]> = [[META_KEY, nextMeta]];
-        for (let offset = 0; offset < storedChunks.length; offset++) {
-          const index = startIndex + offset;
-          entries.push([chunkKey(index), storedChunks[offset]]);
-          entries.push([chunkSizeKey(index), storedChunks[offset].byteLength]);
+        const entries: Array<[string, StreamMeta | Uint8Array | number | SegmentSize]> = [
+          [META_KEY, nextMeta],
+        ];
+        if (layout === SEGMENT_LAYOUT) {
+          for (const segment of packSegments(startIndex, chunks)) {
+            entries.push([segmentKey(segment.start), encodeSegment(segment.chunks)]);
+            entries.push([
+              segmentSizeKey(segment.start),
+              {
+                count: segment.chunks.length,
+                bytes: segment.chunks.reduce((total, chunk) => total + chunk.byteLength, 0),
+              },
+            ]);
+          }
+        } else {
+          const storedChunks = chunks.map(compactChunk);
+          for (let offset = 0; offset < storedChunks.length; offset++) {
+            const index = startIndex + offset;
+            entries.push([chunkKey(index), storedChunks[offset]]);
+            entries.push([chunkSizeKey(index), storedChunks[offset].byteLength]);
+          }
         }
         // One transaction, written in groups within the per-call key limit.
         for (let offset = 0; offset < entries.length; offset += STORAGE_BATCH_KEYS) {
@@ -499,6 +722,110 @@ export class StreamDO extends DurableObject {
     });
   }
 
+  /** Delete one page of per-chunk rows, listing size rows to avoid loading payloads. */
+  private async expireChunkPage(
+    txn: DurableObjectTransaction,
+    limit: number,
+    byteLimit: number,
+  ): Promise<{ chunks: number; bytes: number; done: boolean }> {
+    const candidates = await txn.list<number>({
+      prefix: CHUNK_SIZE_KEY_PREFIX,
+      limit: limit + 1,
+    });
+    const page: Array<{ index: number; size: number }> = [];
+    let bytes = 0;
+    for (const [key, storedSize] of Array.from(candidates).slice(0, limit)) {
+      const index = indexFromChunkSizeKey(key);
+      const size = validateChunkSize(storedSize, index);
+      if (page.length > 0 && bytes + size > byteLimit) break;
+      page.push({ index, size });
+      bytes += size;
+    }
+
+    let payloadFallback = false;
+    if (candidates.size === 0) {
+      const payloads = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
+      const first = payloads.entries().next().value;
+      if (first) {
+        const [key, payload] = first;
+        page.push({
+          index: indexFromChunkKey(key),
+          size: payload instanceof Uint8Array ? payload.byteLength : 0,
+        });
+        bytes = page[0].size;
+        payloadFallback = true;
+      }
+    }
+
+    const keys = page.flatMap(({ index }) => [chunkKey(index), chunkSizeKey(index)]);
+    await deleteInBatches(txn, keys);
+    let done = candidates.size === page.length;
+    if (payloadFallback) {
+      const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
+      done = remaining.size === 0;
+    } else if (done && candidates.size > 0) {
+      // A corrupt/missing size index can otherwise make cleanup report
+      // completion while leaving an orphan payload. Verify once after the
+      // final staged size-index page; healthy pages return an empty list.
+      const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
+      done = remaining.size === 0;
+    }
+    return { chunks: page.length, bytes, done };
+  }
+
+  /**
+   * Delete one page of segment rows, listing segment size rows to avoid
+   * loading payloads. One segment always makes progress, even when it holds
+   * more chunks or bytes than the page allows.
+   */
+  private async expireSegmentPage(
+    txn: DurableObjectTransaction,
+    limit: number,
+    byteLimit: number,
+  ): Promise<{ chunks: number; bytes: number; done: boolean }> {
+    const candidates = await txn.list<SegmentSize>({
+      prefix: SEGMENT_SIZE_KEY_PREFIX,
+      limit: limit + 1,
+    });
+    const page: number[] = [];
+    let chunks = 0;
+    let bytes = 0;
+    for (const [key, value] of candidates) {
+      const start = startFromSegmentKey(key, SEGMENT_SIZE_KEY_PREFIX);
+      const size = validateSegmentSize(value, start);
+      if (page.length > 0 && (chunks + size.count > limit || bytes + size.bytes > byteLimit)) {
+        break;
+      }
+      page.push(start);
+      chunks += size.count;
+      bytes += size.bytes;
+    }
+
+    let orphan = false;
+    if (candidates.size === 0) {
+      // A segment row without its size row: delete it on its own.
+      const segments = await txn.list<Uint8Array>({ prefix: SEGMENT_KEY_PREFIX, limit: 1 });
+      const first = segments.entries().next().value;
+      if (first) {
+        page.push(startFromSegmentKey(first[0], SEGMENT_KEY_PREFIX));
+        bytes = first[1] instanceof Uint8Array ? first[1].byteLength : 0;
+        chunks = 1;
+        orphan = true;
+      }
+    }
+
+    await deleteInBatches(
+      txn,
+      page.flatMap((start) => [segmentKey(start), segmentSizeKey(start)]),
+    );
+    let done = !orphan && candidates.size === page.length;
+    if (orphan || done) {
+      const remaining = await txn.list({ prefix: SEGMENT_KEY_PREFIX, limit: 1 });
+      done = remaining.size === 0;
+    }
+    return { chunks, bytes, done };
+  }
+
   /**
    * Fence the stream and delete one bounded page. Listing size keys avoids
    * loading payloads, and the transaction makes a crash retry resume safely.
@@ -521,51 +848,11 @@ export class StreamDO extends DurableObject {
         this.assertOwner(meta, runId);
         const firstFence = meta.state !== 'expired';
 
-        const candidates = await txn.list<number>({
-          prefix: CHUNK_SIZE_KEY_PREFIX,
-          limit: limit + 1,
-        });
-        const page: Array<{ index: number; size: number }> = [];
-        let bytes = 0;
-        for (const [key, storedSize] of Array.from(candidates).slice(0, limit)) {
-          const index = indexFromChunkSizeKey(key);
-          const size = validateChunkSize(storedSize, index);
-          if (page.length > 0 && bytes + size > byteLimit) break;
-          page.push({ index, size });
-          bytes += size;
-        }
-
-        let payloadFallback = false;
-        if (candidates.size === 0) {
-          const payloads = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
-          const first = payloads.entries().next().value;
-          if (first) {
-            const [key, payload] = first;
-            page.push({
-              index: indexFromChunkKey(key),
-              size: payload instanceof Uint8Array ? payload.byteLength : 0,
-            });
-            bytes = page[0].size;
-            payloadFallback = true;
-          }
-        }
-
-        const keys = page.flatMap(({ index }) => [chunkKey(index), chunkSizeKey(index)]);
-        for (let offset = 0; offset < keys.length; offset += DELETE_BATCH_KEYS) {
-          await txn.delete(keys.slice(offset, offset + DELETE_BATCH_KEYS));
-        }
-        let done = candidates.size === page.length;
-        if (payloadFallback) {
-          const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
-          done = remaining.size === 0;
-        } else if (done && candidates.size > 0) {
-          // A corrupt/missing size index can otherwise make cleanup report
-          // completion while leaving an orphan payload. Verify once after the
-          // final staged size-index page; healthy pages return an empty list.
-          const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
-          done = remaining.size === 0;
-        }
-        if (done && page.length === 0 && meta.state === 'expired' && meta.payloadDeleted) {
+        const { chunks, bytes, done } =
+          meta.layout === SEGMENT_LAYOUT
+            ? await this.expireSegmentPage(txn, limit, byteLimit)
+            : await this.expireChunkPage(txn, limit, byteLimit);
+        if (done && chunks === 0 && meta.state === 'expired' && meta.payloadDeleted) {
           return {
             meta,
             result: { deleted: false, chunks: 0, bytes: 0, done: true },
@@ -586,7 +873,7 @@ export class StreamDO extends DurableObject {
           meta: nextMeta,
           result: {
             deleted: firstFence,
-            chunks: page.length,
+            chunks,
             bytes,
             done,
           } satisfies ExpireStreamResult,
