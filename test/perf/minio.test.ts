@@ -152,6 +152,9 @@ describe('MinIO single-node queue performance and loss', () => {
   const concurrency = positiveInteger('PERF_CONCURRENCY', 32);
   const payloadBytes = positiveInteger('PERF_PAYLOAD_BYTES', 256);
   const retryEvery = nonNegativeInteger('PERF_RETRY_EVERY', 20);
+  // Workflow messages carry a runId, which moves their body into the fleet
+  // bucket and adds payload bookkeeping and an idempotency claim per message.
+  const runBearingQueue = process.env.PERF_QUEUE_RUN_BEARING === '1';
   const timeoutMs = positiveInteger('PERF_TIMEOUT_MS', 180_000);
   // Emulates the client-to-fleet network: every World client request waits
   // this long before it is sent, so round-trip savings show on loopback.
@@ -316,16 +319,29 @@ describe('MinIO single-node queue performance and loss', () => {
     });
     const queueName = `__wkf_workflow_perf_${runId.replaceAll('-', '')}`;
     const padding = 'x'.repeat(Math.max(0, payloadBytes - 96));
+    const queueRunId = runBearingQueue
+      ? (
+          await world.events.create(null, {
+            eventType: 'run_created',
+            eventData: { deploymentId: `perf-${runId}`, workflowName: 'perf-queue', input: [] },
+          })
+        ).run.runId
+      : undefined;
     const workloadStart = performance.now();
 
     await runPool(messageCount, concurrency, async (sequence) => {
       const enqueueStart = performance.now();
       startedAt.set(sequence, enqueueStart);
       try {
-        const outcome = await world.queue(queueName, {
-          __healthCheck: true,
-          correlationId: `${runId}|${sequence}|${padding}`,
-        });
+        const outcome = await world.queue(
+          queueName,
+          {
+            __healthCheck: true,
+            correlationId: `${runId}|${sequence}|${padding}`,
+            ...(queueRunId ? { runId: queueRunId } : {}),
+          },
+          queueRunId ? { idempotencyKey: `perf-${sequence}` } : undefined,
+        );
         accepted.set(sequence, String(outcome.messageId));
         enqueueLatencies.push(performance.now() - enqueueStart);
       } catch (error) {
@@ -371,6 +387,7 @@ describe('MinIO single-node queue performance and loss', () => {
         concurrency,
         payloadBytes,
         retryEvery,
+        runBearing: runBearingQueue,
       },
       correctness: {
         allDelivered,
