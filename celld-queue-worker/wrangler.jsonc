@@ -11,7 +11,9 @@
       {
         "queue": "workflow-world",
         "max_batch_size": 10,
-        "max_batch_timeout": 1,
+        // Dispatch as soon as a message is ready. Every workflow step hop
+        // goes through this queue, so a batch-fill wait adds to each hop.
+        "max_batch_timeout": 0,
         "max_retries": 100,
         "dead_letter_queue": "workflow-world-dlq",
         "max_concurrency": 25,
