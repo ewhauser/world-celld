@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { RunExpiredError } from '@workflow/errors';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { build } from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../../src/index.js';
@@ -700,7 +701,16 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     await w.closeStream(streamName, runId);
     await w.queue(
       `__wkf_workflow_retention_restart_${randomUUID().slice(0, 8)}`,
-      { runId },
+      // User data keeps the body in object storage, where retention must delete it.
+      {
+        runId,
+        runInput: {
+          input: ['retention-restart'],
+          deploymentId: 'smoke',
+          workflowName: 'retention-restart',
+          specVersion: SPEC_VERSION_CURRENT,
+        },
+      },
       { delaySeconds: 3_600, idempotencyKey: `retention-restart:${runId}` },
     );
     await w.events.create(runId, {
