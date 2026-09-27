@@ -173,6 +173,15 @@ export function allRunCatalogShardNames(): string[] {
   );
 }
 
+/** Catalog metadata for a run; the client and the worker router must agree on it. */
+export function runIndexMetadata(run: Pick<WorkflowRun, 'runId' | 'createdAt' | 'status'>): string {
+  return JSON.stringify({
+    runId: run.runId,
+    createdAt: run.createdAt.toISOString(),
+    status: run.status,
+  });
+}
+
 function stub<T>(namespace: CellNamespaceLike<T>, name: string): T {
   return namespace.get(namespace.idFromName(name));
 }

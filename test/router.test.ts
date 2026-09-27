@@ -932,13 +932,8 @@ describe('full stack: vendored storage over the wire', () => {
       eventData: { output: [] },
     });
 
-    expect(publicRpcs).toBe(2);
-    expect(paths).toEqual(
-      new Map([
-        [`/v1/rpc/runs/${created.run.runId}/applyEvent`, 1],
-        ['/v1/index/runs/commit', 1],
-      ]),
-    );
+    expect(publicRpcs).toBe(1);
+    expect(paths).toEqual(new Map([[`/v1/rpc/runs/${created.run.runId}/applyEvent`, 1]]));
   });
 
   it('lists runs inside the fleet, or from the client with bounded fanout for an older worker', async () => {
@@ -1151,9 +1146,11 @@ describe('full stack: vendored storage over the wire', () => {
     });
     const runId = 'wrun_catalog_failure_repair';
     const catalogStorage = harness.fleet.cell('run-catalog', runCatalogShardName(runId)).storage;
+    // Fail both the router's in-fleet publication and the client's fallback.
     catalogStorage.failNextMutation(
       (mutation) => mutation.operation === 'put' && mutation.key.startsWith('run:'),
       new Error('injected catalog commit failure'),
+      2,
     );
 
     const request = {
@@ -1176,6 +1173,33 @@ describe('full stack: vendored storage over the wire', () => {
       run: { runId },
     });
     const listed = await storage.runs.list({ workflowName: 'wire-catalog-repair' });
+    expect(listed.data.map((run) => run.runId)).toEqual([runId]);
+  });
+
+  it('publishes from the client when the in-fleet catalog publication fails', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-index-fallback',
+    });
+    const runId = 'wrun_catalog_router_fallback';
+    const catalogStorage = harness.fleet.cell('run-catalog', runCatalogShardName(runId)).storage;
+    catalogStorage.failNextMutation(
+      (mutation) => mutation.operation === 'put' && mutation.key.startsWith('run:'),
+      new Error('injected router catalog failure'),
+    );
+
+    await expect(
+      storage.events.create(runId, {
+        eventType: 'run_created',
+        eventData: {
+          deploymentId: 'wire-index-fallback',
+          workflowName: 'wire-catalog-fallback',
+          input: [],
+        },
+      }),
+    ).resolves.toMatchObject({ run: { runId } });
+    const listed = await storage.runs.list({ workflowName: 'wire-catalog-fallback' });
     expect(listed.data.map((run) => run.runId)).toEqual([runId]);
   });
 
@@ -1448,10 +1472,12 @@ describe('full stack: vendored storage over the wire', () => {
       eventData: { token },
     });
     const idStorage = harness.fleet.cell('hook-ids', hookIdShardName(hookId)).storage;
+    // Fail both the router's in-fleet release and the client's fallback.
     idStorage.failNextMutation(
       (mutation) =>
         mutation.operation === 'delete' && mutation.key === `hookid:${encodeURIComponent(hookId)}`,
       new Error('injected hook id deletion failure'),
+      2,
     );
 
     const disposal = { eventType: 'hook_disposed' as const, correlationId: hookId };

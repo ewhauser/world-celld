@@ -290,6 +290,10 @@ export interface ApplyEventSuccess {
   maxEvents?: number;
   /** Deadline for publishing this authoritative mutation to derivative indexes. */
   indexPublicationExpiresAt?: number;
+  /** Set by the worker router after it published `run` to the run catalog. */
+  runIndexPublished?: true;
+  /** Set by the worker router after it released `releasedHooks` from the hook indexes. */
+  hookIndexesReleased?: true;
 }
 
 export type ApplyEventOutcome = ApplyEventSuccess | ApplyEventFailure;

@@ -279,15 +279,15 @@ describe('sharded index scalability evidence', () => {
     };
     console.log(`INDEX_SCALABILITY_FANOUT ${JSON.stringify(report)}`);
 
-    expect(created.publicRpcs).toBe(2);
-    expect(updated.publicRpcs).toBe(2);
+    expect(created.publicRpcs).toBe(1);
+    expect(updated.publicRpcs).toBe(1);
     expect(listed.publicRpcs).toBe(1);
     expect(hookCreated.publicRpcs).toBe(3);
     expect(getByToken.publicRpcs).toBe(1);
     expect(getById.publicRpcs).toBe(1);
     expect(resumed.publicRpcs).toBe(1);
-    expect(disposed.publicRpcs).toBe(2);
-    expect(terminal.publicRpcs).toBe(2);
+    expect(disposed.publicRpcs).toBe(1);
+    expect(terminal.publicRpcs).toBe(1);
     expect(hookCreated).toMatchObject({
       internalLifecycleRpcs: 2,
       lifecycleStorage: { ...emptyCounts(), getMany: 2, transaction: 2 },

@@ -49,7 +49,7 @@ import type {
   ApplyEventSuccess,
 } from './apply-event.js';
 import type { HookTokenOwner, IndexNamespace } from './config.js';
-import type { HookReservation } from './indexes.js';
+import { type HookReservation, runIndexMetadata } from './indexes.js';
 import { FleetTransportError } from './remote/errors.js';
 import { listRunsPage, MAX_RUN_LIST_LIMIT, type RunListRequest } from './run-list.js';
 import { compact } from './util.js';
@@ -296,6 +296,11 @@ function parseApplyEventOutcome(value: unknown): ParsedApplyEventOutcome {
       value.maxEvents < 0)
   ) {
     malformedApplyEventOutcome('maxEvents must be a non-negative safe integer');
+  }
+  for (const flag of ['runIndexPublished', 'hookIndexesReleased'] as const) {
+    if (value[flag] !== undefined && value[flag] !== true) {
+      malformedApplyEventOutcome(`${flag} must be true when present`);
+    }
   }
   if (run !== undefined && value.indexPublicationExpiresAt === undefined) {
     malformedApplyEventOutcome('indexPublicationExpiresAt is required when run is present');
@@ -615,16 +620,18 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
 
         // Derived indexes are deliberately rewritten on idempotent replay so
         // a committed run or hook can repair an interrupted index update.
-        if (outcome.run) {
-          const meta = JSON.stringify({
-            runId: effectiveRunId,
-            createdAt: outcome.run.createdAt.toISOString(),
-            status: outcome.run.status,
-          });
+        // The worker router publishes both inside the fleet when it can and
+        // says so; otherwise (older workers, or a failed in-fleet write) the
+        // client publishes them here.
+        if (outcome.run && !outcome.runIndexPublished) {
           if (outcome.indexPublicationExpiresAt === undefined) {
             throw new Error('world-celld: authoritative run mutation omitted its index lease');
           }
-          await env.WORKFLOW_INDEX.commitRun(outcome.run, meta, outcome.indexPublicationExpiresAt);
+          await env.WORKFLOW_INDEX.commitRun(
+            outcome.run,
+            runIndexMetadata({ ...outcome.run, runId: effectiveRunId }),
+            outcome.indexPublicationExpiresAt,
+          );
         }
         if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
@@ -642,7 +649,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             hookAdmission.reservation,
           );
         }
-        if (outcome.releasedHooks.length > 0) {
+        if (outcome.releasedHooks.length > 0 && !outcome.hookIndexesReleased) {
           await env.WORKFLOW_INDEX.releaseHookIndexes({
             runId: effectiveRunId,
             hooks: outcome.releasedHooks,

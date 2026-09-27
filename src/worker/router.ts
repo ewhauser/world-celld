@@ -12,12 +12,13 @@
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
 import { SPEC_VERSION_CURRENT, type WorkflowRun } from '@workflow/world';
-import { parseApplyEventRequest } from '../apply-event.js';
+import { type ApplyEventSuccess, parseApplyEventRequest } from '../apply-event.js';
 import { rpcParse, rpcStringify } from '../codec.js';
 import type { RunReadOutcome } from '../retention.js';
 import { listRunsPage } from '../run-list.js';
 import {
   createWorkflowIndex,
+  runIndexMetadata,
   type CellNamespaceLike,
   type HookIdShardStub,
   type HookTokenShardStub,
@@ -111,6 +112,45 @@ function workflowIndex(env: WorkerEnv) {
     hookTokens: env.WORKFLOW_HOOK_TOKENS as CellNamespaceLike<HookTokenShardStub>,
     hookIds: env.WORKFLOW_HOOK_IDS as CellNamespaceLike<HookIdShardStub>,
   });
+}
+
+/**
+ * Publish a committed applyEvent outcome to the derivative indexes inside the
+ * fleet, sparing the client a round trip per run mutation. Each index write is
+ * idempotent under the outcome's publication lease. A failed write leaves its
+ * flag unset, so the client publishes it itself exactly as it would without
+ * this step; older clients ignore the flags and publish again.
+ */
+async function publishApplyEventIndexes(
+  env: WorkerEnv,
+  runId: string,
+  outcome: unknown,
+): Promise<void> {
+  if (typeof outcome !== 'object' || outcome === null) return;
+  const success = outcome as { ok?: unknown } & Partial<ApplyEventSuccess>;
+  if (success.ok !== true) return;
+  const index = workflowIndex(env);
+  const publications: Array<Promise<void>> = [];
+  if (success.run && typeof success.indexPublicationExpiresAt === 'number') {
+    const run = success.run;
+    const lease = success.indexPublicationExpiresAt;
+    publications.push(
+      (async () => {
+        await index.commitRun(run, runIndexMetadata(run), lease);
+        success.runIndexPublished = true;
+      })(),
+    );
+  }
+  const releasedHooks = success.releasedHooks;
+  if (Array.isArray(releasedHooks) && releasedHooks.length > 0) {
+    publications.push(
+      (async () => {
+        await index.releaseHookIndexes({ runId, hooks: releasedHooks });
+        success.hookIndexesReleased = true;
+      })(),
+    );
+  }
+  await Promise.allSettled(publications);
 }
 
 const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<string> }> = {
@@ -743,6 +783,9 @@ export function createRouter(env: WorkerEnv) {
         (...a: unknown[]) => Promise<unknown>
       >;
       const result = await stub[method](...args);
+      if (bindingKey === 'runs' && method === 'applyEvent') {
+        await publishApplyEventIndexes(env, name, result);
+      }
       return new Response(rpcStringify(result ?? null), {
         status: 200,
         headers: { 'content-type': 'application/json' },
