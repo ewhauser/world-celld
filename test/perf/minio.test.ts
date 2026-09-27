@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { mkdir, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
@@ -151,6 +152,10 @@ describe('MinIO single-node queue performance and loss', () => {
   const payloadBytes = positiveInteger('PERF_PAYLOAD_BYTES', 256);
   const retryEvery = nonNegativeInteger('PERF_RETRY_EVERY', 20);
   const timeoutMs = positiveInteger('PERF_TIMEOUT_MS', 180_000);
+  // Emulates the client-to-fleet network: every World client request waits
+  // this long before it is sent, so round-trip savings show on loopback.
+  const clientRttMs = nonNegativeInteger('PERF_CLIENT_RTT_MS');
+  const originalFetch = globalThis.fetch;
   const minEnqueuePerSecond = nonNegativeNumber('PERF_MIN_ENQUEUE_PER_SECOND');
   const minDeliveryPerSecond = nonNegativeNumber('PERF_MIN_DELIVERY_PER_SECOND');
   const maxDeliveryP99Ms = nonNegativeNumber('PERF_MAX_DELIVERY_P99_MS');
@@ -196,6 +201,12 @@ describe('MinIO single-node queue performance and loss', () => {
 
   beforeAll(async () => {
     process.env.CELLD_QUEUE_MODE = 'native';
+    if (clientRttMs > 0) {
+      globalThis.fetch = async (input, init) => {
+        await delay(clientRttMs);
+        return await originalFetch(input, init);
+      };
+    }
     if (!fleetUrl || !secret) {
       throw new Error('CELLD_FLEET_URL and CELLD_WORLD_SECRET are required');
     }
@@ -282,6 +293,7 @@ describe('MinIO single-node queue performance and loss', () => {
 
   afterAll(async () => {
     delete process.env.CELLD_QUEUE_MODE;
+    globalThis.fetch = originalFetch;
     if (!listener) return;
     listener.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
@@ -537,7 +549,7 @@ describe('MinIO single-node queue performance and loss', () => {
       schemaVersion: 1,
       recordedAt: new Date().toISOString(),
       backend: { name: 'minio', celldVersion: process.env.PERF_CELLD_VERSION ?? 'unknown' },
-      workload: { runs: workflowRuns, concurrency: workflowConcurrency, payloadBytes },
+      workload: { runs: workflowRuns, concurrency: workflowConcurrency, payloadBytes, clientRttMs },
       correctness: {
         completed: stageMs.complete.length,
         accepted: workflowAccepted.size,
