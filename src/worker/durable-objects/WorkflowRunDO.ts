@@ -1186,6 +1186,21 @@ export class WorkflowRunDO extends DurableObject {
     });
   }
 
+  /**
+   * Read-only admission for a run-bearing Queue message whose body travels
+   * inline in the broker envelope. It answers what payload registration does
+   * for offloaded bodies, without writing anything.
+   */
+  async getQueueAdmission(): Promise<{ ok: true } | { ok: false; message: string }> {
+    const { tombstone } = await this.retentionState(this.ctx.storage);
+    return tombstone
+      ? {
+          ok: false,
+          message: `Workflow run "${tombstone.runId}" expired at ${tombstone.expiredAt.toISOString()}`,
+        }
+      : { ok: true };
+  }
+
   async registerQueuePayload(
     registration: QueuePayloadRegistration,
   ): Promise<{ ok: true } | { ok: false; message: string }> {

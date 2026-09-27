@@ -38,7 +38,11 @@ export interface NativeQueueEnvelope {
   runId?: string;
   idempotencyKey?: string;
   payloadKey?: string;
-  /** Inline only for the small, run-less health-check envelope. */
+  /**
+   * Inline body. Health checks always travel inline; a run-bearing body may
+   * travel inline when it is small and carries no user data, in which case
+   * delivery checks the run's expiry instead of reading a payload object.
+   */
   body?: string;
   /** Absolute workflow redelivery deadline; long waits are chained by the consumer. */
   notBefore?: number;
