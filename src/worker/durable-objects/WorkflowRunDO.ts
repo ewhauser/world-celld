@@ -806,6 +806,7 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   private async executeTerminalCleanup(cleanup: TerminalCleanupRecord): Promise<void> {
+    if (cleanup.phase === 'hooks' && (await this.completeSmallTerminalCleanup(cleanup))) return;
     if (cleanup.phase === 'hooks') {
       await this.deleteTerminalHookPage(cleanup);
     } else if (cleanup.phase === 'markers') {
@@ -813,6 +814,73 @@ export class WorkflowRunDO extends DurableObject {
     } else {
       await this.deleteTerminalWaitPage(cleanup);
     }
+  }
+
+  /**
+   * Most runs end with a handful of hooks and waits. When every terminal
+   * phase fits in one page, release the hook indexes once and delete hooks,
+   * markers, and waits in a single transaction instead of one alarm and one
+   * transaction per phase. Returns false, having changed nothing locally, when
+   * any phase needs paging; the paged phases then run as before.
+   */
+  private async completeSmallTerminalCleanup(cleanup: TerminalCleanupRecord): Promise<boolean> {
+    const [hookEntries, markerEntries] = await Promise.all([
+      this.ctx.storage.list<Hook>({ prefix: HOOK_KEY_PREFIX, limit: TERMINAL_HOOK_PAGE_SIZE + 1 }),
+      this.ctx.storage.list<HookIndexReference>({
+        prefix: HOOK_MARKER_PREFIX,
+        limit: HOOK_MARKER_PAGE_SIZE + 1,
+      }),
+    ]);
+    if (hookEntries.size > TERMINAL_HOOK_PAGE_SIZE || markerEntries.size > HOOK_MARKER_PAGE_SIZE) {
+      return false;
+    }
+    const hooks = Array.from(hookEntries.values());
+    const references = new Map<string, HookIndexReference>();
+    for (const reference of [
+      ...hooks.map((hook) => ({ hookId: hook.hookId, token: hook.token })),
+      ...markerEntries.values(),
+    ]) {
+      references.set(`${reference.hookId}\u0000${reference.token}`, reference);
+    }
+    if (references.size > 0) {
+      await this.workflowIndex().releaseHookIndexes({
+        runId: cleanup.runId,
+        hooks: Array.from(references.values()),
+      });
+    }
+
+    return await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<TerminalCleanupRecord>(TERMINAL_CLEANUP_KEY);
+      if (
+        !current ||
+        current.phase !== cleanup.phase ||
+        current.generation !== cleanup.generation
+      ) {
+        // Another pass owns the record now; there is nothing left to do here.
+        return true;
+      }
+      const waits = await txn.list({ prefix: WAIT_KEY_PREFIX, limit: TERMINAL_WAIT_PAGE_SIZE + 1 });
+      if (waits.size > TERMINAL_WAIT_PAGE_SIZE) return false;
+      const keys = [
+        ...hooks.flatMap((hook) => [
+          `${HOOK_KEY_PREFIX}${hook.hookId}`,
+          hookCreationIndexKey(hook),
+        ]),
+        ...markerEntries.keys(),
+        ...waits.keys(),
+      ];
+      for (let offset = 0; offset < keys.length; offset += STORAGE_BATCH_SIZE) {
+        await txn.delete(keys.slice(offset, offset + STORAGE_BATCH_SIZE));
+      }
+      await txn.delete(TERMINAL_CLEANUP_KEY);
+      const retention = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
+      if (retention && retention.phase !== 'tombstoned') {
+        await txn.setAlarm(Math.max(this.now() + 1, retention.dueAt.getTime()));
+      } else {
+        await txn.deleteAlarm();
+      }
+      return true;
+    });
   }
 
   private async deleteTerminalHookPage(cleanup: TerminalCleanupRecord): Promise<void> {

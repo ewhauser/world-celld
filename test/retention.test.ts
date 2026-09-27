@@ -356,6 +356,62 @@ describe('terminal workflow retention', () => {
     expect(remainingChunks()).toBe(0);
   });
 
+  it('finishes a small terminal cleanup in one alarm and one transaction', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+    });
+    const runId = await createCompletedRun(world, 'terminal-small');
+    for (let hook = 0; hook < 3; hook++) {
+      await world.events.create(runId, {
+        eventType: 'hook_created',
+        correlationId: `small-hook-${hook}`,
+        eventData: { token: `small-token-${hook}` },
+      });
+    }
+    for (let wait = 0; wait < 2; wait++) {
+      await world.events.create(runId, {
+        eventType: 'wait_created',
+        correlationId: `small-wait-${wait}`,
+        eventData: { resumeAt: new Date(harness.fleet.now + 60_000) },
+      });
+    }
+    await finishRun(world, runId);
+
+    const cell = harness.fleet.cell('runs', runId);
+    const instance = cell.instance as WorkflowRunDO;
+    const originalAlarm = instance.alarm.bind(instance);
+    let alarms = 0;
+    instance.alarm = async () => {
+      alarms++;
+      await originalAlarm();
+    };
+    const transactionsBefore = cell.storage.operationCounts.transaction;
+    await driveTerminalCleanup(harness, runId);
+    const transactions = cell.storage.operationCounts.transaction - transactionsBefore;
+    console.log(`TERMINAL_CLEANUP_SMALL ${JSON.stringify({ alarms, transactions })}`);
+
+    expect(alarms).toBe(1);
+    expect(transactions).toBe(1);
+    const keys = Array.from(cell.storage.data.keys());
+    expect(keys.filter((key) => /^(hook:|hookcreated:|wait:|retention:hook:)/.test(key))).toEqual(
+      [],
+    );
+    expect(cell.storage.alarmAt).toBeNull();
+    for (let hook = 0; hook < 3; hook++) {
+      await expect(world.hooks.getByToken(`small-token-${hook}`)).rejects.toSatisfy((error) =>
+        HookNotFoundError.is(error),
+      );
+      expect(
+        harness.fleet
+          .cell('hook-tokens', hookTokenShardName(`small-token-${hook}`))
+          .storage.data.has(hookTokenRecordKey(`small-token-${hook}`)),
+      ).toBe(false);
+    }
+  });
+
   it('pages terminal hooks and waits with bounded operations until cleanup completes', async () => {
     harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
     const world = createCelldWorld({
