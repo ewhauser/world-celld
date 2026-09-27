@@ -264,10 +264,24 @@ describe('terminal workflow retention', () => {
       correlationId: 'retention-hook',
       eventData: { token: 'retention-token' },
     });
+    // A body with user data moves to object storage; a small one stays inline.
+    await world.queue(
+      '__wkf_workflow_retention',
+      {
+        runId,
+        runInput: {
+          input: ['queued-user-data'],
+          deploymentId: 'retention-tests',
+          workflowName: 'retention-complete',
+          specVersion: SPEC_VERSION_CURRENT,
+        },
+      },
+      { delaySeconds: 3_600, idempotencyKey: `wake:${runId}` },
+    );
     await world.queue(
       '__wkf_workflow_retention',
       { runId },
-      { delaySeconds: 3_600, idempotencyKey: `wake:${runId}` },
+      { delaySeconds: 3_600, idempotencyKey: `wake-inline:${runId}` },
     );
     await finishRun(world, runId);
 
@@ -277,7 +291,7 @@ describe('terminal workflow retention', () => {
     expect((await world.getStreamInfo('retention-stream', runId)).done).toBe(true);
 
     harness.fleet.advance(1_001);
-    expect(harness.queueMessages).toHaveLength(1);
+    expect(harness.queueMessages).toHaveLength(2);
     expect(harness.queuePayloads.size).toBe(1);
     await expect(
       world.queue(

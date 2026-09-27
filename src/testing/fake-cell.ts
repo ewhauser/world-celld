@@ -458,6 +458,11 @@ export class FakeFleet {
     return new CellCtor(ctx, this.cellEnv);
   }
 
+  /** Whether a cell has been activated, without activating it. */
+  hasCell(bindingKey: string, name: string): boolean {
+    return this.cells.has(`${bindingKey}\0${name}`);
+  }
+
   cell(bindingKey: string, name: string): CellSlot {
     const key = `${bindingKey}\0${name}`;
     let slot = this.cells.get(key);
