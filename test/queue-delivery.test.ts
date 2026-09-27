@@ -24,6 +24,21 @@ function setup() {
     holdInflight: vi.fn<QueueRunStub['holdInflight']>().mockResolvedValue({ held: true }),
   };
   const run = {
+    claimRunQueueMessage: vi
+      .fn<QueueRunStub['claimRunQueueMessage']>()
+      .mockResolvedValue({ expired: false, claimed: true }),
+    holdRunQueueMessage: vi
+      .fn<QueueRunStub['holdRunQueueMessage']>()
+      .mockResolvedValue({ held: true }),
+    releaseRunQueueMessage: vi
+      .fn<QueueRunStub['releaseRunQueueMessage']>()
+      .mockResolvedValue(undefined),
+    completeRunQueueMessage: vi
+      .fn<QueueRunStub['completeRunQueueMessage']>()
+      .mockResolvedValue(undefined),
+    getQueueAdmission: vi
+      .fn<QueueRunStub['getQueueAdmission']>()
+      .mockResolvedValue({ ok: true } as const),
     unregisterQueuePayload: vi
       .fn<QueueRunStub['unregisterQueuePayload']>()
       .mockResolvedValue(undefined),
@@ -215,5 +230,134 @@ describe('internal Queue delivery', () => {
       'connection reset',
     );
     expect(claim.releaseInflight).toHaveBeenCalledWith(envelope.messageId);
+  });
+
+  describe('inline run-bearing bodies', () => {
+    const inline: NativeQueueEnvelope = {
+      version: 1,
+      messageId: 'msg_inline',
+      queueName: '__wkf_workflow_delivery',
+      targetBaseUrl: 'https://app.internal/',
+      runId: 'wrun_delivery',
+      idempotencyKey: 'inline-key',
+      body: '{"runId":"wrun_delivery"}',
+    };
+
+    it('delivers the inline body after checking the run, with no payload object work', async () => {
+      const { env, claim, run, orphan, store, callback } = setup();
+      expect(await deliverQueueMessage(env, 'secret', inline, 1)).toEqual({ kind: 'complete' });
+      expect(run.getQueueAdmission).toHaveBeenCalledTimes(1);
+      expect(callback.mock.calls[0][1]?.body).toBe(inline.body);
+      expect(store.read).not.toHaveBeenCalled();
+      expect(store.delete).not.toHaveBeenCalled();
+      expect(run.unregisterQueuePayload).not.toHaveBeenCalled();
+      expect(orphan.cancelQueuePayloadOrphan).not.toHaveBeenCalled();
+      expect(claim.completeQueueMessage).toHaveBeenCalledWith(inline.messageId);
+    });
+
+    it('completes without a callback when the run has expired', async () => {
+      const { env, claim, run, callback } = setup();
+      run.getQueueAdmission.mockResolvedValue({ ok: false, message: 'expired' });
+      expect(await deliverQueueMessage(env, 'secret', inline, 1)).toEqual({ kind: 'complete' });
+      expect(callback).not.toHaveBeenCalled();
+      expect(claim.completeQueueMessage).toHaveBeenCalledWith(inline.messageId);
+      expect(claim.releaseInflight).not.toHaveBeenCalled();
+    });
+
+    it('releases the claim when the run check fails', async () => {
+      const { env, claim, run, callback } = setup();
+      run.getQueueAdmission.mockRejectedValue(new Error('run cell unavailable'));
+      await expect(deliverQueueMessage(env, 'secret', inline, 1)).rejects.toThrow(
+        /run cell unavailable/,
+      );
+      expect(callback).not.toHaveBeenCalled();
+      expect(claim.releaseInflight).toHaveBeenCalledWith(inline.messageId);
+    });
+
+    it('does not deliver an inline body whose claim is held elsewhere', async () => {
+      const { env, claim, callback } = setup();
+      claim.claimInflight.mockResolvedValue({ claimed: false });
+      expect(await deliverQueueMessage(env, 'secret', inline, 1)).toEqual({ kind: 'complete' });
+      expect(callback).not.toHaveBeenCalled();
+    });
+
+    it('never checks the run for offloaded bodies or run-less health checks', async () => {
+      const { env, run } = setup();
+      await deliverQueueMessage(env, 'secret', envelope, 1);
+      await deliverQueueMessage(
+        env,
+        'secret',
+        { ...inline, runId: undefined, idempotencyKey: undefined },
+        1,
+      );
+      expect(run.getQueueAdmission).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('run-scoped claims', () => {
+    const scoped: NativeQueueEnvelope = {
+      version: 1,
+      messageId: 'msg_scoped',
+      queueName: '__wkf_workflow_delivery',
+      targetBaseUrl: 'https://app.internal/',
+      runId: 'wrun_delivery',
+      idempotencyKey: 'scoped-key',
+      claimScope: 'run',
+      body: '{"runId":"wrun_delivery"}',
+    };
+    const claimName = 'claim:23:__wkf_workflow_delivery:scoped-key';
+
+    it('claims and completes in the run cell, with the expiry check in the same call', async () => {
+      const { env, claim, run, get, callback } = setup();
+      expect(await deliverQueueMessage(env, 'secret', scoped, 1)).toEqual({ kind: 'complete' });
+      expect(run.claimRunQueueMessage).toHaveBeenCalledWith({
+        claimName,
+        messageId: scoped.messageId,
+        staleMs: expect.any(Number),
+      });
+      expect(run.getQueueAdmission).not.toHaveBeenCalled();
+      expect(callback).toHaveBeenCalledOnce();
+      expect(run.completeRunQueueMessage).toHaveBeenCalledWith({
+        claimName,
+        messageId: scoped.messageId,
+      });
+      expect(claim.claimInflight).not.toHaveBeenCalled();
+      expect(get.mock.calls.map(([id]) => id.toString())).not.toContain(claimName);
+    });
+
+    it('completes without a callback when the run has expired', async () => {
+      const { env, run, callback } = setup();
+      run.claimRunQueueMessage.mockResolvedValue({ expired: true });
+      expect(await deliverQueueMessage(env, 'secret', scoped, 1)).toEqual({ kind: 'complete' });
+      expect(callback).not.toHaveBeenCalled();
+      expect(run.releaseRunQueueMessage).not.toHaveBeenCalled();
+    });
+
+    it('holds the run-scoped claim on suspension and releases it on a transient failure', async () => {
+      const { env, run, callback } = setup();
+      callback.mockResolvedValueOnce(Response.json({ timeoutSeconds: 30 }, { status: 503 }));
+      expect(await deliverQueueMessage(env, 'secret', scoped, 1)).toEqual({
+        kind: 'suspend',
+        timeoutSeconds: 30,
+      });
+      expect(run.holdRunQueueMessage).toHaveBeenCalledWith(
+        expect.objectContaining({ claimName, messageId: scoped.messageId }),
+      );
+
+      callback.mockResolvedValueOnce(new Response('retry', { status: 500 }));
+      expect(await deliverQueueMessage(env, 'secret', scoped, 2)).toEqual({ kind: 'retry' });
+      expect(run.releaseRunQueueMessage).toHaveBeenCalledWith({
+        claimName,
+        messageId: scoped.messageId,
+      });
+    });
+
+    it('rejects a run scope without a runId', async () => {
+      const { env, get } = setup();
+      await expect(
+        deliverQueueMessage(env, 'secret', { ...scoped, runId: undefined }, 1),
+      ).rejects.toThrow(/claimScope/);
+      expect(get).not.toHaveBeenCalled();
+    });
   });
 });

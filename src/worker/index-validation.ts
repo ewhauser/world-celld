@@ -1,12 +1,14 @@
 import { HookSchema, WorkflowRunSchema, type WorkflowRun } from '@workflow/world';
 import type { HookTokenOwner } from '../config.js';
 import type { HookReservation, IndexListOptions } from '../indexes.js';
+import { MAX_RUN_LIST_LIMIT, type RunListRequest, type RunStatus } from '../run-list.js';
 import type { ExpireRunIndexesRequest, ReleaseHookIndexesRequest } from '../retention.js';
 import { isRecord } from '../validation.js';
 import { parse } from '../vendor/shared/index.js';
 
 export type IndexOperation =
   | 'runs.list'
+  | 'runs.list-resolved'
   | 'runs.commit'
   | 'runs.expire'
   | 'hooks.reserve'
@@ -16,6 +18,7 @@ export type IndexOperation =
 
 export type ValidatedIndexRequest =
   | { operation: 'runs.list'; args: [IndexListOptions | undefined] }
+  | { operation: 'runs.list-resolved'; args: [RunListRequest] }
   | { operation: 'runs.commit'; args: [WorkflowRun, string, number] }
   | { operation: 'runs.expire'; args: [ExpireRunIndexesRequest] }
   | { operation: 'hooks.reserve'; args: [string, HookTokenOwner] }
@@ -140,6 +143,48 @@ function listOptions(value: unknown): IndexListOptions | undefined {
   return parsed;
 }
 
+const RUN_STATUSES = new Set<RunStatus>(['pending', 'running', 'completed', 'failed', 'cancelled']);
+
+function runListRequest(value: unknown): RunListRequest {
+  if (!isRecord(value)) invalid('run list request must be an object');
+  const limit = value.limit;
+  if (
+    !Number.isSafeInteger(limit) ||
+    (limit as number) < 1 ||
+    (limit as number) > MAX_RUN_LIST_LIMIT
+  ) {
+    invalid(`request.limit must be an integer between 1 and ${MAX_RUN_LIST_LIMIT}`);
+  }
+  const parsed: RunListRequest = { limit: limit as number };
+  if (value.workflowName !== undefined) {
+    parsed.workflowName = nonEmptyString(value.workflowName, 'request.workflowName');
+  }
+  if (value.cursor !== undefined) parsed.cursor = stringValue(value.cursor, 'request.cursor');
+  if (value.statuses !== undefined) {
+    if (
+      !Array.isArray(value.statuses) ||
+      value.statuses.length === 0 ||
+      !value.statuses.every((status) => RUN_STATUSES.has(status as RunStatus))
+    ) {
+      invalid('request.statuses must be a non-empty array of run statuses');
+    }
+    parsed.statuses = value.statuses as RunStatus[];
+  }
+  if (value.sortOrder !== undefined) {
+    if (value.sortOrder !== 'asc' && value.sortOrder !== 'desc') {
+      invalid("request.sortOrder must be 'asc' or 'desc'");
+    }
+    parsed.sortOrder = value.sortOrder;
+  }
+  if (value.resolveData !== undefined) {
+    if (value.resolveData !== 'none' && value.resolveData !== 'all') {
+      invalid("request.resolveData must be 'none' or 'all'");
+    }
+    parsed.resolveData = value.resolveData;
+  }
+  return parsed;
+}
+
 function runCommit(args: unknown[]): ValidatedIndexRequest {
   exactArgs(args, 3);
   const parsedRun = WorkflowRunSchema.safeParse(args[0]);
@@ -208,6 +253,9 @@ export function validateIndexRequest(
     case 'runs.list':
       if (args.length > 1) invalid('expected at most 1 argument');
       return { operation, args: [listOptions(args[0])] };
+    case 'runs.list-resolved':
+      exactArgs(args, 1);
+      return { operation, args: [runListRequest(args[0])] };
     case 'runs.commit':
       return runCommit(args);
     case 'runs.expire':
@@ -237,6 +285,7 @@ export function validateIndexRequest(
 
 export const INDEX_OPERATIONS = new Set<IndexOperation>([
   'runs.list',
+  'runs.list-resolved',
   'runs.commit',
   'runs.expire',
   'hooks.reserve',

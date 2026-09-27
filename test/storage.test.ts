@@ -1187,3 +1187,90 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
     });
   });
 });
+
+describe('hook_received replay preload', () => {
+  let storage: ReturnType<typeof createStorage>;
+
+  beforeAll(() => {
+    storage = createStorage({ env: createMockEnv(), deploymentId: 'preload-deployment' });
+  });
+
+  beforeEach(() => {
+    clearMockData();
+  });
+
+  async function startRunWithHook(options: { start: boolean }): Promise<string> {
+    const created = await storage.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId: 'preload-deployment', workflowName: 'preload', input: [] },
+    });
+    const runId = created.run.runId;
+    if (options.start) await storage.events.create(runId, { eventType: 'run_started' });
+    await storage.events.create(runId, {
+      eventType: 'hook_created',
+      correlationId: 'hook-1',
+      eventData: { token: 'token-1' },
+    });
+    return runId;
+  }
+
+  function resume(runId: string, params: { preloadEvents?: true } = { preloadEvents: true }) {
+    return storage.events.create(
+      runId,
+      { eventType: 'hook_received', correlationId: 'hook-1', eventData: { payload: 'ok' } },
+      { resumeId: '01K00000000000000000000001', resumePayloadDigest: 'digest', ...params },
+    );
+  }
+
+  it('returns the run and the complete log with a resumable cursor', async () => {
+    const runId = await startRunWithHook({ start: true });
+    const result = await resume(runId);
+    expect(result.run?.status).toBe('running');
+    expect(result.run?.startedAt).toBeInstanceOf(Date);
+    expect(typeof result.maxEvents).toBe('number');
+    expect(result.hasMore).toBe(false);
+    expect(result.events?.map((event) => event.eventType)).toEqual([
+      'run_created',
+      'run_started',
+      'hook_created',
+      'hook_received',
+    ]);
+    expect(result.cursor).toBe(result.events?.at(-1)?.eventId);
+
+    // An idempotent re-ensure converges on the same event and log.
+    const again = await resume(runId);
+    expect(again.event?.eventId).toBe(result.event?.eventId);
+    expect(again.events).toEqual(result.events);
+  });
+
+  it('returns the plain result without preloadEvents', async () => {
+    const runId = await startRunWithHook({ start: true });
+    const result = await resume(runId, {});
+    expect(result.event?.eventType).toBe('hook_received');
+    expect(result.run).toBeUndefined();
+    expect(result.events).toBeUndefined();
+  });
+
+  it('returns no preload for a run that has not started', async () => {
+    const runId = await startRunWithHook({ start: false });
+    const result = await resume(runId);
+    expect(result.event?.eventType).toBe('hook_received');
+    expect(result.run).toBeUndefined();
+    expect(result.events).toBeUndefined();
+  });
+
+  it('returns no preload when the log exceeds the event ceiling', async () => {
+    const runId = await startRunWithHook({ start: true });
+    const previous = process.env.WORKFLOW_MAX_EVENTS;
+    process.env.WORKFLOW_MAX_EVENTS = '3';
+    try {
+      const result = await resume(runId);
+      expect(result.event?.eventType).toBe('hook_received');
+      expect(result.run).toBeUndefined();
+      expect(result.events).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.WORKFLOW_MAX_EVENTS;
+      else process.env.WORKFLOW_MAX_EVENTS = previous;
+    }
+  });
+});

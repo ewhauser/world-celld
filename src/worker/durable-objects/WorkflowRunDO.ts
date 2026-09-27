@@ -54,6 +54,7 @@ import {
   queuePayloadRegistryKey,
   type QueuePayloadOrphan,
   type QueuePayloadRegistration,
+  type RunQueueReservation,
 } from '../../queue-protocol.js';
 import {
   deleteQueuePayloadObjects,
@@ -94,19 +95,29 @@ interface WorkflowRunDOEnv {
   clock?: () => number;
 }
 
+const EVENT_SEQUENCE_KEY = 'event_sequence';
 const STORAGE_BATCH_SIZE = 128;
 const PAYLOAD_DELETE_BATCH = STORAGE_BATCH_SIZE;
 const HOOK_MARKER_PAGE_SIZE = 64;
 const TERMINAL_HOOK_PAGE_SIZE = 64;
 const TERMINAL_WAIT_PAGE_SIZE = STORAGE_BATCH_SIZE;
 const STREAMS_PER_CLEANUP_PAGE = 16;
-const STREAM_CHUNKS_PER_CLEANUP_PAGE = STORAGE_BATCH_SIZE;
+/** StreamDO deletes a page in 128-key calls within one transaction. */
+const STREAM_CHUNKS_PER_CLEANUP_PAGE = 256;
 const STREAM_BYTES_PER_CLEANUP_PAGE = 16 * 1024 * 1024;
 const QUEUE_PAYLOADS_PER_CLEANUP_PAGE = STORAGE_BATCH_SIZE;
 const CLEANUP_RETRY_MAX_MS = 60 * 60 * 1000;
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const QUEUE_ORPHAN_KEY = 'queue-orphan';
 const QUEUE_RESERVATION_KEY = 'queue-reservation';
+/** Run-scoped Queue idempotency state, one key per claim name, in the run's own cell. */
+const RUN_QUEUE_CLAIM_PREFIX = 'queue-claim:';
+/**
+ * Present when every idempotency claim of this run lives in the run's own
+ * cell. Written only when the run is created, so a run keeps one claim scope
+ * for its whole life and claims made before the marker existed stay valid.
+ */
+export const RUN_QUEUE_CLAIM_SCOPE_KEY = 'queue-claim-scope';
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
 
 function validateCleanupRequest(request: unknown, allowDisabled: boolean): ScheduleCleanupRequest {
@@ -196,6 +207,24 @@ interface InflightClaim {
 
 type QueueMessageReservation = InflightClaim;
 
+/**
+ * Run-scoped equivalent of a claim cell's reservation and in-flight claim.
+ * Expiry is checked on read, so no alarm is needed; completion deletes the
+ * entry and run retention deletes any left behind.
+ */
+interface RunQueueClaimState {
+  reservation?: QueueMessageReservation;
+  claim?: InflightClaim;
+}
+
+function runQueueClaimKey(claimName: string): string {
+  return `${RUN_QUEUE_CLAIM_PREFIX}${claimName}`;
+}
+
+function validRunQueueClaimName(claimName: unknown): claimName is string {
+  return typeof claimName === 'string' && claimName.startsWith('claim:');
+}
+
 interface QueuePayloadOrphanState extends QueuePayloadOrphan {
   generation: number;
   deleting: boolean;
@@ -231,14 +260,15 @@ export class WorkflowRunDO extends DurableObject {
   private async retentionState(
     storage: DurableObjectStorage | DurableObjectTransaction,
     now = this.now(),
-  ): Promise<{ cleanup?: CleanupRecord; tombstone: RunTombstone | null }> {
-    const values = await storage.get<RunTombstone | CleanupRecord>([
-      TOMBSTONE_KEY,
-      CLEANUP_RECORD_KEY,
-    ]);
+    options?: { withEventSequence?: boolean },
+  ): Promise<{ cleanup?: CleanupRecord; tombstone: RunTombstone | null; eventSequence: number }> {
+    const keys = [TOMBSTONE_KEY, CLEANUP_RECORD_KEY];
+    if (options?.withEventSequence) keys.push(EVENT_SEQUENCE_KEY);
+    const values = await storage.get<RunTombstone | CleanupRecord | number>(keys);
     return {
       cleanup: values.get(CLEANUP_RECORD_KEY) as CleanupRecord | undefined,
-      tombstone: this.tombstoneFrom(values, now),
+      tombstone: this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>, now),
+      eventSequence: (values.get(EVENT_SEQUENCE_KEY) as number | undefined) ?? 0,
     };
   }
 
@@ -276,7 +306,7 @@ export class WorkflowRunDO extends DurableObject {
     if (request.cleanup !== undefined) validateCleanupRequest(request.cleanup, true);
     return await this.ctx.storage.transaction(async (txn) => {
       const now = new Date(this.now());
-      const retention = await this.retentionState(txn, now.getTime());
+      const retention = await this.retentionState(txn, now.getTime(), { withEventSequence: true });
       const { tombstone } = retention;
       if (tombstone) {
         return {
@@ -286,7 +316,8 @@ export class WorkflowRunDO extends DurableObject {
         };
       }
 
-      let eventSequence = (await txn.get<number>('event_sequence')) ?? 0;
+      const storedSequence = retention.eventSequence;
+      let eventSequence = storedSequence;
       const outcome = await applyEvent(storeFrom(txn), {
         ...request,
         nextEventId: () => slotToEventId(++eventSequence),
@@ -294,7 +325,12 @@ export class WorkflowRunDO extends DurableObject {
       });
       if (!outcome.ok) return outcome;
 
-      await txn.put('event_sequence', eventSequence);
+      // An idempotent replay appends nothing; leaving the sequence untouched
+      // keeps its transaction read-only, so it skips the durable commit.
+      if (eventSequence !== storedSequence) await txn.put(EVENT_SEQUENCE_KEY, eventSequence);
+      // A run created by this version keeps its Queue idempotency claims in
+      // its own cell for its whole life.
+      if (outcome.runCreated) await txn.put(RUN_QUEUE_CLAIM_SCOPE_KEY, 'run');
       const hookReferences: HookIndexReference[] = outcome.hookToIndex
         ? [
             {
@@ -801,6 +837,7 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   private async executeTerminalCleanup(cleanup: TerminalCleanupRecord): Promise<void> {
+    if (cleanup.phase === 'hooks' && (await this.completeSmallTerminalCleanup(cleanup))) return;
     if (cleanup.phase === 'hooks') {
       await this.deleteTerminalHookPage(cleanup);
     } else if (cleanup.phase === 'markers') {
@@ -808,6 +845,73 @@ export class WorkflowRunDO extends DurableObject {
     } else {
       await this.deleteTerminalWaitPage(cleanup);
     }
+  }
+
+  /**
+   * Most runs end with a handful of hooks and waits. When every terminal
+   * phase fits in one page, release the hook indexes once and delete hooks,
+   * markers, and waits in a single transaction instead of one alarm and one
+   * transaction per phase. Returns false, having changed nothing locally, when
+   * any phase needs paging; the paged phases then run as before.
+   */
+  private async completeSmallTerminalCleanup(cleanup: TerminalCleanupRecord): Promise<boolean> {
+    const [hookEntries, markerEntries] = await Promise.all([
+      this.ctx.storage.list<Hook>({ prefix: HOOK_KEY_PREFIX, limit: TERMINAL_HOOK_PAGE_SIZE + 1 }),
+      this.ctx.storage.list<HookIndexReference>({
+        prefix: HOOK_MARKER_PREFIX,
+        limit: HOOK_MARKER_PAGE_SIZE + 1,
+      }),
+    ]);
+    if (hookEntries.size > TERMINAL_HOOK_PAGE_SIZE || markerEntries.size > HOOK_MARKER_PAGE_SIZE) {
+      return false;
+    }
+    const hooks = Array.from(hookEntries.values());
+    const references = new Map<string, HookIndexReference>();
+    for (const reference of [
+      ...hooks.map((hook) => ({ hookId: hook.hookId, token: hook.token })),
+      ...markerEntries.values(),
+    ]) {
+      references.set(`${reference.hookId}\u0000${reference.token}`, reference);
+    }
+    if (references.size > 0) {
+      await this.workflowIndex().releaseHookIndexes({
+        runId: cleanup.runId,
+        hooks: Array.from(references.values()),
+      });
+    }
+
+    return await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<TerminalCleanupRecord>(TERMINAL_CLEANUP_KEY);
+      if (
+        !current ||
+        current.phase !== cleanup.phase ||
+        current.generation !== cleanup.generation
+      ) {
+        // Another pass owns the record now; there is nothing left to do here.
+        return true;
+      }
+      const waits = await txn.list({ prefix: WAIT_KEY_PREFIX, limit: TERMINAL_WAIT_PAGE_SIZE + 1 });
+      if (waits.size > TERMINAL_WAIT_PAGE_SIZE) return false;
+      const keys = [
+        ...hooks.flatMap((hook) => [
+          `${HOOK_KEY_PREFIX}${hook.hookId}`,
+          hookCreationIndexKey(hook),
+        ]),
+        ...markerEntries.keys(),
+        ...waits.keys(),
+      ];
+      for (let offset = 0; offset < keys.length; offset += STORAGE_BATCH_SIZE) {
+        await txn.delete(keys.slice(offset, offset + STORAGE_BATCH_SIZE));
+      }
+      await txn.delete(TERMINAL_CLEANUP_KEY);
+      const retention = await txn.get<CleanupRecord>(CLEANUP_RECORD_KEY);
+      if (retention && retention.phase !== 'tombstoned') {
+        await txn.setAlarm(Math.max(this.now() + 1, retention.dueAt.getTime()));
+      } else {
+        await txn.deleteAlarm();
+      }
+      return true;
+    });
   }
 
   private async deleteTerminalHookPage(cleanup: TerminalCleanupRecord): Promise<void> {
@@ -1109,6 +1213,192 @@ export class WorkflowRunDO extends DurableObject {
         lastAttemptAt: new Date(this.now()),
       });
       await txn.setAlarm(this.now() + delay);
+    });
+  }
+
+  /**
+   * Read-only admission for a run-bearing Queue message whose body travels
+   * inline in the broker envelope. It answers what payload registration does
+   * for offloaded bodies, without writing anything.
+   */
+  async getQueueAdmission(): Promise<{ ok: true } | { ok: false; message: string }> {
+    const { tombstone } = await this.retentionState(this.ctx.storage);
+    return tombstone
+      ? {
+          ok: false,
+          message: `Workflow run "${tombstone.runId}" expired at ${tombstone.expiredAt.toISOString()}`,
+        }
+      : { ok: true };
+  }
+
+  /**
+   * Enqueue-side admission and idempotency reservation in one transaction,
+   * for a run-scoped claim. Replaces a separate claim cell's reservation plus
+   * the run expiry check.
+   */
+  async reserveRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    expiresAt: number;
+  }): Promise<RunQueueReservation> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.expiresAt)
+    ) {
+      throw new TypeError('world-celld run queue reservation is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const values = await txn.get<RunTombstone | CleanupRecord | RunQueueClaimState | string>([
+        TOMBSTONE_KEY,
+        CLEANUP_RECORD_KEY,
+        RUN_QUEUE_CLAIM_SCOPE_KEY,
+        key,
+      ]);
+      const tombstone = this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>);
+      if (tombstone) {
+        return {
+          ok: false,
+          message: `Workflow run "${tombstone.runId}" expired at ${tombstone.expiredAt.toISOString()}`,
+        };
+      }
+      // A run created before run-scoped claims keeps its claims in claim cells.
+      if (values.get(RUN_QUEUE_CLAIM_SCOPE_KEY) !== 'run') return { ok: true, scope: 'cell' };
+      const state = (values.get(key) as RunQueueClaimState | undefined) ?? {};
+      const existing = state.reservation;
+      if (existing && existing.expiresAt > this.now() && existing.messageId !== params.messageId) {
+        return { ok: true, scope: 'run', admitted: false, messageId: existing.messageId };
+      }
+      await txn.put<RunQueueClaimState>(key, {
+        ...state,
+        reservation: {
+          messageId: params.messageId,
+          expiresAt: Math.max(existing?.expiresAt ?? 0, params.expiresAt),
+        },
+      });
+      return { ok: true, scope: 'run', admitted: true, messageId: params.messageId };
+    });
+  }
+
+  /** Delivery-side run expiry check and in-flight claim in one transaction. */
+  async claimRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    staleMs: number;
+  }): Promise<{ expired: true } | { expired: false; claimed: boolean; retryAt?: number }> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isPositiveSafeInteger(params.staleMs)
+    ) {
+      throw new TypeError('world-celld run queue claim is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const values = await txn.get<RunTombstone | CleanupRecord | RunQueueClaimState>([
+        TOMBSTONE_KEY,
+        CLEANUP_RECORD_KEY,
+        key,
+      ]);
+      if (this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>)) {
+        return { expired: true };
+      }
+      const state = (values.get(key) as RunQueueClaimState | undefined) ?? {};
+      const existing = state.claim;
+      const now = this.now();
+      if (existing && existing.expiresAt > now) {
+        if (existing.messageId !== params.messageId) return { expired: false, claimed: false };
+        if (existing.retryAt === undefined || existing.retryAt > now) {
+          return {
+            expired: false,
+            claimed: false,
+            retryAt: existing.retryAt ?? existing.expiresAt,
+          };
+        }
+      }
+      await txn.put<RunQueueClaimState>(key, {
+        ...state,
+        claim: { messageId: params.messageId, expiresAt: now + params.staleMs },
+      });
+      return { expired: false, claimed: true };
+    });
+  }
+
+  async holdRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    retryAt: number;
+    expiresAt: number;
+    reservationExpiresAt?: number;
+  }): Promise<{ held: boolean }> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.retryAt) ||
+      !isNonNegativeSafeInteger(params.expiresAt) ||
+      (params.reservationExpiresAt !== undefined &&
+        !isNonNegativeSafeInteger(params.reservationExpiresAt))
+    ) {
+      throw new TypeError('world-celld run queue claim hold is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = (await txn.get<RunQueueClaimState>(key)) ?? {};
+      const existing = state.claim;
+      if (!existing || existing.messageId !== params.messageId) return { held: false };
+      const next: RunQueueClaimState = {
+        ...state,
+        claim: {
+          ...existing,
+          retryAt: params.retryAt,
+          expiresAt: Math.max(existing.expiresAt, params.expiresAt),
+        },
+      };
+      if (
+        state.reservation?.messageId === params.messageId &&
+        params.reservationExpiresAt !== undefined &&
+        params.reservationExpiresAt > state.reservation.expiresAt
+      ) {
+        next.reservation = { ...state.reservation, expiresAt: params.reservationExpiresAt };
+      }
+      await txn.put<RunQueueClaimState>(key, next);
+      return { held: true };
+    });
+  }
+
+  async releaseRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void> {
+    if (!validRunQueueClaimName(params?.claimName) || typeof params.messageId !== 'string') {
+      throw new TypeError('world-celld run queue claim release is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = await txn.get<RunQueueClaimState>(key);
+      if (state?.claim?.messageId !== params.messageId) return;
+      const { claim: _released, ...rest } = state;
+      if (rest.reservation) await txn.put<RunQueueClaimState>(key, rest);
+      else await txn.delete(key);
+    });
+  }
+
+  async completeRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void> {
+    if (!validRunQueueClaimName(params?.claimName) || typeof params.messageId !== 'string') {
+      throw new TypeError('world-celld run queue completion is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = await txn.get<RunQueueClaimState>(key);
+      if (!state) return;
+      const next: RunQueueClaimState = {};
+      if (state.reservation && state.reservation.messageId !== params.messageId) {
+        next.reservation = state.reservation;
+      }
+      if (state.claim && state.claim.messageId !== params.messageId) next.claim = state.claim;
+      if (next.reservation || next.claim) await txn.put<RunQueueClaimState>(key, next);
+      else await txn.delete(key);
     });
   }
 

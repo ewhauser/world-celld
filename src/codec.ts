@@ -9,7 +9,8 @@
  * `{__type:'Date', iso}`.
  *
  * Runs on both sides of the wire, including inside the celld worker — so no
- * Node built-ins (Buffer): base64 goes through atob/btoa.
+ * Node built-ins (Buffer): base64 uses the native Uint8Array methods or
+ * atob/btoa.
  */
 import { b64decode, b64encode, dateReviver } from './vendor/shared/serialization.js';
 

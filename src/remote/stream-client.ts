@@ -1,7 +1,12 @@
 import {
   MAX_STREAM_BATCH_BYTES,
   MAX_STREAM_READ_BYTES,
+  MAX_STREAM_READ_CHUNKS,
+  MAX_STREAM_WRITE_CHUNKS,
+  NEGOTIATED_STREAM_CHUNKS,
   STREAM_BATCH_CONTENT_TYPE,
+  STREAM_CHUNK_LIMIT_HEADER,
+  isChunkLimitRejection,
   decodeStreamReadResult,
   decodeStreamWriteResult,
   encodeStreamWriteBatch,
@@ -17,6 +22,30 @@ const READ_ATTEMPTS = 3;
 const MAX_WRITE_RESPONSE_BYTES = 64;
 const MAX_READ_RESPONSE_BYTES = MAX_STREAM_READ_BYTES + 64 * 1024;
 const MAX_ERROR_RESPONSE_BYTES = 64 * 1024;
+
+/**
+ * Per-request chunk limit the fleet has advertised, per transport. Absent
+ * until a worker advertises one, so a client never sends an older worker more
+ * than the baseline it accepts; a response without the header drops back.
+ */
+const advertisedChunkLimits = new WeakMap<RpcTransport, number>();
+
+export function streamChunkLimit(transport: RpcTransport): number {
+  return advertisedChunkLimits.get(transport) ?? MAX_STREAM_WRITE_CHUNKS;
+}
+
+export function resetStreamChunkLimit(transport: RpcTransport): void {
+  advertisedChunkLimits.delete(transport);
+}
+
+function recordStreamChunkLimit(transport: RpcTransport, response: Response): void {
+  const advertised = Number(response.headers.get(STREAM_CHUNK_LIMIT_HEADER));
+  if (Number.isSafeInteger(advertised) && advertised > MAX_STREAM_WRITE_CHUNKS) {
+    advertisedChunkLimits.set(transport, Math.min(advertised, NEGOTIATED_STREAM_CHUNKS));
+  } else {
+    advertisedChunkLimits.delete(transport);
+  }
+}
 
 function delayMs(ms: number, signal?: AbortSignal): Promise<void> {
   if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
@@ -104,7 +133,7 @@ export async function writeStreamChunks(
 ): Promise<StreamWriteResult> {
   const timeoutMs = resolveFleetTimeoutMs(transport);
   const body = encodeStreamWriteBatch(chunks);
-  if (body.byteLength > MAX_STREAM_BATCH_BYTES + 1024) {
+  if (body.byteLength > MAX_STREAM_BATCH_BYTES + 4 * NEGOTIATED_STREAM_CHUNKS + 1024) {
     throw new Error('world-celld: encoded stream batch exceeds configured limit');
   }
   const url = new URL(streamUrl(transport, name));
@@ -127,6 +156,7 @@ export async function writeStreamChunks(
   }
 
   if (!response.ok) throw await errorFromResponse(response);
+  recordStreamChunkLimit(transport, response);
   try {
     return decodeStreamWriteResult(await readBoundedResponse(response, MAX_WRITE_RESPONSE_BYTES));
   } catch (error) {
@@ -173,6 +203,7 @@ export async function readStreamChunks(
     }
 
     if (response.ok) {
+      recordStreamChunkLimit(transport, response);
       try {
         return decodeStreamReadResult(await readBoundedResponse(response, MAX_READ_RESPONSE_BYTES));
       } catch (error) {
@@ -203,6 +234,17 @@ export async function readStreamChunks(
             );
     }
     if (RETRYABLE_STATUSES.has(response.status) && attempt < READ_ATTEMPTS) {
+      lastError = error;
+      continue;
+    }
+    if (
+      request.maxChunks > MAX_STREAM_READ_CHUNKS &&
+      isChunkLimitRejection(error) &&
+      attempt < READ_ATTEMPTS
+    ) {
+      // An older worker behind the same fleet URL; reads are safe to repeat.
+      resetStreamChunkLimit(transport);
+      url.searchParams.set('maxChunks', String(MAX_STREAM_READ_CHUNKS));
       lastError = error;
       continue;
     }

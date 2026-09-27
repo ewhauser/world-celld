@@ -11,11 +11,14 @@
  * Generic RPC bodies use the tagged JSON codec. Stream chunk bodies use the
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
-import { SPEC_VERSION_CURRENT } from '@workflow/world';
-import { parseApplyEventRequest } from '../apply-event.js';
+import { SPEC_VERSION_CURRENT, type WorkflowRun } from '@workflow/world';
+import { type ApplyEventSuccess, parseApplyEventRequest } from '../apply-event.js';
 import { rpcParse, rpcStringify } from '../codec.js';
+import type { RunReadOutcome } from '../retention.js';
+import { listRunsPage } from '../run-list.js';
 import {
   createWorkflowIndex,
+  runIndexMetadata,
   type CellNamespaceLike,
   type HookIdShardStub,
   type HookTokenShardStub,
@@ -26,8 +29,9 @@ import {
   MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_LONG_POLL_MS,
   MAX_STREAM_READ_BYTES,
-  MAX_STREAM_READ_CHUNKS,
+  NEGOTIATED_STREAM_CHUNKS,
   STREAM_BATCH_CONTENT_TYPE,
+  STREAM_CHUNK_LIMIT_HEADER,
   decodeStreamWriteBatch,
   encodeStreamReadResult,
   encodeStreamWriteResult,
@@ -36,10 +40,12 @@ import {
   type StreamWriteResult,
 } from '../stream-protocol.js';
 import { authenticate } from './auth.js';
+import { cellQueueClaim, runQueueClaim, type QueueClaimHandle } from './queue-claims.js';
 import { INDEX_OPERATIONS, type IndexOperation, validateIndexRequest } from './index-validation.js';
 import {
   NATIVE_QUEUE_MAX_MESSAGE_BYTES,
   queueClaimName,
+  isInlineRunBody,
   queueOrphanName,
   queuePayloadObjectKey,
   validateNativeQueueEnvelope,
@@ -47,6 +53,7 @@ import {
   type NativeQueueEnvelope,
   type QueuePayloadOrphan,
   type QueuePayloadRegistration,
+  type RunQueueReservation,
 } from '../queue-protocol.js';
 import type { QueuePayloadStore } from './queue-payload-store.js';
 
@@ -64,6 +71,7 @@ interface NativeQueueBindingLike {
 }
 
 export interface QueueRunStub {
+  getQueueAdmission(): Promise<{ ok: true } | { ok: false; message: string }>;
   registerQueuePayload(
     registration: QueuePayloadRegistration,
   ): Promise<{ ok: true } | { ok: false; message: string }>;
@@ -87,6 +95,25 @@ export interface QueueRunStub {
     reservationExpiresAt?: number;
   }): Promise<{ held: boolean }>;
   releaseInflight(messageId?: string): Promise<void>;
+  reserveRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    expiresAt: number;
+  }): Promise<RunQueueReservation>;
+  claimRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    staleMs: number;
+  }): Promise<{ expired: true } | { expired: false; claimed: boolean; retryAt?: number }>;
+  holdRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    retryAt: number;
+    expiresAt: number;
+    reservationExpiresAt?: number;
+  }): Promise<{ held: boolean }>;
+  releaseRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void>;
+  completeRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void>;
 }
 
 export interface WorkerEnv {
@@ -103,12 +130,67 @@ export interface WorkerEnv {
   WORKFLOW_RETENTION_BATCH_SIZE?: string | number;
 }
 
+/**
+ * Per-isolate record of runs whose Queue idempotency claims stay in claim
+ * cells (created before run-scoped claims) or live in the run cell. A run's
+ * scope never changes, so the cache only saves the run-cell question.
+ */
+const runClaimScopes = new Map<string, 'cell' | 'run'>();
+const MAX_REMEMBERED_RUN_CLAIM_SCOPES = 4096;
+
+function rememberRunClaimScope(runId: string, scope: 'cell' | 'run'): void {
+  if (runClaimScopes.has(runId)) return;
+  if (runClaimScopes.size >= MAX_REMEMBERED_RUN_CLAIM_SCOPES) {
+    runClaimScopes.delete(runClaimScopes.keys().next().value!);
+  }
+  runClaimScopes.set(runId, scope);
+}
+
 function workflowIndex(env: WorkerEnv) {
   return createWorkflowIndex({
     runCatalog: env.WORKFLOW_RUN_CATALOG as CellNamespaceLike<RunCatalogShardStub>,
     hookTokens: env.WORKFLOW_HOOK_TOKENS as CellNamespaceLike<HookTokenShardStub>,
     hookIds: env.WORKFLOW_HOOK_IDS as CellNamespaceLike<HookIdShardStub>,
   });
+}
+
+/**
+ * Publish a committed applyEvent outcome to the derivative indexes inside the
+ * fleet, sparing the client a round trip per run mutation. Each index write is
+ * idempotent under the outcome's publication lease. A failed write leaves its
+ * flag unset, so the client publishes it itself exactly as it would without
+ * this step; older clients ignore the flags and publish again.
+ */
+async function publishApplyEventIndexes(
+  env: WorkerEnv,
+  runId: string,
+  outcome: unknown,
+): Promise<void> {
+  if (typeof outcome !== 'object' || outcome === null) return;
+  const success = outcome as { ok?: unknown } & Partial<ApplyEventSuccess>;
+  if (success.ok !== true) return;
+  const index = workflowIndex(env);
+  const publications: Array<Promise<void>> = [];
+  if (success.run && typeof success.indexPublicationExpiresAt === 'number') {
+    const run = success.run;
+    const lease = success.indexPublicationExpiresAt;
+    publications.push(
+      (async () => {
+        await index.commitRun(run, runIndexMetadata(run), lease);
+        success.runIndexPublished = true;
+      })(),
+    );
+  }
+  const releasedHooks = success.releasedHooks;
+  if (Array.isArray(releasedHooks) && releasedHooks.length > 0) {
+    publications.push(
+      (async () => {
+        await index.releaseHookIndexes({ runId, hooks: releasedHooks });
+        success.hookIndexesReleased = true;
+      })(),
+    );
+  }
+  await Promise.allSettled(publications);
 }
 
 const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<string> }> = {
@@ -154,7 +236,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
 
 /** Request body cap: oversize payloads get a clear 413 instead of an OOM. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
-const MAX_STREAM_WRITE_BODY_BYTES = MAX_STREAM_BATCH_BYTES + 1024;
+const MAX_STREAM_WRITE_BODY_BYTES = MAX_STREAM_BATCH_BYTES + 4 * NEGOTIATED_STREAM_CHUNKS + 1024;
 const QUEUE_ORPHAN_GRACE_MS = 5 * 24 * 60 * 60 * 1000;
 
 function errorResponse(status: number, name: string, message: string): Response {
@@ -290,7 +372,10 @@ function parseBoundedInteger(url: URL, name: string, minimum: number, maximum: n
 function streamResponse(body: Uint8Array): Response {
   return new Response(body, {
     status: 200,
-    headers: { 'content-type': STREAM_BATCH_CONTENT_TYPE },
+    headers: {
+      'content-type': STREAM_BATCH_CONTENT_TYPE,
+      [STREAM_CHUNK_LIMIT_HEADER]: String(NEGOTIATED_STREAM_CHUNKS),
+    },
   });
 }
 
@@ -346,14 +431,19 @@ export function createRouter(env: WorkerEnv) {
         try {
           const namespace = env.WORKFLOW_DB;
           const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
-          const payloadKey = envelope.runId
-            ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
-            : undefined;
-          const brokerEnvelope: NativeQueueEnvelope = payloadKey
+          // Small bodies without user data stay inline; the rest move to the
+          // fleet bucket so run retention can delete them.
+          const inlineRunBody = envelope.runId !== undefined && isInlineRunBody(envelope.body);
+          const payloadKey =
+            envelope.runId && !inlineRunBody
+              ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
+              : undefined;
+          let brokerEnvelope: NativeQueueEnvelope = payloadKey
             ? { ...envelope, payloadKey, body: undefined }
             : envelope;
-          const encoded = JSON.stringify(brokerEnvelope);
-          if (new TextEncoder().encode(encoded).byteLength > NATIVE_QUEUE_MAX_MESSAGE_BYTES) {
+          // Sized with the claim scope a run-scoped claim may add.
+          const sized = JSON.stringify({ ...brokerEnvelope, claimScope: 'run' });
+          if (new TextEncoder().encode(sized).byteLength > NATIVE_QUEUE_MAX_MESSAGE_BYTES) {
             return errorResponse(
               413,
               'PayloadTooLarge',
@@ -364,24 +454,65 @@ export function createRouter(env: WorkerEnv) {
           const now = Date.now();
           const reservationExpiresAt =
             Math.max(now, envelope.notBefore ?? now) + QUEUE_ORPHAN_GRACE_MS;
-          let claim: QueueRunStub | undefined;
+          const run = envelope.runId
+            ? (namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub)
+            : undefined;
+          let claim: QueueClaimHandle | undefined;
+          let admission: Promise<{ ok: true } | { ok: false; message: string }> | undefined;
           if (envelope.idempotencyKey) {
-            claim = namespace.get(
-              namespace.idFromName(queueClaimName(envelope.queueName, envelope.idempotencyKey)),
-            ) as QueueRunStub;
-            const reservation = await claim.reserveQueueMessage({
-              messageId: envelope.messageId,
-              expiresAt: reservationExpiresAt,
-            });
+            const claimName = queueClaimName(envelope.queueName, envelope.idempotencyKey);
+            // A keyed run-bearing message asks its run cell first unless this
+            // isolate already knows the run keeps claims in claim cells. The
+            // run cell reserves in the same call when the run is run-scoped.
+            let scope = run && envelope.runId ? runClaimScopes.get(envelope.runId) : 'cell';
+            let reservation: { admitted: boolean; messageId: string } | undefined;
+            if (run && envelope.runId && scope !== 'cell') {
+              const reserved = await run.reserveRunQueueMessage({
+                claimName,
+                messageId: envelope.messageId,
+                expiresAt: reservationExpiresAt,
+              });
+              if (!reserved.ok) return errorResponse(410, 'RunExpiredError', reserved.message);
+              scope = reserved.scope;
+              rememberRunClaimScope(envelope.runId, reserved.scope);
+              if (reserved.scope === 'run') {
+                reservation = reserved;
+                claim = runQueueClaim(run, claimName);
+                brokerEnvelope = { ...brokerEnvelope, claimScope: 'run' };
+              }
+            } else if (inlineRunBody && run) {
+              // The read-only expiry check overlaps the claim-cell reservation.
+              admission = run.getQueueAdmission();
+              admission.catch(() => undefined);
+            }
+            if (!reservation) {
+              const cell = namespace.get(namespace.idFromName(claimName)) as QueueRunStub;
+              reservation = await cell.reserveQueueMessage({
+                messageId: envelope.messageId,
+                expiresAt: reservationExpiresAt,
+              });
+              claim = cellQueueClaim(cell);
+            }
             if (!reservation.admitted) {
               return new Response(rpcStringify({ messageId: reservation.messageId }), {
                 status: 200,
                 headers: { 'content-type': 'application/json' },
               });
             }
+          } else if (inlineRunBody && run) {
+            admission = run.getQueueAdmission();
+          }
+          const encoded = JSON.stringify(brokerEnvelope);
+
+          if (admission) {
+            const admitted = await admission;
+            if (!admitted.ok) {
+              await claim?.complete(envelope.messageId);
+              return errorResponse(410, 'RunExpiredError', admitted.message);
+            }
           }
 
-          if (envelope.runId && payloadKey) {
+          if (run && envelope.runId && payloadKey) {
             if (!payloadStore) {
               return errorResponse(
                 500,
@@ -389,7 +520,6 @@ export function createRouter(env: WorkerEnv) {
                 'missing binding: WORKFLOW_QUEUE_PAYLOADS',
               );
             }
-            const run = namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub;
             const orphanExpiresAt = reservationExpiresAt;
             const registered = await run.registerQueuePayload({
               messageId: envelope.messageId,
@@ -397,7 +527,7 @@ export function createRouter(env: WorkerEnv) {
               orphanExpiresAt,
             });
             if (!registered.ok) {
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', registered.message);
             }
             const orphan = namespace.get(
@@ -412,7 +542,7 @@ export function createRouter(env: WorkerEnv) {
               });
             } catch (error) {
               await run.unregisterQueuePayload(envelope.messageId);
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               throw error;
             }
             try {
@@ -421,21 +551,21 @@ export function createRouter(env: WorkerEnv) {
                 messageId: envelope.messageId,
               });
             } catch (error) {
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               throw error;
             }
             let finalized: Awaited<ReturnType<QueueRunStub['finalizeQueuePayload']>>;
             try {
               finalized = await run.finalizeQueuePayload(envelope.messageId);
             } catch (error) {
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               throw error;
             }
             if (!finalized.ok) {
               await payloadStore.delete(payloadKey);
               await run.unregisterQueuePayload(envelope.messageId);
               await orphan.cancelQueuePayloadOrphan(envelope.messageId);
-              await claim?.completeQueueMessage(envelope.messageId);
+              await claim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', finalized.message);
             }
           }
@@ -512,6 +642,26 @@ export function createRouter(env: WorkerEnv) {
           case 'runs.list':
             result = await index.listRuns(...validated.args);
             break;
+          case 'runs.list-resolved': {
+            const runs = env.WORKFLOW_DB;
+            if (!runs) {
+              return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_DB');
+            }
+            result = await listRunsPage(
+              {
+                listRuns: (options) => index.listRuns(options),
+                readRun: async (runId) => {
+                  const stub = runs.get(runs.idFromName(runId)) as {
+                    getRun(): Promise<RunReadOutcome<WorkflowRun | null>>;
+                  };
+                  const outcome = await stub.getRun();
+                  return outcome.ok ? outcome.value : null;
+                },
+              },
+              ...validated.args,
+            );
+            break;
+          }
           case 'runs.commit':
             result = await index.commitRun(...validated.args);
             break;
@@ -597,7 +747,7 @@ export function createRouter(env: WorkerEnv) {
           const readRequest = {
             runId,
             startIndex: parseBoundedInteger(url, 'startIndex', 0, 0x7fffffff),
-            maxChunks: parseBoundedInteger(url, 'maxChunks', 0, MAX_STREAM_READ_CHUNKS),
+            maxChunks: parseBoundedInteger(url, 'maxChunks', 0, NEGOTIATED_STREAM_CHUNKS),
             maxBytes: parseBoundedInteger(
               url,
               'maxBytes',
@@ -721,6 +871,9 @@ export function createRouter(env: WorkerEnv) {
         (...a: unknown[]) => Promise<unknown>
       >;
       const result = await stub[method](...args);
+      if (bindingKey === 'runs' && method === 'applyEvent') {
+        await publishApplyEventIndexes(env, name, result);
+      }
       return new Response(rpcStringify(result ?? null), {
         status: 200,
         headers: { 'content-type': 'application/json' },

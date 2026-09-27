@@ -11,6 +11,7 @@ import { createQueue } from '../src/queue.js';
 import { parse, stringify } from '../src/vendor/shared/index.js';
 import { clearMockData, createMockEnv, recordedEnqueues } from '../src/test-mocks.js';
 import { MAX_QUEUE_SCHEDULE_TIMESTAMP_MS } from '../src/lifecycle.js';
+import { isInlineRunBody, MAX_INLINE_RUN_BODY_BYTES } from '../src/queue-protocol.js';
 import { MAX_QUEUE_DELAY_SECONDS } from '../src/validation.js';
 
 const WORKFLOW_PAYLOAD = { runId: 'wrun_queue_test' };
@@ -526,5 +527,38 @@ describe('Queue (celld native Queue integration)', () => {
       await expect(queue.start()).resolves.toBeUndefined();
       await queue.start();
     });
+  });
+});
+
+describe('isInlineRunBody', () => {
+  it('keeps small bodies without user data inline', () => {
+    expect(isInlineRunBody(JSON.stringify({ runId: 'wrun_x', stepId: 'step_x' }))).toBe(true);
+    expect(
+      isInlineRunBody(JSON.stringify({ __healthCheck: true, correlationId: 'c', runId: 'r' })),
+    ).toBe(true);
+  });
+
+  it.each(['runInput', 'hookInput', 'stepInput'])('offloads a body carrying %s', (field) => {
+    expect(isInlineRunBody(JSON.stringify({ runId: 'wrun_x', [field]: { input: [1] } }))).toBe(
+      false,
+    );
+  });
+
+  it('offloads bodies over the inline size limit, counted in bytes', () => {
+    expect(
+      isInlineRunBody(
+        JSON.stringify({ runId: 'r', padding: 'x'.repeat(MAX_INLINE_RUN_BODY_BYTES) }),
+      ),
+    ).toBe(false);
+    const multiByte = 'é'.repeat(Math.floor(MAX_INLINE_RUN_BODY_BYTES / 2) - 20);
+    expect(multiByte.length).toBeLessThan(MAX_INLINE_RUN_BODY_BYTES);
+    expect(
+      isInlineRunBody(JSON.stringify({ runId: 'r', note: multiByte + 'éééééééééééééééééééé' })),
+    ).toBe(false);
+  });
+
+  it('offloads bodies it cannot parse as an object', () => {
+    expect(isInlineRunBody('not json')).toBe(false);
+    expect(isInlineRunBody('[1,2]')).toBe(false);
   });
 });

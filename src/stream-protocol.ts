@@ -6,13 +6,21 @@
 
 export const STREAM_BATCH_CONTENT_TYPE = 'application/vnd.world-celld.stream-batch.v1';
 
-/** Metadata plus payload and size-index entries remain below the 128-key platform limit. */
+/**
+ * Chunks per write request that every worker accepts. A client sends larger
+ * batches only after a worker advertises {@link STREAM_CHUNK_LIMIT_HEADER}.
+ */
 export const MAX_STREAM_WRITE_CHUNKS = 32;
 /** A chunk remains below the 2 MiB SQLite-backed DO key/value limit. */
 export const MAX_STREAM_CHUNK_BYTES = 1024 * 1024;
 /** Keeps serialized RPC bodies well below the 32 MiB Workers RPC limit. */
 export const MAX_STREAM_BATCH_BYTES = 8 * 1024 * 1024;
+/** Chunks per read request that every worker accepts; see {@link MAX_STREAM_WRITE_CHUNKS}. */
 export const MAX_STREAM_READ_CHUNKS = 32;
+/** Chunks per write or read request accepted by a worker that advertises the header below. */
+export const NEGOTIATED_STREAM_CHUNKS = 512;
+/** Response header on stream requests: the per-request chunk limit this worker accepts. */
+export const STREAM_CHUNK_LIMIT_HEADER = 'x-world-celld-stream-chunks';
 export const MAX_STREAM_READ_BYTES = 8 * 1024 * 1024;
 export const MAX_STREAM_ERROR_BYTES = 16 * 1024;
 /** Must remain below the default 30 second fleet request deadline. */
@@ -77,10 +85,20 @@ function requireSafeIndex(value: number, field: string): void {
   }
 }
 
+/** An older worker rejects an oversized request before it touches the stream. */
+export function isChunkLimitRejection(error: unknown): boolean {
+  const candidate = error as { status?: unknown; message?: unknown } | null;
+  return (
+    candidate?.status === 400 &&
+    typeof candidate.message === 'string' &&
+    /batch exceeds \d+ chunks|maxChunks must be (?:an integer )?between/.test(candidate.message)
+  );
+}
+
 export function validateStreamWriteChunks(chunks: readonly Uint8Array[]): number {
   if (chunks.length === 0) throw protocolError('batch must contain at least one chunk');
-  if (chunks.length > MAX_STREAM_WRITE_CHUNKS) {
-    throw protocolError(`batch exceeds ${MAX_STREAM_WRITE_CHUNKS} chunks`);
+  if (chunks.length > NEGOTIATED_STREAM_CHUNKS) {
+    throw protocolError(`batch exceeds ${NEGOTIATED_STREAM_CHUNKS} chunks`);
   }
 
   let totalBytes = 0;
@@ -109,9 +127,9 @@ export function validateStreamReadRequest(request: StreamReadRequest): void {
   if (
     !Number.isSafeInteger(request.maxChunks) ||
     request.maxChunks < 0 ||
-    request.maxChunks > MAX_STREAM_READ_CHUNKS
+    request.maxChunks > NEGOTIATED_STREAM_CHUNKS
   ) {
-    throw protocolError(`maxChunks must be between 0 and ${MAX_STREAM_READ_CHUNKS}`);
+    throw protocolError(`maxChunks must be between 0 and ${NEGOTIATED_STREAM_CHUNKS}`);
   }
   if (
     !Number.isSafeInteger(request.maxBytes) ||
@@ -179,7 +197,7 @@ export function encodeStreamWriteResult(result: StreamWriteResult): Uint8Array {
   if (
     !Number.isSafeInteger(result.count) ||
     result.count < 1 ||
-    result.count > MAX_STREAM_WRITE_CHUNKS
+    result.count > NEGOTIATED_STREAM_CHUNKS
   ) {
     throw protocolError('write count is out of range');
   }
@@ -201,7 +219,7 @@ export function decodeStreamWriteResult(encoded: Uint8Array): StreamWriteResult 
     throw protocolError('unsupported write response version');
   }
   const count = view.getUint16(6);
-  if (count < 1 || count > MAX_STREAM_WRITE_CHUNKS) {
+  if (count < 1 || count > NEGOTIATED_STREAM_CHUNKS) {
     throw protocolError('write response count is out of range');
   }
   const result = {
@@ -222,7 +240,10 @@ export function encodeStreamReadResult(result: StreamReadResult): Uint8Array {
   requireSafeIndex(result.tailIndex, 'tailIndex');
   let chunkBytes = 0;
   for (const chunk of result.chunks) chunkBytes += 4 + chunk.byteLength;
-  if (result.chunks.length > MAX_STREAM_READ_CHUNKS || chunkBytes > MAX_STREAM_READ_BYTES + 128) {
+  if (
+    result.chunks.length > NEGOTIATED_STREAM_CHUNKS ||
+    chunkBytes > MAX_STREAM_READ_BYTES + 4 * NEGOTIATED_STREAM_CHUNKS
+  ) {
     throw protocolError('read result exceeds configured bounds');
   }
 
@@ -276,7 +297,7 @@ export function decodeStreamReadResult(encoded: Uint8Array): StreamReadResult {
   const count = view.getUint32(16);
   const errorNameLength = view.getUint32(20);
   const errorMessageLength = view.getUint32(24);
-  if (count > MAX_STREAM_READ_CHUNKS) throw protocolError('read chunk count exceeds limit');
+  if (count > NEGOTIATED_STREAM_CHUNKS) throw protocolError('read chunk count exceeds limit');
   if (errorNameLength + errorMessageLength > MAX_STREAM_ERROR_BYTES) {
     throw protocolError('read error exceeds limit');
   }

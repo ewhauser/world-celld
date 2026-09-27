@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 import { mkdir, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { createCelldWorld } from '../../src/index.js';
 import { parse } from '../../src/vendor/shared/index.js';
 import { RunExpiredError } from '@workflow/errors';
 import type { CleanupRecord } from '../../src/retention.js';
+import { lazyHookResumeSetup } from './lazy-hook-resume.js';
 
 function positiveInteger(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -150,7 +153,14 @@ describe('MinIO single-node queue performance and loss', () => {
   const concurrency = positiveInteger('PERF_CONCURRENCY', 32);
   const payloadBytes = positiveInteger('PERF_PAYLOAD_BYTES', 256);
   const retryEvery = nonNegativeInteger('PERF_RETRY_EVERY', 20);
+  // Workflow messages carry a runId, which moves their body into the fleet
+  // bucket and adds payload bookkeeping and an idempotency claim per message.
+  const runBearingQueue = process.env.PERF_QUEUE_RUN_BEARING === '1';
   const timeoutMs = positiveInteger('PERF_TIMEOUT_MS', 180_000);
+  // Emulates the client-to-fleet network: every World client request waits
+  // this long before it is sent, so round-trip savings show on loopback.
+  const clientRttMs = nonNegativeInteger('PERF_CLIENT_RTT_MS');
+  const originalFetch = globalThis.fetch;
   const minEnqueuePerSecond = nonNegativeNumber('PERF_MIN_ENQUEUE_PER_SECOND');
   const minDeliveryPerSecond = nonNegativeNumber('PERF_MIN_DELIVERY_PER_SECOND');
   const maxDeliveryP99Ms = nonNegativeNumber('PERF_MAX_DELIVERY_P99_MS');
@@ -160,6 +170,10 @@ describe('MinIO single-node queue performance and loss', () => {
   const retentionMs = positiveInteger('PERF_RUN_RETENTION_MS', 1_000);
   const retentionResultPath =
     process.env.PERF_RETENTION_RESULT_PATH ?? '.perf-results/minio-retention-latest.json';
+  const streamChunkCount = positiveInteger('PERF_STREAM_CHUNKS', 1000);
+  const streamChunkBytes = positiveInteger('PERF_STREAM_CHUNK_BYTES', 32);
+  const streamResultPath =
+    process.env.PERF_STREAM_RESULT_PATH ?? '.perf-results/minio-stream-latest.json';
   const workflowRuns = positiveInteger('PERF_WORKFLOW_RUNS', 25);
   const workflowConcurrency = positiveInteger('PERF_WORKFLOW_CONCURRENCY', 8);
   const workflowResultPath =
@@ -196,6 +210,12 @@ describe('MinIO single-node queue performance and loss', () => {
 
   beforeAll(async () => {
     process.env.CELLD_QUEUE_MODE = 'native';
+    if (clientRttMs > 0) {
+      globalThis.fetch = async (input, init) => {
+        await delay(clientRttMs);
+        return await originalFetch(input, init);
+      };
+    }
     if (!fleetUrl || !secret) {
       throw new Error('CELLD_FLEET_URL and CELLD_WORLD_SECRET are required');
     }
@@ -282,6 +302,7 @@ describe('MinIO single-node queue performance and loss', () => {
 
   afterAll(async () => {
     delete process.env.CELLD_QUEUE_MODE;
+    globalThis.fetch = originalFetch;
     if (!listener) return;
     listener.closeAllConnections();
     await new Promise<void>((resolve, reject) =>
@@ -299,16 +320,29 @@ describe('MinIO single-node queue performance and loss', () => {
     });
     const queueName = `__wkf_workflow_perf_${runId.replaceAll('-', '')}`;
     const padding = 'x'.repeat(Math.max(0, payloadBytes - 96));
+    const queueRunId = runBearingQueue
+      ? (
+          await world.events.create(null, {
+            eventType: 'run_created',
+            eventData: { deploymentId: `perf-${runId}`, workflowName: 'perf-queue', input: [] },
+          })
+        ).run.runId
+      : undefined;
     const workloadStart = performance.now();
 
     await runPool(messageCount, concurrency, async (sequence) => {
       const enqueueStart = performance.now();
       startedAt.set(sequence, enqueueStart);
       try {
-        const outcome = await world.queue(queueName, {
-          __healthCheck: true,
-          correlationId: `${runId}|${sequence}|${padding}`,
-        });
+        const outcome = await world.queue(
+          queueName,
+          {
+            __healthCheck: true,
+            correlationId: `${runId}|${sequence}|${padding}`,
+            ...(queueRunId ? { runId: queueRunId } : {}),
+          },
+          queueRunId ? { idempotencyKey: `perf-${sequence}` } : undefined,
+        );
         accepted.set(sequence, String(outcome.messageId));
         enqueueLatencies.push(performance.now() - enqueueStart);
       } catch (error) {
@@ -354,6 +388,7 @@ describe('MinIO single-node queue performance and loss', () => {
         concurrency,
         payloadBytes,
         retryEvery,
+        runBearing: runBearingQueue,
       },
       correctness: {
         allDelivered,
@@ -425,8 +460,10 @@ describe('MinIO single-node queue performance and loss', () => {
     });
     const stageMs: Record<string, number[]> = {
       create: [],
+      replay: [],
       step: [],
       hook: [],
+      resume: [],
       stream: [],
       queue: [],
       read: [],
@@ -434,6 +471,7 @@ describe('MinIO single-node queue performance and loss', () => {
     };
     const payload = 'x'.repeat(payloadBytes);
     const failures: string[] = [];
+    let lazyResumePreloads = 0;
     const started = performance.now();
     const measure = async (stage: string, action: () => Promise<void>) => {
       const began = performance.now();
@@ -450,6 +488,11 @@ describe('MinIO single-node queue performance and loss', () => {
             eventData: { deploymentId, workflowName, input: [payload, sequence] },
           });
           workflowRunId = created.run.runId;
+          await world.events.create(workflowRunId, { eventType: 'run_started' });
+        });
+        // Every workflow invocation after the first starts with a run_started
+        // replay against the already-running run.
+        await measure('replay', async () => {
           await world.events.create(workflowRunId, { eventType: 'run_started' });
         });
         const stepId = `step-${sequence}`;
@@ -474,6 +517,17 @@ describe('MinIO single-node queue performance and loss', () => {
           });
           const hook = await world.hooks.getByToken(token);
           if (hook.runId !== workflowRunId) throw new Error('hook owner mismatch');
+        });
+        await measure('resume', async () => {
+          const resumeId = `01K${String(sequence).padStart(23, '0')}`;
+          const { usablePreload } = await lazyHookResumeSetup(world, {
+            runId: workflowRunId,
+            hookId: `hook-${sequence}`,
+            token,
+            resumeId,
+            payload,
+          });
+          lazyResumePreloads += usablePreload ? 1 : 0;
         });
         const streamName = `perf-stream-${workflowRunId}`;
         await measure('stream', async () => {
@@ -512,7 +566,17 @@ describe('MinIO single-node queue performance and loss', () => {
       }
     });
 
-    const listed = await world.runs.list({ workflowName, pagination: { limit: 20 } });
+    const listMs: number[] = [];
+    const listNoDataMs: number[] = [];
+    let listed = await world.runs.list({ workflowName, pagination: { limit: 20 } });
+    for (let iteration = 0; iteration < 5; iteration++) {
+      let began = performance.now();
+      listed = await world.runs.list({ workflowName, pagination: { limit: 20 } });
+      listMs.push(performance.now() - began);
+      began = performance.now();
+      await world.runs.list({ workflowName, resolveData: 'none', pagination: { limit: 20 } });
+      listNoDataMs.push(performance.now() - began);
+    }
     const delivered = await waitUntil(
       () => workflowAccepted.size === workflowRuns && workflowDelivered.size === workflowRuns,
       timeoutMs,
@@ -527,7 +591,7 @@ describe('MinIO single-node queue performance and loss', () => {
       schemaVersion: 1,
       recordedAt: new Date().toISOString(),
       backend: { name: 'minio', celldVersion: process.env.PERF_CELLD_VERSION ?? 'unknown' },
-      workload: { runs: workflowRuns, concurrency: workflowConcurrency, payloadBytes },
+      workload: { runs: workflowRuns, concurrency: workflowConcurrency, payloadBytes, clientRttMs },
       correctness: {
         completed: stageMs.complete.length,
         accepted: workflowAccepted.size,
@@ -535,11 +599,14 @@ describe('MinIO single-node queue performance and loss', () => {
         duplicateCallbacks: workflowDuplicates,
         mismatchedMessageIds: mismatched.length,
         listReturned: listed.data.length,
+        lazyResumePreloads,
         failures,
       },
       performance: {
         elapsedMs: Number(elapsedMs.toFixed(2)),
         runsPerSecond: rate(stageMs.complete.length, elapsedMs),
+        listMs: summarizeLatency(listMs),
+        listNoDataMs: summarizeLatency(listNoDataMs),
         queueDeliveryMs: summarizeLatency(
           Array.from(workflowDelivered.values(), (delivery) => delivery.latencyMs),
         ),
@@ -651,6 +718,89 @@ describe('MinIO single-node queue performance and loss', () => {
     }
   });
 
+  it('measures bulk stream writes and replay through the real fleet', async () => {
+    const world = createCelldWorld({
+      fleetUrl,
+      secret,
+      baseUrl: process.env.CELLD_CALLBACK_BASE_URL,
+      deploymentId: `perf-stream-${runId}`,
+      rpcTimeoutMs: timeoutMs,
+    });
+    const created = await world.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId: `perf-stream-${runId}`, workflowName: 'perf-stream', input: [] },
+    });
+    const streamRunId = created.run.runId;
+    const streamName = `perf-bulk-${streamRunId}`;
+    const chunks = Array.from({ length: streamChunkCount }, (_, index) =>
+      new Uint8Array(streamChunkBytes).fill(index % 251),
+    );
+
+    let streamRequests = 0;
+    const fetchBefore = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (new URL(url).pathname.startsWith('/v1/streams/')) streamRequests++;
+      return await fetchBefore(input, init);
+    };
+    const phase = async (action: () => Promise<void>) => {
+      streamRequests = 0;
+      const began = performance.now();
+      await action();
+      return { ms: Number((performance.now() - began).toFixed(2)), requests: streamRequests };
+    };
+    try {
+      // Registers the stream so the timed write measures only data requests.
+      await world.streams.write(streamRunId, streamName, new Uint8Array([0]));
+      const write = await phase(() => world.streams.writeMulti(streamRunId, streamName, chunks));
+      await world.streams.close(streamRunId, streamName);
+
+      let paged = 0;
+      const page = await phase(async () => {
+        let cursor: string | undefined;
+        for (;;) {
+          const result = await world.streams.getChunks(streamRunId, streamName, {
+            limit: 1000,
+            cursor,
+          });
+          paged += result.data.length;
+          if (!result.hasMore) break;
+          cursor = result.cursor ?? undefined;
+        }
+      });
+
+      let replayed = 0;
+      const replay = await phase(async () => {
+        const reader = (await world.streams.get(streamRunId, streamName)).getReader();
+        for (;;) {
+          const { done } = await reader.read();
+          if (done) break;
+          replayed++;
+        }
+      });
+
+      const result = {
+        schemaVersion: 1,
+        recordedAt: new Date().toISOString(),
+        backend: { name: 'minio', celldVersion: process.env.PERF_CELLD_VERSION ?? 'unknown' },
+        workload: { chunks: streamChunkCount, chunkBytes: streamChunkBytes },
+        correctness: { paged, replayed },
+        performance: {
+          write: { ...write, chunksPerSecond: rate(streamChunkCount, write.ms) },
+          page: { ...page, chunksPerSecond: rate(paged, page.ms) },
+          replay: { ...replay, chunksPerSecond: rate(replayed, replay.ms) },
+        },
+      };
+      await mkdir(path.dirname(streamResultPath), { recursive: true });
+      await writeFile(streamResultPath, `${JSON.stringify(result, null, 2)}\n`);
+      console.log(`\nworld-celld MinIO stream result\n${JSON.stringify(result, null, 2)}`);
+      expect(paged).toBe(streamChunkCount + 1);
+      expect(replayed).toBe(streamChunkCount + 1);
+    } finally {
+      globalThis.fetch = fetchBefore;
+    }
+  });
+
   it('reclaims terminal run payloads without loss or resurrection', async () => {
     const world = createCelldWorld({
       fleetUrl,
@@ -680,7 +830,16 @@ describe('MinIO single-node queue performance and loss', () => {
       await world.closeStream(streamName, workflowRunId);
       await world.queue(
         `__wkf_workflow_retention_${runId.replaceAll('-', '')}`,
-        { runId: workflowRunId },
+        // User data keeps the body in object storage, where retention must delete it.
+        {
+          runId: workflowRunId,
+          runInput: {
+            input: [`queued-${sequence}`],
+            deploymentId: `retention-perf-${runId}`,
+            workflowName: `retention-perf-${sequence}`,
+            specVersion: SPEC_VERSION_CURRENT,
+          },
+        },
         { delaySeconds: 3_600, idempotencyKey: `retention:${workflowRunId}` },
       );
       const terminalStart = performance.now();

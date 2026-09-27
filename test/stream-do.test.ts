@@ -4,6 +4,7 @@ import {
   MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_READ_BYTES,
   MAX_STREAM_WRITE_CHUNKS,
+  NEGOTIATED_STREAM_CHUNKS,
   type StreamReadRequest,
 } from '../src/stream-protocol.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
@@ -11,9 +12,13 @@ import { StreamDO } from '../src/worker/durable-objects/StreamDO.js';
 
 const RUN_ID = 'wrun_stream_do';
 
-function setup(name = 'stream:test') {
+function setup(name = 'stream:test', options: { existingPerChunkStream?: boolean } = {}) {
   const fleet = new FakeFleet({ streams: StreamDO as never });
   const get = () => fleet.namespace('streams').get({ toString: () => name }) as StreamDO;
+  // Per-chunk rows are kept only by streams created before segment rows.
+  if (options.existingPerChunkStream) {
+    fleet.cell('streams', name).storage.data.set('meta', { count: 0, state: 'open' });
+  }
   return { fleet, get, name };
 }
 
@@ -59,17 +64,25 @@ describe('StreamDO binary batch and long-poll protocol', () => {
     const { get } = setup();
     await expect(get().writeChunks(RUN_ID, [])).rejects.toThrow(/at least one chunk/);
 
-    const chunks = Array.from({ length: MAX_STREAM_WRITE_CHUNKS }, (_, index) =>
-      Uint8Array.of(index),
+    const chunks = Array.from({ length: NEGOTIATED_STREAM_CHUNKS }, (_, index) =>
+      Uint8Array.of(index % 256),
     );
     await expect(get().writeChunks(RUN_ID, chunks)).resolves.toMatchObject({
       startIndex: 0,
-      count: MAX_STREAM_WRITE_CHUNKS,
-      tailIndex: MAX_STREAM_WRITE_CHUNKS - 1,
+      count: NEGOTIATED_STREAM_CHUNKS,
+      tailIndex: NEGOTIATED_STREAM_CHUNKS - 1,
     });
-    await expect(get().writeChunks(RUN_ID, [...chunks, Uint8Array.of(33)])).rejects.toThrow(
-      /exceeds 32 chunks/,
+    await expect(get().writeChunks(RUN_ID, [...chunks, Uint8Array.of(1)])).rejects.toThrow(
+      new RegExp(`exceeds ${NEGOTIATED_STREAM_CHUNKS} chunks`),
     );
+    const read = await get().readChunks({
+      runId: RUN_ID,
+      startIndex: 0,
+      maxChunks: NEGOTIATED_STREAM_CHUNKS,
+      maxBytes: MAX_STREAM_READ_BYTES,
+      waitMs: 0,
+    });
+    expect(read.chunks.map((chunk) => chunk[0])).toEqual(chunks.map((chunk) => chunk[0]));
   });
 
   it('enforces the total batch byte limit', async () => {
@@ -90,7 +103,7 @@ describe('StreamDO binary batch and long-poll protocol', () => {
   });
 
   it('compacts direct-RPC subarrays before structured-clone storage', async () => {
-    const { fleet, get, name } = setup();
+    const { fleet, get, name } = setup('stream:test', { existingPerChunkStream: true });
     const backing = new Uint8Array(MAX_STREAM_CHUNK_BYTES + 64);
     const chunk = backing.subarray(32, 32 + MAX_STREAM_CHUNK_BYTES);
 
@@ -103,7 +116,7 @@ describe('StreamDO binary batch and long-poll protocol', () => {
   });
 
   it('batch-fetches 32 small chunks without over-reading the byte budget', async () => {
-    const { fleet, get, name } = setup();
+    const { fleet, get, name } = setup('stream:test', { existingPerChunkStream: true });
     const chunks = Array.from({ length: MAX_STREAM_WRITE_CHUNKS }, (_, index) =>
       new Uint8Array(MAX_STREAM_READ_BYTES / MAX_STREAM_WRITE_CHUNKS).fill(index),
     );
@@ -125,7 +138,7 @@ describe('StreamDO binary batch and long-poll protocol', () => {
   });
 
   it('fetches only the payload prefix selected by the byte budget', async () => {
-    const { fleet, get, name } = setup();
+    const { fleet, get, name } = setup('stream:test', { existingPerChunkStream: true });
     const chunkBytes = MAX_STREAM_CHUNK_BYTES / 8;
     await get().writeChunks(
       RUN_ID,

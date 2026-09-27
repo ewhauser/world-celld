@@ -8,6 +8,27 @@ export const NATIVE_QUEUE_MAX_DELAY_SECONDS = 86_400;
 export const NATIVE_QUEUE_MAX_MESSAGE_BYTES = 128_000;
 export const MAX_QUEUE_SUSPENSIONS = 256;
 export const QUEUE_PAYLOAD_REGISTRY_PREFIX = 'queue-payload:';
+/** Largest run-bearing body that may travel inline in the broker envelope. */
+export const MAX_INLINE_RUN_BODY_BYTES = 8 * 1024;
+/** Workflow payload fields that carry user data, which run retention must be able to delete. */
+const USER_DATA_FIELDS = ['runInput', 'hookInput', 'stepInput'] as const;
+
+/**
+ * A run-bearing body may stay inline when it is small and carries no user
+ * data: then it holds only IDs, trace context, and metadata, and nothing in it
+ * needs run retention to delete it from object storage.
+ */
+export function isInlineRunBody(body: string): boolean {
+  if (body.length > MAX_INLINE_RUN_BODY_BYTES) return false;
+  if (new TextEncoder().encode(body).byteLength > MAX_INLINE_RUN_BODY_BYTES) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  return isRecord(parsed) && USER_DATA_FIELDS.every((field) => parsed[field] === undefined);
+}
 
 export interface QueuePayloadRegistration {
   messageId: string;
@@ -38,14 +59,33 @@ export interface NativeQueueEnvelope {
   runId?: string;
   idempotencyKey?: string;
   payloadKey?: string;
-  /** Inline only for the small, run-less health-check envelope. */
+  /**
+   * Inline body. Health checks always travel inline; a run-bearing body may
+   * travel inline when it is small and carries no user data, in which case
+   * delivery checks the run's expiry instead of reading a payload object.
+   */
   body?: string;
   /** Absolute workflow redelivery deadline; long waits are chained by the consumer. */
   notBefore?: number;
+  /**
+   * Where the idempotency claim lives. Absent: the claim cell named by queue
+   * and key. `run`: an entry in the run's own cell (requires `runId`).
+   */
+  claimScope?: 'run';
   /** Failed deliveries carried across suspension re-publishes. */
   deliveryFailures?: number;
   suspensionCount?: number;
 }
+
+/**
+ * Enqueue-side answer from a run cell. `cell`: the run predates run-scoped
+ * claims, so its idempotency claims stay in claim cells. `run`: the
+ * reservation was made in the run's own cell.
+ */
+export type RunQueueReservation =
+  | { ok: false; message: string }
+  | { ok: true; scope: 'cell' }
+  | { ok: true; scope: 'run'; admitted: boolean; messageId: string };
 
 export interface NativeQueueSendOptions {
   delaySeconds?: number;
@@ -89,6 +129,9 @@ export function validateNativeQueueEnvelope(value: unknown): NativeQueueEnvelope
     if (value[field] !== undefined && typeof value[field] !== 'string') {
       throw new TypeError(`world-celld native queue envelope ${field} must be a string`);
     }
+  }
+  if (value.claimScope !== undefined && (value.claimScope !== 'run' || value.runId === undefined)) {
+    throw new TypeError("world-celld native queue envelope claimScope must be 'run' with a runId");
   }
   if ((value.payloadKey === undefined) === (value.body === undefined)) {
     throw new TypeError(

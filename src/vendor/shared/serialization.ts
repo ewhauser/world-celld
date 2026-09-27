@@ -23,26 +23,47 @@ export function dateReviver(key: string, value: unknown): unknown {
 }
 
 /**
- * Base64 helpers. Modified vs upstream: implemented over atob/btoa instead of
- * Buffer so this module is safe inside the celld worker bundle (workerd has
- * no Buffer global); atob/btoa are global in both workerd and Node >= 16.
+ * Base64 helpers. Modified vs upstream: implemented without Buffer so this
+ * module is safe inside the celld worker bundle (workerd has no Buffer
+ * global). Uses the native Uint8Array base64 methods where the runtime has
+ * them (Node >= 25, current V8) and falls back to atob/btoa elsewhere.
  */
-export function b64encode(bytes: Uint8Array): string {
+const nativeToBase64 = (
+  Uint8Array.prototype as Uint8Array & { toBase64?: (this: Uint8Array) => string }
+).toBase64;
+const nativeFromBase64 = (Uint8Array as { fromBase64?: (text: string) => Uint8Array }).fromBase64;
+
+/** Small enough to stay far below engine argument-count limits and fast to spread. */
+const FALLBACK_ENCODE_CHUNK = 0x1000;
+
+/** @internal Exported for tests; use b64encode. */
+export function b64encodeFallback(bytes: Uint8Array): string {
   let bin = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  for (let i = 0; i < bytes.length; i += FALLBACK_ENCODE_CHUNK) {
+    bin += String.fromCharCode.apply(
+      null,
+      bytes.subarray(i, i + FALLBACK_ENCODE_CHUNK) as unknown as number[],
+    );
   }
   return btoa(bin);
 }
 
-export function b64decode(text: string): Uint8Array {
+/** @internal Exported for tests; use b64decode. */
+export function b64decodeFallback(text: string): Uint8Array {
   const bin = atob(text);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) {
     out[i] = bin.charCodeAt(i);
   }
   return out;
+}
+
+export function b64encode(bytes: Uint8Array): string {
+  return nativeToBase64 ? nativeToBase64.call(bytes) : b64encodeFallback(bytes);
+}
+
+export function b64decode(text: string): Uint8Array {
+  return nativeFromBase64 ? nativeFromBase64(text) : b64decodeFallback(text);
 }
 
 /**

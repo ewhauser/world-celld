@@ -1,3 +1,4 @@
+import type { RunListPage, RunListRequest } from './run-list.js';
 import type { WorkflowRun } from '@workflow/world';
 import type { HookTokenOwner } from './config.js';
 import type {
@@ -113,6 +114,11 @@ export interface WorkflowIndex {
     publicationExpiresAt: number,
   ): Promise<{ stored: boolean }>;
   listRuns(options?: IndexListOptions): Promise<IndexListPage>;
+  /**
+   * Remote only: the complete run listing performed inside the fleet. Resolves
+   * to null when the worker predates the route; the caller then lists itself.
+   */
+  listResolvedRuns?(request: RunListRequest): Promise<RunListPage | null>;
   getHookByToken(token: string): Promise<string | null>;
   getHookById(hookId: string): Promise<string | null>;
   reserveHook(token: string, owner: HookTokenOwner): Promise<HookReservationResult>;
@@ -165,6 +171,15 @@ export function allRunCatalogShardNames(): string[] {
     { length: RUN_CATALOG_SHARDS },
     (_, shard) => `run-catalog:${INDEX_PROTOCOL_VERSION}:${shard.toString(16).padStart(2, '0')}`,
   );
+}
+
+/** Catalog metadata for a run; the client and the worker router must agree on it. */
+export function runIndexMetadata(run: Pick<WorkflowRun, 'runId' | 'createdAt' | 'status'>): string {
+  return JSON.stringify({
+    runId: run.runId,
+    createdAt: run.createdAt.toISOString(),
+    status: run.status,
+  });
 }
 
 function stub<T>(namespace: CellNamespaceLike<T>, name: string): T {

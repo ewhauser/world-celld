@@ -1,12 +1,12 @@
 /** Internal delivery contract. No Request/Response objects cross the RPC boundary. */
 import {
   QUEUE_CLAIM_STALE_MS,
-  queueClaimName,
   queueOrphanName,
   validateNativeQueueEnvelope,
 } from '../queue-protocol.js';
 import { queueDelayDeadline } from '../validation.js';
 import { timingSafeEqual } from './auth.js';
+import { deliveryQueueClaim } from './queue-claims.js';
 import type { QueueRunStub, WorkerEnv } from './router.js';
 
 export type QueueDeliveryResult =
@@ -65,11 +65,11 @@ export async function deliverQueueMessage(
   const namespace = env.WORKFLOW_DB;
   const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
   const runStub = (name: string) => namespace.get(namespace.idFromName(name)) as QueueRunStub;
-  let claim: QueueRunStub | undefined;
+  const claim = deliveryQueueClaim(envelope, runStub);
   let claimed = false;
 
   async function releaseClaim(): Promise<void> {
-    if (claimed) await claim!.releaseInflight(envelope.messageId);
+    if (claimed) await claim!.release(envelope.messageId);
   }
   async function unregisterPayload(): Promise<void> {
     if (envelope.runId) {
@@ -81,12 +81,19 @@ export async function deliverQueueMessage(
   }
 
   try {
-    if (envelope.idempotencyKey) {
-      claim = runStub(queueClaimName(envelope.queueName, envelope.idempotencyKey));
-      const result = await claim.claimInflight({
-        messageId: envelope.messageId,
-        staleMs: QUEUE_CLAIM_STALE_MS,
-      });
+    // A run-bearing body carried inline has no payload object for retention
+    // to delete, so the run cell answers whether the run has expired. The
+    // read overlaps the claim and adds no round trip; a run-scoped claim
+    // answers it in the same transaction.
+    let admission: ReturnType<QueueRunStub['getQueueAdmission']> | undefined;
+    if (envelope.runId && !envelope.payloadKey && envelope.claimScope !== 'run') {
+      admission = runStub(envelope.runId).getQueueAdmission();
+      admission.catch(() => undefined);
+    }
+    if (claim) {
+      const result = await claim.claim(envelope.messageId, QUEUE_CLAIM_STALE_MS);
+      // A run-scoped claim of an expired run: same outcome as a deleted body.
+      if (result.expired) return { kind: 'complete' };
       if (!result.claimed) {
         const now = Date.now();
         if (result.retryAt !== undefined && result.retryAt > now) {
@@ -100,13 +107,19 @@ export async function deliverQueueMessage(
       claimed = true;
     }
 
+    if (admission && !(await admission).ok) {
+      // Same outcome as an offloaded body that retention already deleted.
+      await claim?.complete(envelope.messageId);
+      return { kind: 'complete' };
+    }
+
     let body = envelope.body;
     if (envelope.payloadKey) {
       if (!payloadStore) throw new Error('missing binding: WORKFLOW_QUEUE_PAYLOADS');
       body = (await payloadStore.read(envelope.payloadKey)) ?? undefined;
       if (body === undefined) {
         await unregisterPayload();
-        await claim?.completeQueueMessage(envelope.messageId);
+        await claim?.complete(envelope.messageId);
         return { kind: 'complete' };
       }
     }
@@ -131,7 +144,7 @@ export async function deliverQueueMessage(
         await unregisterPayload();
       }
       // Do not acknowledge until cleanup and completion are durably accepted.
-      await claim?.completeQueueMessage(envelope.messageId);
+      await claim?.complete(envelope.messageId);
       return { kind: 'complete' };
     }
 
@@ -150,7 +163,7 @@ export async function deliverQueueMessage(
         });
       }
       if (claim) {
-        await claim.holdInflight({
+        await claim.hold({
           messageId: envelope.messageId,
           retryAt: notBefore,
           expiresAt: notBefore + QUEUE_CLAIM_STALE_MS,

@@ -157,6 +157,94 @@ describe('terminal workflow retention', () => {
     expect(storage.operationCounts.transaction).toBe(0);
   });
 
+  it('expires a large stream in pages of up to 256 chunks', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+      runRetentionMs: 1_000,
+    });
+    const runId = await createCompletedRun(world, 'large-stream');
+    const chunks = Array.from({ length: 2_000 }, () => new Uint8Array(16));
+    for (let offset = 0; offset < chunks.length; offset += 32) {
+      await world.streams.writeMulti(
+        runId,
+        'large-retention-stream',
+        chunks.slice(offset, offset + 32),
+      );
+    }
+    await world.closeStream('large-retention-stream', runId);
+    await finishRun(world, runId);
+    harness.fleet.advance(1_001);
+
+    const runCell = harness.fleet.cell('runs', runId);
+    const streamCell = harness.fleet.cell('streams', 'stream:large-retention-stream');
+    const instance = runCell.instance as WorkflowRunDO;
+    const originalAlarm = instance.alarm.bind(instance);
+    let alarms = 0;
+    instance.alarm = async () => {
+      alarms++;
+      await originalAlarm();
+    };
+    streamCell.storage.resetOperationCounts();
+    let status: CleanupRecord | null = null;
+    for (let attempt = 0; attempt < 100 && status?.phase !== 'tombstoned'; attempt++) {
+      harness.fleet.advance(10);
+      await harness.fleet.fireDueAlarms();
+      status = await world.retention.getStatus(runId);
+    }
+    const streamTransactions = streamCell.storage.operationCounts.transaction;
+    console.log(`STREAM_RETENTION_PAGES ${JSON.stringify({ alarms, streamTransactions })}`);
+
+    expect(status?.phase).toBe('tombstoned');
+    expect(
+      Array.from(streamCell.storage.data.keys()).filter((key) => key.startsWith('chunk')),
+    ).toEqual([]);
+    expect(
+      streamCell.storage.operationCalls
+        .filter((call) => call.operation === 'delete')
+        .every((call) => call.keys.length <= 128),
+    ).toBe(true);
+    expect(alarms).toBeLessThanOrEqual(15);
+  });
+
+  it('reports Queue admission for inline run-bearing messages from run expiry', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+      runRetentionMs: 1_000,
+    });
+    const runId = await createCompletedRun(world, 'queue-admission');
+    const run = () => harness.fleet.cell('runs', runId).instance as WorkflowRunDO;
+    await expect(run().getQueueAdmission()).resolves.toEqual({ ok: true });
+    await finishRun(world, runId);
+    await expect(run().getQueueAdmission()).resolves.toEqual({ ok: true });
+
+    harness.fleet.advance(1_001);
+    await driveCleanup(harness, world, runId);
+    await expect(run().getQueueAdmission()).resolves.toMatchObject({
+      ok: false,
+      message: expect.stringContaining(runId),
+    });
+    await expect(
+      run().reserveRunQueueMessage({
+        claimName: 'claim:1:q:expired',
+        messageId: 'msg_expired',
+        expiresAt: harness.fleet.now + 1_000,
+      }),
+    ).resolves.toMatchObject({ ok: false, message: expect.stringContaining(runId) });
+    await expect(
+      run().claimRunQueueMessage({
+        claimName: 'claim:1:q:expired',
+        messageId: 'msg_expired',
+        staleMs: 1_000,
+      }),
+    ).resolves.toEqual({ expired: true });
+  });
+
   it('purges payloads, indexes, streams, and queued work without allowing resurrection', async () => {
     process.env.CELLD_QUEUE_MODE = 'native';
     harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
@@ -176,10 +264,24 @@ describe('terminal workflow retention', () => {
       correlationId: 'retention-hook',
       eventData: { token: 'retention-token' },
     });
+    // A body with user data moves to object storage; a small one stays inline.
+    await world.queue(
+      '__wkf_workflow_retention',
+      {
+        runId,
+        runInput: {
+          input: ['queued-user-data'],
+          deploymentId: 'retention-tests',
+          workflowName: 'retention-complete',
+          specVersion: SPEC_VERSION_CURRENT,
+        },
+      },
+      { delaySeconds: 3_600, idempotencyKey: `wake:${runId}` },
+    );
     await world.queue(
       '__wkf_workflow_retention',
       { runId },
-      { delaySeconds: 3_600, idempotencyKey: `wake:${runId}` },
+      { delaySeconds: 3_600, idempotencyKey: `wake-inline:${runId}` },
     );
     await finishRun(world, runId);
 
@@ -189,7 +291,7 @@ describe('terminal workflow retention', () => {
     expect((await world.getStreamInfo('retention-stream', runId)).done).toBe(true);
 
     harness.fleet.advance(1_001);
-    expect(harness.queueMessages).toHaveLength(1);
+    expect(harness.queueMessages).toHaveLength(2);
     expect(harness.queuePayloads.size).toBe(1);
     await expect(
       world.queue(
@@ -334,8 +436,17 @@ describe('terminal workflow retention', () => {
     await harness.fleet.fireDueAlarms();
     expect(await world.retention.getStatus(runId)).toMatchObject({ phase: 'index' });
     const streamStorage = harness.fleet.cell('streams', `stream:${streamName}`).storage;
+    // Counts chunks in either stream layout: per-chunk rows or segment size rows.
     const remainingChunks = () =>
-      Array.from(streamStorage.data.keys()).filter((key) => key.startsWith('chunk:')).length;
+      Array.from(streamStorage.data.entries()).reduce(
+        (total, [key, value]) =>
+          key.startsWith('chunk:')
+            ? total + 1
+            : key.startsWith('segsize:')
+              ? total + (value as { count: number }).count
+              : total,
+        0,
+      );
     expect(remainingChunks()).toBe(300);
 
     harness.fleet.advance(1);
@@ -349,11 +460,67 @@ describe('terminal workflow retention', () => {
       phase: 'streams',
       deletedStreams: 0,
     });
-    expect(remainingChunks()).toBe(236);
+    expect(remainingChunks()).toBe(300 - 256);
 
     const status = await driveCleanup(harness, world, runId);
     expect(status).toMatchObject({ phase: 'tombstoned', deletedStreams: 1 });
     expect(remainingChunks()).toBe(0);
+  });
+
+  it('finishes a small terminal cleanup in one alarm and one transaction', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+    });
+    const runId = await createCompletedRun(world, 'terminal-small');
+    for (let hook = 0; hook < 3; hook++) {
+      await world.events.create(runId, {
+        eventType: 'hook_created',
+        correlationId: `small-hook-${hook}`,
+        eventData: { token: `small-token-${hook}` },
+      });
+    }
+    for (let wait = 0; wait < 2; wait++) {
+      await world.events.create(runId, {
+        eventType: 'wait_created',
+        correlationId: `small-wait-${wait}`,
+        eventData: { resumeAt: new Date(harness.fleet.now + 60_000) },
+      });
+    }
+    await finishRun(world, runId);
+
+    const cell = harness.fleet.cell('runs', runId);
+    const instance = cell.instance as WorkflowRunDO;
+    const originalAlarm = instance.alarm.bind(instance);
+    let alarms = 0;
+    instance.alarm = async () => {
+      alarms++;
+      await originalAlarm();
+    };
+    const transactionsBefore = cell.storage.operationCounts.transaction;
+    await driveTerminalCleanup(harness, runId);
+    const transactions = cell.storage.operationCounts.transaction - transactionsBefore;
+    console.log(`TERMINAL_CLEANUP_SMALL ${JSON.stringify({ alarms, transactions })}`);
+
+    expect(alarms).toBe(1);
+    expect(transactions).toBe(1);
+    const keys = Array.from(cell.storage.data.keys());
+    expect(keys.filter((key) => /^(hook:|hookcreated:|wait:|retention:hook:)/.test(key))).toEqual(
+      [],
+    );
+    expect(cell.storage.alarmAt).toBeNull();
+    for (let hook = 0; hook < 3; hook++) {
+      await expect(world.hooks.getByToken(`small-token-${hook}`)).rejects.toSatisfy((error) =>
+        HookNotFoundError.is(error),
+      );
+      expect(
+        harness.fleet
+          .cell('hook-tokens', hookTokenShardName(`small-token-${hook}`))
+          .storage.data.has(hookTokenRecordKey(`small-token-${hook}`)),
+      ).toBe(false);
+    }
   });
 
   it('pages terminal hooks and waits with bounded operations until cleanup completes', async () => {

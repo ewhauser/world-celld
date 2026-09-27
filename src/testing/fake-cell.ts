@@ -104,6 +104,7 @@ export class FakeStorage {
   private mutationFailure?: {
     predicate: (mutation: FakeStorageMutation) => boolean;
     error: Error;
+    remaining: number;
   };
   private readFailure?: {
     predicate: (read: FakeStorageRead) => boolean;
@@ -244,12 +245,13 @@ export class FakeStorage {
     this.operationCalls.push({ operation, keys: [...keys], transactional, synchronous: false });
   }
 
-  /** Inject one matching write failure, including writes inside transactions. */
+  /** Inject matching write failures (one by default), including writes inside transactions. */
   failNextMutation(
     predicate: (mutation: FakeStorageMutation) => boolean,
     error = new Error('injected fake storage mutation failure'),
+    times = 1,
   ): void {
-    this.mutationFailure = { predicate, error };
+    this.mutationFailure = { predicate, error, remaining: times };
   }
 
   /** Inject one matching storage read failure, including reads inside transactions. */
@@ -264,7 +266,8 @@ export class FakeStorage {
   maybeFailMutation(mutation: FakeStorageMutation): void {
     if (!this.mutationFailure?.predicate(mutation)) return;
     const { error } = this.mutationFailure;
-    this.mutationFailure = undefined;
+    this.mutationFailure.remaining -= 1;
+    if (this.mutationFailure.remaining <= 0) this.mutationFailure = undefined;
     throw error;
   }
 
@@ -453,6 +456,11 @@ export class FakeFleet {
       },
     };
     return new CellCtor(ctx, this.cellEnv);
+  }
+
+  /** Whether a cell has been activated, without activating it. */
+  hasCell(bindingKey: string, name: string): boolean {
+    return this.cells.has(`${bindingKey}\0${name}`);
   }
 
   cell(bindingKey: string, name: string): CellSlot {
