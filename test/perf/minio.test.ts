@@ -8,6 +8,7 @@ import { createCelldWorld } from '../../src/index.js';
 import { parse } from '../../src/vendor/shared/index.js';
 import { RunExpiredError } from '@workflow/errors';
 import type { CleanupRecord } from '../../src/retention.js';
+import { lazyHookResumeSetup } from './lazy-hook-resume.js';
 
 function positiveInteger(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -440,6 +441,7 @@ describe('MinIO single-node queue performance and loss', () => {
       replay: [],
       step: [],
       hook: [],
+      resume: [],
       stream: [],
       queue: [],
       read: [],
@@ -447,6 +449,7 @@ describe('MinIO single-node queue performance and loss', () => {
     };
     const payload = 'x'.repeat(payloadBytes);
     const failures: string[] = [];
+    let lazyResumePreloads = 0;
     const started = performance.now();
     const measure = async (stage: string, action: () => Promise<void>) => {
       const began = performance.now();
@@ -492,6 +495,17 @@ describe('MinIO single-node queue performance and loss', () => {
           });
           const hook = await world.hooks.getByToken(token);
           if (hook.runId !== workflowRunId) throw new Error('hook owner mismatch');
+        });
+        await measure('resume', async () => {
+          const resumeId = `01K${String(sequence).padStart(23, '0')}`;
+          const { usablePreload } = await lazyHookResumeSetup(world, {
+            runId: workflowRunId,
+            hookId: `hook-${sequence}`,
+            token,
+            resumeId,
+            payload,
+          });
+          lazyResumePreloads += usablePreload ? 1 : 0;
         });
         const streamName = `perf-stream-${workflowRunId}`;
         await measure('stream', async () => {
@@ -563,6 +577,7 @@ describe('MinIO single-node queue performance and loss', () => {
         duplicateCallbacks: workflowDuplicates,
         mismatchedMessageIds: mismatched.length,
         listReturned: listed.data.length,
+        lazyResumePreloads,
         failures,
       },
       performance: {

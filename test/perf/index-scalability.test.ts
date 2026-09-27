@@ -9,6 +9,7 @@ import { createRemoteEnv } from '../../src/remote/namespaces.js';
 import { createStorage } from '../../src/storage.js';
 import type { FakeStorage, FakeStorageOperationCounts } from '../../src/testing/fake-cell.js';
 import { startHarness, type Harness } from '../../src/testing/http-harness.js';
+import { lazyHookResumeSetup } from './lazy-hook-resume.js';
 
 const SECRET = 'index-scalability-secret';
 const WORKLOAD = 48;
@@ -366,6 +367,69 @@ describe('sharded index scalability evidence', () => {
       putMany: 1,
       transaction: 1,
     });
+  });
+
+  it('records lazy hook resume setup round trips', async () => {
+    let publicRpcs = 0;
+    const paths = new Map<string, number>();
+    const countedFetch: typeof fetch = async (input, init) => {
+      const path = new URL(input instanceof Request ? input.url : String(input)).pathname;
+      publicRpcs++;
+      paths.set(path, (paths.get(path) ?? 0) + 1);
+      return fetch(input, init);
+    };
+    const env = createRemoteEnv({ fleetUrl: harness.url, secret: SECRET, fetchImpl: countedFetch });
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'index-scalability',
+    });
+    const runId = 'wrun_lazy_hook_resume_evidence';
+    await storage.events.create(runId, {
+      eventType: 'run_created',
+      eventData: { deploymentId: 'index-scalability', workflowName: 'resume', input: [] },
+    });
+    await storage.events.create(runId, { eventType: 'run_started' });
+    await storage.events.create(runId, {
+      eventType: 'hook_created',
+      correlationId: 'lazy-hook',
+      eventData: { token: 'lazy-token' },
+    });
+
+    const resumeId = '01K0000000000000000000LAZY';
+    publicRpcs = 0;
+    paths.clear();
+    const startedAt = performance.now();
+    const { result, usablePreload } = await lazyHookResumeSetup(storage, {
+      runId,
+      hookId: 'lazy-hook',
+      token: 'lazy-token',
+      resumeId,
+      payload: 'ok',
+    });
+    const report = {
+      usablePreload,
+      publicRpcs,
+      paths: Object.fromEntries(
+        [...paths].toSorted(([left], [right]) => left.localeCompare(right)),
+      ),
+      elapsedMs: performance.now() - startedAt,
+    };
+    console.log(`INDEX_SCALABILITY_LAZY_HOOK_RESUME ${JSON.stringify(report)}`);
+
+    expect(usablePreload).toBe(true);
+    expect(report.paths).toEqual({ [`/v1/rpc/runs/${runId}/applyEvent`]: 1 });
+    expect(result.events?.map((event) => event.eventType)).toEqual([
+      'run_created',
+      'run_started',
+      'hook_created',
+      'hook_received',
+    ]);
+    expect(result.cursor).toBe(result.events?.at(-1)?.eventId);
+    const after = await storage.events.list({
+      runId,
+      pagination: { cursor: result.cursor ?? undefined },
+    });
+    expect(after.data).toEqual([]);
   });
 
   it('separates batched-RPC savings from shard distribution under contention', async () => {

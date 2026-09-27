@@ -294,6 +294,11 @@ export interface ApplyEventSuccess {
   runIndexPublished?: true;
   /** Set by the worker router after it released `releasedHooks` from the hook indexes. */
   hookIndexesReleased?: true;
+  /**
+   * The unchanged run returned with a `preloadEvents` hook_received replay
+   * log. It is not a run mutation, so it carries no index publication.
+   */
+  replayRun?: WorkflowRun;
 }
 
 export type ApplyEventOutcome = ApplyEventSuccess | ApplyEventFailure;
@@ -1261,6 +1266,10 @@ export async function finalizeEventPage(
       : outcome;
   if (!result.event) return result;
 
+  if (params?.preloadEvents && result.event.eventType === 'hook_received') {
+    return await attachHookReplayPreload(store, result);
+  }
+
   if (typeof params?.sinceCursor === 'string') {
     const page = await listByPrefix<Event>(
       store,
@@ -1292,5 +1301,38 @@ export async function finalizeEventPage(
     events,
     cursor: null,
     hasMore: events.length < skippedCount,
+  };
+}
+
+/**
+ * Lazy hook resume preload: return the run and its complete replay log with
+ * the hook_received write, read in the same transaction, so the runtime can
+ * skip its run_started write and the index publication that follows it. The
+ * runtime trusts only a complete log with a non-null cursor, so a run that is
+ * not started, not running, or over the event ceiling gets the plain result.
+ */
+async function attachHookReplayPreload(
+  store: EventStore,
+  result: ApplyEventSuccess,
+): Promise<ApplyEventSuccess> {
+  const run = await store.get<WorkflowRun>(RUN_KEY);
+  if (!run?.startedAt || run.status !== 'running') return result;
+  const maxEvents = getMaxEventsPerRun();
+  const log = await listByPrefix<Event>(
+    store,
+    EVENT_KEY_PREFIX,
+    { limit: maxEvents, sortOrder: 'asc' },
+    (event) => event.eventId,
+  );
+  const last = log.data.at(-1);
+  if (log.hasMore || last === undefined) return result;
+  return {
+    ...result,
+    replayRun: run,
+    maxEvents,
+    events: log.data,
+    // events.list cursors are the last returned event ID (exclusive start).
+    cursor: last.eventId,
+    hasMore: false,
   };
 }
