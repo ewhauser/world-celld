@@ -78,7 +78,14 @@ export class RunCatalogDO extends DurableObject {
   ): Promise<{ stored: boolean }> {
     const canonicalKeys = canonicalCatalogKeys(runId, keys);
     return await this.ctx.storage.transaction(async (txn) => {
-      if ((await txn.get(expiredKey(runId))) !== undefined) return { stored: false };
+      const recordKey = catalogKeysKey(runId);
+      const existing = await txn.get<string | CatalogKeys>([
+        expiredKey(runId),
+        canonicalKeys[0],
+        canonicalKeys[1],
+        recordKey,
+      ]);
+      if (existing.get(expiredKey(runId)) !== undefined) return { stored: false };
       const now = this.now();
       if (
         !Number.isSafeInteger(publicationExpiresAt) ||
@@ -86,6 +93,17 @@ export class RunCatalogDO extends DurableObject {
         publicationExpiresAt > now + MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS
       ) {
         return { stored: false };
+      }
+      const record = existing.get(recordKey) as CatalogKeys | undefined;
+      if (
+        existing.get(canonicalKeys[0]) === serializedMetadata &&
+        existing.get(canonicalKeys[1]) === serializedMetadata &&
+        record?.keys.length === canonicalKeys.length &&
+        record.keys.every((key, index) => key === canonicalKeys[index])
+      ) {
+        // An idempotent republication (e.g. a run_started replay) changes
+        // nothing, so it stays a read-only transaction.
+        return { stored: true };
       }
       await txn.put({
         [canonicalKeys[0]]: serializedMetadata,

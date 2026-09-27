@@ -437,6 +437,7 @@ describe('MinIO single-node queue performance and loss', () => {
     });
     const stageMs: Record<string, number[]> = {
       create: [],
+      replay: [],
       step: [],
       hook: [],
       stream: [],
@@ -462,6 +463,11 @@ describe('MinIO single-node queue performance and loss', () => {
             eventData: { deploymentId, workflowName, input: [payload, sequence] },
           });
           workflowRunId = created.run.runId;
+          await world.events.create(workflowRunId, { eventType: 'run_started' });
+        });
+        // Every workflow invocation after the first starts with a run_started
+        // replay against the already-running run.
+        await measure('replay', async () => {
           await world.events.create(workflowRunId, { eventType: 'run_started' });
         });
         const stepId = `step-${sequence}`;

@@ -1138,6 +1138,42 @@ describe('full stack: vendored storage over the wire', () => {
     expect((full.data[0] as { input?: unknown }).input).toEqual(['secret-input-marker']);
   });
 
+  it('keeps a run_started replay free of run and catalog writes', async () => {
+    const env = transport();
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-replay',
+    });
+    const created = await storage.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId: 'wire-replay', workflowName: 'wire-replay', input: [] },
+    });
+    const runId = created.run.runId;
+    await storage.events.create(runId, { eventType: 'run_started' });
+
+    const runStorage = harness.fleet.cell('runs', runId).storage;
+    const catalogStorage = harness.fleet.cell('run-catalog', runCatalogShardName(runId)).storage;
+    const writes = () =>
+      [runStorage, catalogStorage].map(
+        ({ operationCounts: counts }) =>
+          counts.put + counts.putMany + counts.delete + counts.deleteMany,
+      );
+    const before = writes();
+    const replay = await storage.events.create(runId, { eventType: 'run_started' });
+    expect(replay.run?.status).toBe('running');
+    expect(writes()).toEqual(before);
+
+    // The next appended event still takes the next sequence slot.
+    const attr = await storage.events.create(runId, {
+      eventType: 'attr_set',
+      correlationId: 'after-replay',
+      eventData: { changes: [{ key: 'k', value: 'v' }], writer: { type: 'workflow' } },
+    });
+    const events = await storage.events.list({ runId, pagination: { sortOrder: 'asc' } });
+    expect(events.data.map((event) => event.eventId).at(-1)).toBe(attr.event?.eventId);
+    expect(new Set(events.data.map((event) => event.eventId)).size).toBe(events.data.length);
+  });
+
   it('repairs a run catalog commit after the authoritative run transaction succeeds', async () => {
     const env = transport();
     const storage = createStorage({
