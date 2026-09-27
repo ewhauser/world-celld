@@ -117,7 +117,7 @@ describe('StreamDO paged KV cleanup', () => {
     expect(storage.getManyCalls).toEqual([]);
     expect(storage.listCalls).toEqual([
       {
-        options: { prefix: 'chunk-size:', limit: 65 },
+        options: { prefix: 'chunk-size:', limit: 129 },
         resultSize: 4,
         transactional: true,
       },

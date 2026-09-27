@@ -157,6 +157,58 @@ describe('terminal workflow retention', () => {
     expect(storage.operationCounts.transaction).toBe(0);
   });
 
+  it('expires a large stream in pages of up to 256 chunks', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+      runRetentionMs: 1_000,
+    });
+    const runId = await createCompletedRun(world, 'large-stream');
+    const chunks = Array.from({ length: 2_000 }, () => new Uint8Array(16));
+    for (let offset = 0; offset < chunks.length; offset += 32) {
+      await world.streams.writeMulti(
+        runId,
+        'large-retention-stream',
+        chunks.slice(offset, offset + 32),
+      );
+    }
+    await world.closeStream('large-retention-stream', runId);
+    await finishRun(world, runId);
+    harness.fleet.advance(1_001);
+
+    const runCell = harness.fleet.cell('runs', runId);
+    const streamCell = harness.fleet.cell('streams', 'stream:large-retention-stream');
+    const instance = runCell.instance as WorkflowRunDO;
+    const originalAlarm = instance.alarm.bind(instance);
+    let alarms = 0;
+    instance.alarm = async () => {
+      alarms++;
+      await originalAlarm();
+    };
+    streamCell.storage.resetOperationCounts();
+    let status: CleanupRecord | null = null;
+    for (let attempt = 0; attempt < 100 && status?.phase !== 'tombstoned'; attempt++) {
+      harness.fleet.advance(10);
+      await harness.fleet.fireDueAlarms();
+      status = await world.retention.getStatus(runId);
+    }
+    const streamTransactions = streamCell.storage.operationCounts.transaction;
+    console.log(`STREAM_RETENTION_PAGES ${JSON.stringify({ alarms, streamTransactions })}`);
+
+    expect(status?.phase).toBe('tombstoned');
+    expect(
+      Array.from(streamCell.storage.data.keys()).filter((key) => key.startsWith('chunk')),
+    ).toEqual([]);
+    expect(
+      streamCell.storage.operationCalls
+        .filter((call) => call.operation === 'delete')
+        .every((call) => call.keys.length <= 128),
+    ).toBe(true);
+    expect(alarms).toBeLessThanOrEqual(15);
+  });
+
   it('purges payloads, indexes, streams, and queued work without allowing resurrection', async () => {
     process.env.CELLD_QUEUE_MODE = 'native';
     harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
@@ -349,7 +401,7 @@ describe('terminal workflow retention', () => {
       phase: 'streams',
       deletedStreams: 0,
     });
-    expect(remainingChunks()).toBe(236);
+    expect(remainingChunks()).toBe(300 - 256);
 
     const status = await driveCleanup(harness, world, runId);
     expect(status).toMatchObject({ phase: 'tombstoned', deletedStreams: 1 });
