@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import { rpcParse, rpcStringify } from '../src/codec.js';
+import {
+  b64decode,
+  b64decodeFallback,
+  b64encode,
+  b64encodeFallback,
+} from '../src/vendor/shared/serialization.js';
 
 describe('rpc codec', () => {
   it('round-trips Dates in arbitrary positions', () => {
@@ -39,5 +45,39 @@ describe('rpc codec', () => {
   it('round-trips argument arrays with null and nested structures', () => {
     const args = ['wrun_1', { pagination: { limit: 5 } }, null, true, 42];
     expect(rpcParse(rpcStringify(args))).toEqual(args);
+  });
+});
+
+const BASE64_SIZES = [0, 1, 2, 3, 4095, 4096, 4097, 65_537];
+
+function bytesOf(size: number): Uint8Array {
+  return new Uint8Array(size).map((_, i) => (i * 131 + 7) % 256);
+}
+
+describe('base64 helpers', () => {
+  it('native and fallback encoders produce identical standard padded base64', () => {
+    for (const size of BASE64_SIZES) {
+      const bytes = bytesOf(size);
+      const encoded = b64encodeFallback(bytes);
+      expect(b64encode(bytes)).toBe(encoded);
+      expect(encoded).toBe(btoa(String.fromCharCode(...bytes)));
+    }
+  });
+
+  it('native and fallback decoders round-trip every size', () => {
+    for (const size of BASE64_SIZES) {
+      const bytes = bytesOf(size);
+      const encoded = b64encodeFallback(bytes);
+      expect(Array.from(b64decode(encoded))).toEqual(Array.from(bytes));
+      expect(Array.from(b64decodeFallback(encoded))).toEqual(Array.from(bytes));
+    }
+  });
+
+  it('the fallback decoder rejects non-base64 input', () => {
+    expect(() => b64decodeFallback('not base64!')).toThrow(DOMException);
+  });
+
+  it('rejects a malformed Uint8Array tag through the codec', () => {
+    expect(() => rpcParse('{"x":{"__type":"Uint8Array","data":"@@@"}}')).toThrow(SyntaxError);
   });
 });
