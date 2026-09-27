@@ -15,6 +15,7 @@ import type { CelldQueueProducer } from '../queue.js';
 import type { NativeQueueSendResult } from '../queue-protocol.js';
 import type { WorkflowRunDOStub } from '../storage.js';
 import type { StreamDOStub } from '../streamer.js';
+import type { RunListPage, RunListRequest } from '../run-list.js';
 import { callDO, callFleetRoute, type RpcTransport } from './rpc-client.js';
 import { readStreamChunks, writeStreamChunks } from './stream-client.js';
 
@@ -121,6 +122,28 @@ const HOOK_IDS: MethodSpec = {
   mutating: new Set(),
 };
 
+/** Transports whose worker answered the fleet-side run listing with 404. */
+const legacyRunListing = new WeakSet<RpcTransport>();
+
+async function listResolvedRuns(
+  transport: RpcTransport,
+  request: RunListRequest,
+): Promise<RunListPage | null> {
+  if (legacyRunListing.has(transport)) return null;
+  try {
+    return await callFleetRoute<RunListPage>(transport, '/v1/index/runs/list-resolved', [request], {
+      idempotent: true,
+    });
+  } catch (error) {
+    // A worker that predates the route: list from the client instead.
+    if ((error as { status?: unknown }).status === 404) {
+      legacyRunListing.add(transport);
+      return null;
+    }
+    throw error;
+  }
+}
+
 export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
   const runCatalog = makeNamespace<RunCatalogShardStub>(transport, 'run-catalog', RUN_CATALOG);
   const hookTokens = makeNamespace<HookTokenShardStub>(transport, 'hook-tokens', HOOK_TOKENS);
@@ -142,6 +165,7 @@ export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
         ),
       listRuns: (options) =>
         callFleetRoute(transport, '/v1/index/runs/list', [options], { idempotent: true }),
+      listResolvedRuns: (request) => listResolvedRuns(transport, request),
       expireRun: (request) =>
         callFleetRoute(transport, '/v1/index/runs/expire', [request], { idempotent: true }),
       reserveHook: (token, owner) =>

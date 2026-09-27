@@ -281,7 +281,7 @@ describe('sharded index scalability evidence', () => {
 
     expect(created.publicRpcs).toBe(2);
     expect(updated.publicRpcs).toBe(2);
-    expect(listed.publicRpcs).toBe(2);
+    expect(listed.publicRpcs).toBe(1);
     expect(hookCreated.publicRpcs).toBe(3);
     expect(getByToken.publicRpcs).toBe(1);
     expect(getById.publicRpcs).toBe(1);

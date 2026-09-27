@@ -512,7 +512,17 @@ describe('MinIO single-node queue performance and loss', () => {
       }
     });
 
-    const listed = await world.runs.list({ workflowName, pagination: { limit: 20 } });
+    const listMs: number[] = [];
+    const listNoDataMs: number[] = [];
+    let listed = await world.runs.list({ workflowName, pagination: { limit: 20 } });
+    for (let iteration = 0; iteration < 5; iteration++) {
+      let began = performance.now();
+      listed = await world.runs.list({ workflowName, pagination: { limit: 20 } });
+      listMs.push(performance.now() - began);
+      began = performance.now();
+      await world.runs.list({ workflowName, resolveData: 'none', pagination: { limit: 20 } });
+      listNoDataMs.push(performance.now() - began);
+    }
     const delivered = await waitUntil(
       () => workflowAccepted.size === workflowRuns && workflowDelivered.size === workflowRuns,
       timeoutMs,
@@ -540,6 +550,8 @@ describe('MinIO single-node queue performance and loss', () => {
       performance: {
         elapsedMs: Number(elapsedMs.toFixed(2)),
         runsPerSecond: rate(stageMs.complete.length, elapsedMs),
+        listMs: summarizeLatency(listMs),
+        listNoDataMs: summarizeLatency(listNoDataMs),
         queueDeliveryMs: summarizeLatency(
           Array.from(workflowDelivered.values(), (delivery) => delivery.latencyMs),
         ),
