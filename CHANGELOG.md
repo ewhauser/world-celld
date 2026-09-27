@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.7.0 (2026-09-27)
+
+## What's Changed
+* test(perf): cover mixed workflows, sustained load, and node failover by @ewhauser in https://github.com/ewhauser/world-celld/pull/64
+* feat!: require celld v0.6.0 by @ewhauser in https://github.com/ewhauser/world-celld/pull/67
+* perf(queue): dispatch consumer batches without a fill wait by @ewhauser in https://github.com/ewhauser/world-celld/pull/69
+* perf(codec): use native base64 and a faster fallback by @ewhauser in https://github.com/ewhauser/world-celld/pull/70
+* perf(runs): list runs inside the fleet in one round trip by @ewhauser in https://github.com/ewhauser/world-celld/pull/74
+* perf(indexes): publish run mutations to indexes inside the fleet by @ewhauser in https://github.com/ewhauser/world-celld/pull/72
+* perf(runs): keep idempotent run replays read-only by @ewhauser in https://github.com/ewhauser/world-celld/pull/75
+* perf(events): honor preloadEvents on lazy hook resume by @ewhauser in https://github.com/ewhauser/world-celld/pull/71
+* perf(streams): negotiate 512-chunk stream batches by @ewhauser in https://github.com/ewhauser/world-celld/pull/73
+* perf(retention): finish small terminal cleanups in one pass by @ewhauser in https://github.com/ewhauser/world-celld/pull/76
+* perf(retention): expire streams in pages of up to 256 chunks by @ewhauser in https://github.com/ewhauser/world-celld/pull/77
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.6.0...v0.7.0
+
 ## 0.6.0 (2026-09-16)
 
 ## What's Changed
