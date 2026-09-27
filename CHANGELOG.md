@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.8.0 (2026-09-27)
+
+## What's Changed
+* test(perf): add a run-bearing mode to the MinIO queue benchmark by @ewhauser in https://github.com/ewhauser/world-celld/pull/78
+* feat(queue): accept inline run-bearing Queue bodies at delivery by @ewhauser in https://github.com/ewhauser/world-celld/pull/79
+* feat(queue): support run-scoped Queue idempotency claims by @ewhauser in https://github.com/ewhauser/world-celld/pull/81
+* perf(queue): keep small run-bearing bodies inline in the broker by @ewhauser in https://github.com/ewhauser/world-celld/pull/80
+* perf(queue): keep new runs' idempotency claims in the run cell by @ewhauser in https://github.com/ewhauser/world-celld/pull/82
+* feat(streams): read, append, and expire segment-layout streams by @ewhauser in https://github.com/ewhauser/world-celld/pull/83
+* perf(streams): store new streams in segment rows by @ewhauser in https://github.com/ewhauser/world-celld/pull/84
+* chore(deps): bump zizmorcore/zizmor-action from 0.6.3 to 0.6.4 in the github-actions group across 1 directory by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/62
+* test(smoke): keep the retention-restart Queue payload in object storage by @ewhauser in https://github.com/ewhauser/world-celld/pull/85
+* Limit Dependabot to security updates by @ewhauser in https://github.com/ewhauser/world-celld/pull/63
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.7.0...v0.8.0
+
 ## 0.7.0 (2026-09-27)
 
 ## What's Changed
