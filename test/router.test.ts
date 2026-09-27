@@ -941,8 +941,9 @@ describe('full stack: vendored storage over the wire', () => {
     );
   });
 
-  it('merges every catalog shard behind one public call with bounded run fanout', async () => {
+  it('lists runs inside the fleet, or from the client with bounded fanout for an older worker', async () => {
     let publicRpcs = 0;
+    let legacyWorker = false;
     let activeRunReads = 0;
     let maxActiveRunReads = 0;
     const paths = new Map<string, number>();
@@ -950,6 +951,12 @@ describe('full stack: vendored storage over the wire', () => {
       const url = new URL(input instanceof Request ? input.url : String(input));
       publicRpcs++;
       paths.set(url.pathname, (paths.get(url.pathname) ?? 0) + 1);
+      if (legacyWorker && url.pathname === '/v1/index/runs/list-resolved') {
+        return Response.json(
+          { error: { name: 'NotFound', message: 'unknown index operation: runs.list-resolved' } },
+          { status: 404 },
+        );
+      }
 
       const isRunRead = url.pathname.endsWith('/getRun');
       if (isRunRead) {
@@ -1016,23 +1023,53 @@ describe('full stack: vendored storage over the wire', () => {
       maxActiveRunReads = 0;
       paths.clear();
       catalogLists = 0;
-      runStorageGets = 0;
       resetRunStorageCalls();
       const listed = await storage.runs.list({
         workflowName: 'wire-list-fanout',
         pagination: { limit: 20 },
       });
-
       expect(listed.data).toHaveLength(20);
-      expect(publicRpcs).toBe(1 + 20);
-      expect(paths.get('/v1/index/runs/list')).toBe(1);
-      expect(Array.from(paths.entries()).filter(([path]) => path.endsWith('/getRun'))).toHaveLength(
-        20,
-      );
-      expect(maxActiveRunReads).toBe(8);
+      expect(publicRpcs).toBe(1);
+      expect(paths).toEqual(new Map([['/v1/index/runs/list-resolved', 1]]));
       expect(catalogLists).toBe(16);
-      runStorageGets = countRunStorageGets();
-      expect(runStorageGets).toBe(20);
+      expect(countRunStorageGets()).toBe(20);
+
+      // An older worker answers 404; the client lists with bounded fanout
+      // and does not ask that transport again.
+      legacyWorker = true;
+      const legacyEnv = createRemoteEnv({
+        fleetUrl: harness.url,
+        secret: SECRET,
+        fetchImpl: countedFetch,
+      });
+      const legacyStorage = createStorage({
+        env: { WORKFLOW_DB: legacyEnv.WORKFLOW_DB, WORKFLOW_INDEX: legacyEnv.WORKFLOW_INDEX },
+        deploymentId: 'wire-test',
+      });
+      for (let attempt = 0; attempt < 2; attempt++) {
+        publicRpcs = 0;
+        maxActiveRunReads = 0;
+        paths.clear();
+        catalogLists = 0;
+        resetRunStorageCalls();
+        const legacyListed = await legacyStorage.runs.list({
+          workflowName: 'wire-list-fanout',
+          pagination: { limit: 20 },
+        });
+        expect(legacyListed.data.map((run) => run.runId)).toEqual(
+          listed.data.map((run) => run.runId),
+        );
+        expect(paths.get('/v1/index/runs/list-resolved')).toBe(attempt === 0 ? 1 : undefined);
+        expect(paths.get('/v1/index/runs/list')).toBe(1);
+        expect(
+          Array.from(paths.entries()).filter(([path]) => path.endsWith('/getRun')),
+        ).toHaveLength(20);
+        expect(publicRpcs).toBe((attempt === 0 ? 1 : 0) + 1 + 20);
+        expect(maxActiveRunReads).toBe(8);
+        expect(catalogLists).toBe(16);
+        expect(countRunStorageGets()).toBe(20);
+      }
+      legacyWorker = false;
 
       await Promise.all(
         runIds.map((runId) =>
@@ -1056,7 +1093,7 @@ describe('full stack: vendored storage over the wire', () => {
       });
       expect(pending.data).toEqual([]);
       expect(publicRpcs).toBe(1);
-      expect(paths).toEqual(new Map([['/v1/index/runs/list', 1]]));
+      expect(paths).toEqual(new Map([['/v1/index/runs/list-resolved', 1]]));
       expect(maxActiveRunReads).toBe(0);
       expect(catalogLists).toBe(16);
       runStorageGets = countRunStorageGets();
@@ -1064,6 +1101,46 @@ describe('full stack: vendored storage over the wire', () => {
     } finally {
       for (const restore of restorers) restore();
     }
+  });
+
+  it('strips run data inside the fleet for resolveData none', async () => {
+    let responseText = '';
+    const recordingFetch: typeof fetch = async (input, init) => {
+      const response = await fetch(input, init);
+      const url = new URL(input instanceof Request ? input.url : String(input));
+      if (url.pathname === '/v1/index/runs/list-resolved') {
+        responseText = await response.clone().text();
+      }
+      return response;
+    };
+    const env = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: recordingFetch,
+    });
+    const storage = createStorage({
+      env: { WORKFLOW_DB: env.WORKFLOW_DB, WORKFLOW_INDEX: env.WORKFLOW_INDEX },
+      deploymentId: 'wire-list-strip',
+    });
+    await storage.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'wire-list-strip',
+        workflowName: 'wire-list-strip',
+        input: ['secret-input-marker'],
+      },
+    });
+
+    const stripped = await storage.runs.list({
+      workflowName: 'wire-list-strip',
+      resolveData: 'none',
+    });
+    expect(stripped.data).toHaveLength(1);
+    expect(stripped.data[0]).not.toHaveProperty('input');
+    expect(responseText).not.toContain('secret-input-marker');
+
+    const full = await storage.runs.list({ workflowName: 'wire-list-strip' });
+    expect((full.data[0] as { input?: unknown }).input).toEqual(['secret-input-marker']);
   });
 
   it('repairs a run catalog commit after the authoritative run transaction succeeds', async () => {

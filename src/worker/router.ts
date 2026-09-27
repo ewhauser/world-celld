@@ -11,9 +11,11 @@
  * Generic RPC bodies use the tagged JSON codec. Stream chunk bodies use the
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
-import { SPEC_VERSION_CURRENT } from '@workflow/world';
+import { SPEC_VERSION_CURRENT, type WorkflowRun } from '@workflow/world';
 import { parseApplyEventRequest } from '../apply-event.js';
 import { rpcParse, rpcStringify } from '../codec.js';
+import type { RunReadOutcome } from '../retention.js';
+import { listRunsPage } from '../run-list.js';
 import {
   createWorkflowIndex,
   type CellNamespaceLike,
@@ -512,6 +514,26 @@ export function createRouter(env: WorkerEnv) {
           case 'runs.list':
             result = await index.listRuns(...validated.args);
             break;
+          case 'runs.list-resolved': {
+            const runs = env.WORKFLOW_DB;
+            if (!runs) {
+              return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_DB');
+            }
+            result = await listRunsPage(
+              {
+                listRuns: (options) => index.listRuns(options),
+                readRun: async (runId) => {
+                  const stub = runs.get(runs.idFromName(runId)) as {
+                    getRun(): Promise<RunReadOutcome<WorkflowRun | null>>;
+                  };
+                  const outcome = await stub.getRun();
+                  return outcome.ok ? outcome.value : null;
+                },
+              },
+              ...validated.args,
+            );
+            break;
+          }
           case 'runs.commit':
             result = await index.commitRun(...validated.args);
             break;
