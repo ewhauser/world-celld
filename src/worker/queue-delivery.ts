@@ -81,6 +81,14 @@ export async function deliverQueueMessage(
   }
 
   try {
+    // A run-bearing body carried inline has no payload object for retention
+    // to delete, so the run cell answers whether the run has expired. The
+    // read overlaps the claim and adds no round trip.
+    let admission: ReturnType<QueueRunStub['getQueueAdmission']> | undefined;
+    if (envelope.runId && !envelope.payloadKey) {
+      admission = runStub(envelope.runId).getQueueAdmission();
+      admission.catch(() => undefined);
+    }
     if (envelope.idempotencyKey) {
       claim = runStub(queueClaimName(envelope.queueName, envelope.idempotencyKey));
       const result = await claim.claimInflight({
@@ -98,6 +106,12 @@ export async function deliverQueueMessage(
         return { kind: 'complete' };
       }
       claimed = true;
+    }
+
+    if (admission && !(await admission).ok) {
+      // Same outcome as an offloaded body that retention already deleted.
+      await claim?.completeQueueMessage(envelope.messageId);
+      return { kind: 'complete' };
     }
 
     let body = envelope.body;

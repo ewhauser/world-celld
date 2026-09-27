@@ -209,6 +209,28 @@ describe('terminal workflow retention', () => {
     expect(alarms).toBeLessThanOrEqual(15);
   });
 
+  it('reports Queue admission for inline run-bearing messages from run expiry', async () => {
+    harness = await startHarness({ secret: 'retention-secret', virtualClock: true });
+    const world = createCelldWorld({
+      fleetUrl: harness.url,
+      secret: 'retention-secret',
+      deploymentId: 'retention-tests',
+      runRetentionMs: 1_000,
+    });
+    const runId = await createCompletedRun(world, 'queue-admission');
+    const run = () => harness.fleet.cell('runs', runId).instance as WorkflowRunDO;
+    await expect(run().getQueueAdmission()).resolves.toEqual({ ok: true });
+    await finishRun(world, runId);
+    await expect(run().getQueueAdmission()).resolves.toEqual({ ok: true });
+
+    harness.fleet.advance(1_001);
+    await driveCleanup(harness, world, runId);
+    await expect(run().getQueueAdmission()).resolves.toMatchObject({
+      ok: false,
+      message: expect.stringContaining(runId),
+    });
+  });
+
   it('purges payloads, indexes, streams, and queued work without allowing resurrection', async () => {
     process.env.CELLD_QUEUE_MODE = 'native';
     harness = await startHarness({ secret: 'retention-secret', virtualClock: true });

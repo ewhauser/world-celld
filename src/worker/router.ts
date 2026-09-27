@@ -68,6 +68,7 @@ interface NativeQueueBindingLike {
 }
 
 export interface QueueRunStub {
+  getQueueAdmission(): Promise<{ ok: true } | { ok: false; message: string }>;
   registerQueuePayload(
     registration: QueuePayloadRegistration,
   ): Promise<{ ok: true } | { ok: false; message: string }>;
