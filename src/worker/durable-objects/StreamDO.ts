@@ -46,9 +46,10 @@ const CHUNK_SIZE_KEY_PREFIX = 'chunk-size:';
 const STREAM_REGISTRY_PREFIX = 'stream:';
 const REGISTRY_OWNER_KEY = 'registry:owner';
 const REGISTRY_EXPIRED_KEY = 'registry:expired';
-/** Each chunk occupies a payload key and a size key; one delete accepts at most 128 keys. */
+/** Each chunk occupies a payload key and a size key, deleted in calls of at most 128 keys. */
 const DEFAULT_EXPIRE_CHUNK_LIMIT = 64;
-const MAX_EXPIRE_CHUNK_LIMIT = 64;
+const MAX_EXPIRE_CHUNK_LIMIT = 256;
+const DELETE_BATCH_KEYS = 128;
 /** Bound storage deletion work as well as item count; one oversized chunk still makes progress. */
 const DEFAULT_EXPIRE_BYTE_LIMIT = 16 * 1024 * 1024;
 const MAX_EXPIRE_BYTE_LIMIT = DEFAULT_EXPIRE_BYTE_LIMIT;
@@ -550,7 +551,9 @@ export class StreamDO extends DurableObject {
         }
 
         const keys = page.flatMap(({ index }) => [chunkKey(index), chunkSizeKey(index)]);
-        if (keys.length > 0) await txn.delete(keys);
+        for (let offset = 0; offset < keys.length; offset += DELETE_BATCH_KEYS) {
+          await txn.delete(keys.slice(offset, offset + DELETE_BATCH_KEYS));
+        }
         let done = candidates.size === page.length;
         if (payloadFallback) {
           const remaining = await txn.list({ prefix: CHUNK_KEY_PREFIX, limit: 1 });
