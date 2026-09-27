@@ -8,6 +8,27 @@ export const NATIVE_QUEUE_MAX_DELAY_SECONDS = 86_400;
 export const NATIVE_QUEUE_MAX_MESSAGE_BYTES = 128_000;
 export const MAX_QUEUE_SUSPENSIONS = 256;
 export const QUEUE_PAYLOAD_REGISTRY_PREFIX = 'queue-payload:';
+/** Largest run-bearing body that may travel inline in the broker envelope. */
+export const MAX_INLINE_RUN_BODY_BYTES = 8 * 1024;
+/** Workflow payload fields that carry user data, which run retention must be able to delete. */
+const USER_DATA_FIELDS = ['runInput', 'hookInput', 'stepInput'] as const;
+
+/**
+ * A run-bearing body may stay inline when it is small and carries no user
+ * data: then it holds only IDs, trace context, and metadata, and nothing in it
+ * needs run retention to delete it from object storage.
+ */
+export function isInlineRunBody(body: string): boolean {
+  if (body.length > MAX_INLINE_RUN_BODY_BYTES) return false;
+  if (new TextEncoder().encode(body).byteLength > MAX_INLINE_RUN_BODY_BYTES) return false;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return false;
+  }
+  return isRecord(parsed) && USER_DATA_FIELDS.every((field) => parsed[field] === undefined);
+}
 
 export interface QueuePayloadRegistration {
   messageId: string;

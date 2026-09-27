@@ -4,6 +4,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { createCelldWorld } from '../../src/index.js';
 import { parse } from '../../src/vendor/shared/index.js';
 import { RunExpiredError } from '@workflow/errors';
@@ -829,7 +830,16 @@ describe('MinIO single-node queue performance and loss', () => {
       await world.closeStream(streamName, workflowRunId);
       await world.queue(
         `__wkf_workflow_retention_${runId.replaceAll('-', '')}`,
-        { runId: workflowRunId },
+        // User data keeps the body in object storage, where retention must delete it.
+        {
+          runId: workflowRunId,
+          runInput: {
+            input: [`queued-${sequence}`],
+            deploymentId: `retention-perf-${runId}`,
+            workflowName: `retention-perf-${sequence}`,
+            specVersion: SPEC_VERSION_CURRENT,
+          },
+        },
         { delaySeconds: 3_600, idempotencyKey: `retention:${workflowRunId}` },
       );
       const terminalStart = performance.now();

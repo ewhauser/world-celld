@@ -30,7 +30,7 @@ import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import { createRouter } from '../src/worker/router.js';
 import type { DONamespaceLike, WorkerEnv } from '../src/worker/router.js';
 import { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
-import { queueClaimName } from '../src/queue-protocol.js';
+import { queueClaimName, queueOrphanName } from '../src/queue-protocol.js';
 
 const SECRET = 'test-secret';
 
@@ -642,7 +642,11 @@ describe('native Queue bridge', () => {
       queueName: '__wkf_workflow_router_retention_race',
       targetBaseUrl: 'https://app.internal',
       runId: 'wrun_router_retention_race',
-      body: rpcStringify({ runId: 'wrun_router_retention_race' }),
+      // User data keeps the body in object storage.
+      body: rpcStringify({
+        runId: 'wrun_router_retention_race',
+        stepInput: { input: [1] },
+      }),
     };
 
     const sending = router(request('send', [envelope]));
@@ -661,6 +665,71 @@ describe('native Queue bridge', () => {
   it('does not expose the old HTTP delivery operation', async () => {
     const router = createRouter({ WORLD_SECRET: SECRET } as WorkerEnv);
     expect((await router(request('deliver', []))).status).toBe(404);
+  });
+
+  it('keeps a small run body without user data inline and delivers it without object work', async () => {
+    const store = {
+      write: vi.fn<(key: string, value: string) => Promise<void>>(),
+      read: vi.fn<(key: string) => Promise<string | null>>(),
+      delete: vi.fn<(keys: string | string[]) => Promise<void>>(),
+    };
+    const send = vi
+      .fn<
+        (
+          body: string,
+          options?: { contentType?: 'text'; delaySeconds?: number },
+        ) => Promise<unknown>
+      >()
+      .mockResolvedValue(undefined);
+    const env: WorkerEnv = {
+      WORKFLOW_DB: harness.fleet.namespace('runs'),
+      WORKFLOW_STREAMS: harness.fleet.namespace('streams'),
+      WORKFLOW_RUN_CATALOG: harness.fleet.namespace('run-catalog'),
+      WORKFLOW_HOOK_TOKENS: harness.fleet.namespace('hook-tokens'),
+      WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
+      WORKFLOW_QUEUE: { send },
+      WORKFLOW_QUEUE_PAYLOADS: store,
+      WORLD_SECRET: SECRET,
+    };
+    const router = createRouter(env);
+    const envelope = {
+      version: 1 as const,
+      messageId: 'msg_router_inline',
+      queueName: '__wkf_workflow_router_inline',
+      targetBaseUrl: 'https://app.internal/',
+      runId: 'wrun_router_inline',
+      idempotencyKey: 'router-inline-key',
+      body: rpcStringify({ runId: 'wrun_router_inline', stepId: 'step_inline' }),
+    };
+    expect((await router(request('send', [envelope]))).status).toBe(200);
+    const brokerEnvelope = JSON.parse((send.mock.calls[0] as [string])[0]);
+    expect(brokerEnvelope).toMatchObject({ runId: envelope.runId, body: envelope.body });
+    expect(brokerEnvelope).not.toHaveProperty('payloadKey');
+    expect(store.write).not.toHaveBeenCalled();
+    expect(harness.fleet.hasCell('runs', queueOrphanName(envelope.messageId))).toBe(false);
+
+    const callback = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', callback);
+    try {
+      expect(await deliverQueueMessage(env, SECRET, brokerEnvelope, 1)).toEqual({
+        kind: 'complete',
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(callback.mock.calls[0][1]?.body).toBe(envelope.body);
+    expect(store.read).not.toHaveBeenCalled();
+    expect(store.delete).not.toHaveBeenCalled();
+    expect(
+      Array.from(harness.fleet.cell('runs', envelope.runId).storage.data.keys()).filter((key) =>
+        key.startsWith('queue-payload:'),
+      ),
+    ).toEqual([]);
+    expect(
+      harness.fleet
+        .cell('runs', queueClaimName(envelope.queueName, envelope.idempotencyKey))
+        .storage.data.has('queue-reservation'),
+    ).toBe(false);
   });
 
   it('offloads a run payload to object storage, delivers it, and clears claim state', async () => {

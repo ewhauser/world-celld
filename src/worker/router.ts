@@ -44,6 +44,7 @@ import { INDEX_OPERATIONS, type IndexOperation, validateIndexRequest } from './i
 import {
   NATIVE_QUEUE_MAX_MESSAGE_BYTES,
   queueClaimName,
+  isInlineRunBody,
   queueOrphanName,
   queuePayloadObjectKey,
   validateNativeQueueEnvelope,
@@ -413,9 +414,13 @@ export function createRouter(env: WorkerEnv) {
         try {
           const namespace = env.WORKFLOW_DB;
           const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
-          const payloadKey = envelope.runId
-            ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
-            : undefined;
+          // Small bodies without user data stay inline; the rest move to the
+          // fleet bucket so run retention can delete them.
+          const inlineRunBody = envelope.runId !== undefined && isInlineRunBody(envelope.body);
+          const payloadKey =
+            envelope.runId && !inlineRunBody
+              ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
+              : undefined;
           const brokerEnvelope: NativeQueueEnvelope = payloadKey
             ? { ...envelope, payloadKey, body: undefined }
             : envelope;
@@ -431,6 +436,12 @@ export function createRouter(env: WorkerEnv) {
           const now = Date.now();
           const reservationExpiresAt =
             Math.max(now, envelope.notBefore ?? now) + QUEUE_ORPHAN_GRACE_MS;
+          const run = envelope.runId
+            ? (namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub)
+            : undefined;
+          // The read-only expiry check overlaps the reservation.
+          const admission = inlineRunBody ? run?.getQueueAdmission() : undefined;
+          admission?.catch(() => undefined);
           let claim: QueueRunStub | undefined;
           if (envelope.idempotencyKey) {
             claim = namespace.get(
@@ -448,7 +459,15 @@ export function createRouter(env: WorkerEnv) {
             }
           }
 
-          if (envelope.runId && payloadKey) {
+          if (admission) {
+            const admitted = await admission;
+            if (!admitted.ok) {
+              await claim?.completeQueueMessage(envelope.messageId);
+              return errorResponse(410, 'RunExpiredError', admitted.message);
+            }
+          }
+
+          if (run && envelope.runId && payloadKey) {
             if (!payloadStore) {
               return errorResponse(
                 500,
@@ -456,7 +475,6 @@ export function createRouter(env: WorkerEnv) {
                 'missing binding: WORKFLOW_QUEUE_PAYLOADS',
               );
             }
-            const run = namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub;
             const orphanExpiresAt = reservationExpiresAt;
             const registered = await run.registerQueuePayload({
               messageId: envelope.messageId,
