@@ -328,6 +328,9 @@ export class WorkflowRunDO extends DurableObject {
       // An idempotent replay appends nothing; leaving the sequence untouched
       // keeps its transaction read-only, so it skips the durable commit.
       if (eventSequence !== storedSequence) await txn.put(EVENT_SEQUENCE_KEY, eventSequence);
+      // A run created by this version keeps its Queue idempotency claims in
+      // its own cell for its whole life.
+      if (outcome.runCreated) await txn.put(RUN_QUEUE_CLAIM_SCOPE_KEY, 'run');
       const hookReferences: HookIndexReference[] = outcome.hookToIndex
         ? [
             {

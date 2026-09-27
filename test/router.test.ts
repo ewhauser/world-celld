@@ -30,6 +30,10 @@ import { startHarness, type Harness } from '../src/testing/http-harness.js';
 import { createRouter } from '../src/worker/router.js';
 import type { DONamespaceLike, WorkerEnv } from '../src/worker/router.js';
 import { RunCatalogDO } from '../src/worker/durable-objects/RunCatalogDO.js';
+import {
+  RUN_QUEUE_CLAIM_SCOPE_KEY,
+  type WorkflowRunDO,
+} from '../src/worker/durable-objects/WorkflowRunDO.js';
 import { queueClaimName, queueOrphanName } from '../src/queue-protocol.js';
 
 const SECRET = 'test-secret';
@@ -548,6 +552,18 @@ describe('router auth and shape', () => {
   });
 });
 
+function keyedRunEnvelope(runId: string, messageId: string, key: string) {
+  return {
+    version: 1 as const,
+    messageId,
+    queueName: '__wkf_workflow_run_claims',
+    targetBaseUrl: 'https://app.internal/',
+    runId,
+    idempotencyKey: key,
+    body: rpcStringify({ runId, stepId: key }),
+  };
+}
+
 describe('native Queue bridge', () => {
   const request = (operation: 'send' | 'deliver', args: unknown[]) =>
     new Request(`https://world.internal/v1/queue/${operation}`, {
@@ -558,6 +574,95 @@ describe('native Queue bridge', () => {
       },
       body: rpcStringify(args),
     });
+
+  describe('run-scoped idempotency claims', () => {
+    function queueEnv(send: WorkerEnv['WORKFLOW_QUEUE']['send']): WorkerEnv {
+      return {
+        WORKFLOW_DB: harness.fleet.namespace('runs'),
+        WORKFLOW_STREAMS: harness.fleet.namespace('streams'),
+        WORKFLOW_RUN_CATALOG: harness.fleet.namespace('run-catalog'),
+        WORKFLOW_HOOK_TOKENS: harness.fleet.namespace('hook-tokens'),
+        WORKFLOW_HOOK_IDS: harness.fleet.namespace('hook-ids'),
+        WORKFLOW_QUEUE: { send },
+        WORLD_SECRET: SECRET,
+      };
+    }
+    async function createRun(workflowName: string): Promise<string> {
+      const remote = createRemoteEnv({ fleetUrl: harness.url, secret: SECRET });
+      const storage = createStorage({
+        env: { WORKFLOW_DB: remote.WORKFLOW_DB, WORKFLOW_INDEX: remote.WORKFLOW_INDEX },
+        deploymentId: 'wire-run-claims',
+      });
+      const created = await storage.events.create(null, {
+        eventType: 'run_created',
+        eventData: { deploymentId: 'wire-run-claims', workflowName, input: [] },
+      });
+      return created.run.runId;
+    }
+    it('reserves, deduplicates, and completes in the run cell of a new run', async () => {
+      const runId = await createRun('wire-run-scoped');
+      const runCell = harness.fleet.cell('runs', runId);
+      expect(runCell.storage.data.get(RUN_QUEUE_CLAIM_SCOPE_KEY)).toBe('run');
+
+      const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
+      const env = queueEnv(send);
+      const router = createRouter(env);
+      const first = keyedRunEnvelope(runId, 'msg_run_scoped_first', 'step-run-scoped');
+      const duplicate = keyedRunEnvelope(runId, 'msg_run_scoped_second', 'step-run-scoped');
+      const claimName = queueClaimName(first.queueName, first.idempotencyKey);
+
+      expect(await (await router(request('send', [first]))).text()).toContain(first.messageId);
+      const duplicateResponse = await router(request('send', [duplicate]));
+      expect(rpcParse(await duplicateResponse.text())).toEqual({ messageId: first.messageId });
+      expect(send).toHaveBeenCalledOnce();
+      const brokerEnvelope = JSON.parse((send.mock.calls[0] as [string])[0]);
+      expect(brokerEnvelope).toMatchObject({ claimScope: 'run', runId });
+      expect(harness.fleet.hasCell('runs', claimName)).toBe(false);
+
+      const callback = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+      vi.stubGlobal('fetch', callback);
+      try {
+        expect(await deliverQueueMessage(env, SECRET, brokerEnvelope, 1)).toEqual({
+          kind: 'complete',
+        });
+      } finally {
+        vi.unstubAllGlobals();
+      }
+      expect(callback).toHaveBeenCalledOnce();
+      expect(harness.fleet.hasCell('runs', claimName)).toBe(false);
+      expect(
+        Array.from(runCell.storage.data.keys()).filter((key) => key.startsWith('queue-claim:')),
+      ).toEqual([]);
+    });
+
+    it('keeps claim cells for a run created before run-scoped claims and remembers it', async () => {
+      const runId = await createRun('wire-cell-scoped');
+      const runCell = harness.fleet.cell('runs', runId);
+      runCell.storage.data.delete(RUN_QUEUE_CLAIM_SCOPE_KEY);
+      const instance = runCell.instance as WorkflowRunDO;
+      const reserveRun = vi.spyOn(instance, 'reserveRunQueueMessage');
+
+      const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
+      const router = createRouter(queueEnv(send));
+      const first = keyedRunEnvelope(runId, 'msg_cell_scoped_first', 'step-cell-first');
+      const second = keyedRunEnvelope(runId, 'msg_cell_scoped_second', 'step-cell-second');
+      expect((await router(request('send', [first]))).status).toBe(200);
+      expect((await router(request('send', [second]))).status).toBe(200);
+
+      expect(reserveRun).toHaveBeenCalledTimes(1);
+      for (const [index, message] of [first, second].entries()) {
+        const brokerEnvelope = JSON.parse((send.mock.calls[index] as [string])[0]);
+        expect(brokerEnvelope).not.toHaveProperty('claimScope');
+        const claimName = queueClaimName(message.queueName, message.idempotencyKey);
+        expect(
+          harness.fleet.cell('runs', claimName).storage.data.get('queue-reservation'),
+        ).toMatchObject({ messageId: message.messageId });
+      }
+      expect(
+        Array.from(runCell.storage.data.keys()).filter((key) => key.startsWith('queue-claim:')),
+      ).toEqual([]);
+    });
+  });
 
   it('reserves an idempotency key before publishing a native message', async () => {
     const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
