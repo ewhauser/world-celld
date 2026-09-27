@@ -46,10 +46,25 @@ export interface NativeQueueEnvelope {
   body?: string;
   /** Absolute workflow redelivery deadline; long waits are chained by the consumer. */
   notBefore?: number;
+  /**
+   * Where the idempotency claim lives. Absent: the claim cell named by queue
+   * and key. `run`: an entry in the run's own cell (requires `runId`).
+   */
+  claimScope?: 'run';
   /** Failed deliveries carried across suspension re-publishes. */
   deliveryFailures?: number;
   suspensionCount?: number;
 }
+
+/**
+ * Enqueue-side answer from a run cell. `cell`: the run predates run-scoped
+ * claims, so its idempotency claims stay in claim cells. `run`: the
+ * reservation was made in the run's own cell.
+ */
+export type RunQueueReservation =
+  | { ok: false; message: string }
+  | { ok: true; scope: 'cell' }
+  | { ok: true; scope: 'run'; admitted: boolean; messageId: string };
 
 export interface NativeQueueSendOptions {
   delaySeconds?: number;
@@ -93,6 +108,9 @@ export function validateNativeQueueEnvelope(value: unknown): NativeQueueEnvelope
     if (value[field] !== undefined && typeof value[field] !== 'string') {
       throw new TypeError(`world-celld native queue envelope ${field} must be a string`);
     }
+  }
+  if (value.claimScope !== undefined && (value.claimScope !== 'run' || value.runId === undefined)) {
+    throw new TypeError("world-celld native queue envelope claimScope must be 'run' with a runId");
   }
   if ((value.payloadKey === undefined) === (value.body === undefined)) {
     throw new TypeError(

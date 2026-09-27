@@ -51,6 +51,7 @@ import {
   type NativeQueueEnvelope,
   type QueuePayloadOrphan,
   type QueuePayloadRegistration,
+  type RunQueueReservation,
 } from '../queue-protocol.js';
 import type { QueuePayloadStore } from './queue-payload-store.js';
 
@@ -92,6 +93,25 @@ export interface QueueRunStub {
     reservationExpiresAt?: number;
   }): Promise<{ held: boolean }>;
   releaseInflight(messageId?: string): Promise<void>;
+  reserveRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    expiresAt: number;
+  }): Promise<RunQueueReservation>;
+  claimRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    staleMs: number;
+  }): Promise<{ expired: true } | { expired: false; claimed: boolean; retryAt?: number }>;
+  holdRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    retryAt: number;
+    expiresAt: number;
+    reservationExpiresAt?: number;
+  }): Promise<{ held: boolean }>;
+  releaseRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void>;
+  completeRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void>;
 }
 
 export interface WorkerEnv {

@@ -229,6 +229,20 @@ describe('terminal workflow retention', () => {
       ok: false,
       message: expect.stringContaining(runId),
     });
+    await expect(
+      run().reserveRunQueueMessage({
+        claimName: 'claim:1:q:expired',
+        messageId: 'msg_expired',
+        expiresAt: harness.fleet.now + 1_000,
+      }),
+    ).resolves.toMatchObject({ ok: false, message: expect.stringContaining(runId) });
+    await expect(
+      run().claimRunQueueMessage({
+        claimName: 'claim:1:q:expired',
+        messageId: 'msg_expired',
+        staleMs: 1_000,
+      }),
+    ).resolves.toEqual({ expired: true });
   });
 
   it('purges payloads, indexes, streams, and queued work without allowing resurrection', async () => {

@@ -54,6 +54,7 @@ import {
   queuePayloadRegistryKey,
   type QueuePayloadOrphan,
   type QueuePayloadRegistration,
+  type RunQueueReservation,
 } from '../../queue-protocol.js';
 import {
   deleteQueuePayloadObjects,
@@ -109,6 +110,14 @@ const CLEANUP_RETRY_MAX_MS = 60 * 60 * 1000;
 const MAX_DATE_MS = 8_640_000_000_000_000;
 const QUEUE_ORPHAN_KEY = 'queue-orphan';
 const QUEUE_RESERVATION_KEY = 'queue-reservation';
+/** Run-scoped Queue idempotency state, one key per claim name, in the run's own cell. */
+const RUN_QUEUE_CLAIM_PREFIX = 'queue-claim:';
+/**
+ * Present when every idempotency claim of this run lives in the run's own
+ * cell. Written only when the run is created, so a run keeps one claim scope
+ * for its whole life and claims made before the marker existed stay valid.
+ */
+export const RUN_QUEUE_CLAIM_SCOPE_KEY = 'queue-claim-scope';
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
 
 function validateCleanupRequest(request: unknown, allowDisabled: boolean): ScheduleCleanupRequest {
@@ -197,6 +206,24 @@ interface InflightClaim {
 }
 
 type QueueMessageReservation = InflightClaim;
+
+/**
+ * Run-scoped equivalent of a claim cell's reservation and in-flight claim.
+ * Expiry is checked on read, so no alarm is needed; completion deletes the
+ * entry and run retention deletes any left behind.
+ */
+interface RunQueueClaimState {
+  reservation?: QueueMessageReservation;
+  claim?: InflightClaim;
+}
+
+function runQueueClaimKey(claimName: string): string {
+  return `${RUN_QUEUE_CLAIM_PREFIX}${claimName}`;
+}
+
+function validRunQueueClaimName(claimName: unknown): claimName is string {
+  return typeof claimName === 'string' && claimName.startsWith('claim:');
+}
 
 interface QueuePayloadOrphanState extends QueuePayloadOrphan {
   generation: number;
@@ -1199,6 +1226,177 @@ export class WorkflowRunDO extends DurableObject {
           message: `Workflow run "${tombstone.runId}" expired at ${tombstone.expiredAt.toISOString()}`,
         }
       : { ok: true };
+  }
+
+  /**
+   * Enqueue-side admission and idempotency reservation in one transaction,
+   * for a run-scoped claim. Replaces a separate claim cell's reservation plus
+   * the run expiry check.
+   */
+  async reserveRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    expiresAt: number;
+  }): Promise<RunQueueReservation> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.expiresAt)
+    ) {
+      throw new TypeError('world-celld run queue reservation is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const values = await txn.get<RunTombstone | CleanupRecord | RunQueueClaimState | string>([
+        TOMBSTONE_KEY,
+        CLEANUP_RECORD_KEY,
+        RUN_QUEUE_CLAIM_SCOPE_KEY,
+        key,
+      ]);
+      const tombstone = this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>);
+      if (tombstone) {
+        return {
+          ok: false,
+          message: `Workflow run "${tombstone.runId}" expired at ${tombstone.expiredAt.toISOString()}`,
+        };
+      }
+      // A run created before run-scoped claims keeps its claims in claim cells.
+      if (values.get(RUN_QUEUE_CLAIM_SCOPE_KEY) !== 'run') return { ok: true, scope: 'cell' };
+      const state = (values.get(key) as RunQueueClaimState | undefined) ?? {};
+      const existing = state.reservation;
+      if (existing && existing.expiresAt > this.now() && existing.messageId !== params.messageId) {
+        return { ok: true, scope: 'run', admitted: false, messageId: existing.messageId };
+      }
+      await txn.put<RunQueueClaimState>(key, {
+        ...state,
+        reservation: {
+          messageId: params.messageId,
+          expiresAt: Math.max(existing?.expiresAt ?? 0, params.expiresAt),
+        },
+      });
+      return { ok: true, scope: 'run', admitted: true, messageId: params.messageId };
+    });
+  }
+
+  /** Delivery-side run expiry check and in-flight claim in one transaction. */
+  async claimRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    staleMs: number;
+  }): Promise<{ expired: true } | { expired: false; claimed: boolean; retryAt?: number }> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isPositiveSafeInteger(params.staleMs)
+    ) {
+      throw new TypeError('world-celld run queue claim is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const values = await txn.get<RunTombstone | CleanupRecord | RunQueueClaimState>([
+        TOMBSTONE_KEY,
+        CLEANUP_RECORD_KEY,
+        key,
+      ]);
+      if (this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>)) {
+        return { expired: true };
+      }
+      const state = (values.get(key) as RunQueueClaimState | undefined) ?? {};
+      const existing = state.claim;
+      const now = this.now();
+      if (existing && existing.expiresAt > now) {
+        if (existing.messageId !== params.messageId) return { expired: false, claimed: false };
+        if (existing.retryAt === undefined || existing.retryAt > now) {
+          return {
+            expired: false,
+            claimed: false,
+            retryAt: existing.retryAt ?? existing.expiresAt,
+          };
+        }
+      }
+      await txn.put<RunQueueClaimState>(key, {
+        ...state,
+        claim: { messageId: params.messageId, expiresAt: now + params.staleMs },
+      });
+      return { expired: false, claimed: true };
+    });
+  }
+
+  async holdRunQueueMessage(params: {
+    claimName: string;
+    messageId: string;
+    retryAt: number;
+    expiresAt: number;
+    reservationExpiresAt?: number;
+  }): Promise<{ held: boolean }> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.retryAt) ||
+      !isNonNegativeSafeInteger(params.expiresAt) ||
+      (params.reservationExpiresAt !== undefined &&
+        !isNonNegativeSafeInteger(params.reservationExpiresAt))
+    ) {
+      throw new TypeError('world-celld run queue claim hold is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = (await txn.get<RunQueueClaimState>(key)) ?? {};
+      const existing = state.claim;
+      if (!existing || existing.messageId !== params.messageId) return { held: false };
+      const next: RunQueueClaimState = {
+        ...state,
+        claim: {
+          ...existing,
+          retryAt: params.retryAt,
+          expiresAt: Math.max(existing.expiresAt, params.expiresAt),
+        },
+      };
+      if (
+        state.reservation?.messageId === params.messageId &&
+        params.reservationExpiresAt !== undefined &&
+        params.reservationExpiresAt > state.reservation.expiresAt
+      ) {
+        next.reservation = { ...state.reservation, expiresAt: params.reservationExpiresAt };
+      }
+      await txn.put<RunQueueClaimState>(key, next);
+      return { held: true };
+    });
+  }
+
+  async releaseRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void> {
+    if (!validRunQueueClaimName(params?.claimName) || typeof params.messageId !== 'string') {
+      throw new TypeError('world-celld run queue claim release is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = await txn.get<RunQueueClaimState>(key);
+      if (state?.claim?.messageId !== params.messageId) return;
+      const { claim: _released, ...rest } = state;
+      if (rest.reservation) await txn.put<RunQueueClaimState>(key, rest);
+      else await txn.delete(key);
+    });
+  }
+
+  async completeRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void> {
+    if (!validRunQueueClaimName(params?.claimName) || typeof params.messageId !== 'string') {
+      throw new TypeError('world-celld run queue completion is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = await txn.get<RunQueueClaimState>(key);
+      if (!state) return;
+      const next: RunQueueClaimState = {};
+      if (state.reservation && state.reservation.messageId !== params.messageId) {
+        next.reservation = state.reservation;
+      }
+      if (state.claim && state.claim.messageId !== params.messageId) next.claim = state.claim;
+      if (next.reservation || next.claim) await txn.put<RunQueueClaimState>(key, next);
+      else await txn.delete(key);
+    });
   }
 
   async registerQueuePayload(
