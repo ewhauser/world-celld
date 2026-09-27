@@ -53,6 +53,8 @@ const MAX_EXPIRE_CHUNK_LIMIT = 64;
 const DEFAULT_EXPIRE_BYTE_LIMIT = 16 * 1024 * 1024;
 const MAX_EXPIRE_BYTE_LIMIT = DEFAULT_EXPIRE_BYTE_LIMIT;
 const MAX_STREAM_INDEX = 0x7fffffff;
+/** One storage get or put call accepts at most 128 keys. */
+const STORAGE_BATCH_KEYS = 128;
 
 function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
   if (value === undefined || !Number.isFinite(value)) return fallback;
@@ -165,6 +167,20 @@ export class StreamDO extends DurableObject {
   private changeVersion = 0;
   private readonly waiters = new Set<StreamWaiter>();
 
+  /** Multi-key read split into calls within the per-call key limit. */
+  private async getMany<T>(keys: string[]): Promise<Map<string, T>> {
+    if (keys.length <= STORAGE_BATCH_KEYS) return await this.ctx.storage.get<T>(keys);
+    const groups: string[][] = [];
+    for (let offset = 0; offset < keys.length; offset += STORAGE_BATCH_KEYS) {
+      groups.push(keys.slice(offset, offset + STORAGE_BATCH_KEYS));
+    }
+    const merged = new Map<string, T>();
+    for (const result of await Promise.all(groups.map((group) => this.ctx.storage.get<T>(group)))) {
+      for (const [key, value] of result) merged.set(key, value);
+    }
+    return merged;
+  }
+
   private async getMeta(): Promise<StreamMeta> {
     if (this.meta) return this.meta;
     this.metaLoad ??= this.ctx.storage.get<StreamMeta>(META_KEY).then((meta) => {
@@ -268,7 +284,7 @@ export class StreamDO extends DurableObject {
     if (available > 0) {
       const indexes = Array.from({ length: available }, (_, offset) => request.startIndex + offset);
       const sizeKeys = indexes.map(chunkSizeKey);
-      const storedSizes = await this.ctx.storage.get<number>(sizeKeys);
+      const storedSizes = await this.getMany<number>(sizeKeys);
       const selectedIndexes: number[] = [];
       const selectedSizes: number[] = [];
       let bytes = 0;
@@ -281,7 +297,7 @@ export class StreamDO extends DurableObject {
       }
 
       const payloadKeys = selectedIndexes.map(chunkKey);
-      const storedChunks = await this.ctx.storage.get<Uint8Array>(payloadKeys);
+      const storedChunks = await this.getMany<Uint8Array>(payloadKeys);
       for (let offset = 0; offset < payloadKeys.length; offset++) {
         const chunk = storedChunks.get(payloadKeys[offset]);
         if (!(chunk instanceof Uint8Array) || chunk.byteLength !== selectedSizes[offset]) {
@@ -319,13 +335,16 @@ export class StreamDO extends DurableObject {
           state: 'open',
           ownerRunId: runId,
         };
-        const entries: Record<string, StreamMeta | Uint8Array | number> = { [META_KEY]: nextMeta };
+        const entries: Array<[string, StreamMeta | Uint8Array | number]> = [[META_KEY, nextMeta]];
         for (let offset = 0; offset < storedChunks.length; offset++) {
           const index = startIndex + offset;
-          entries[chunkKey(index)] = storedChunks[offset];
-          entries[chunkSizeKey(index)] = storedChunks[offset].byteLength;
+          entries.push([chunkKey(index), storedChunks[offset]]);
+          entries.push([chunkSizeKey(index), storedChunks[offset].byteLength]);
         }
-        await txn.put(entries);
+        // One transaction, written in groups within the per-call key limit.
+        for (let offset = 0; offset < entries.length; offset += STORAGE_BATCH_KEYS) {
+          await txn.put(Object.fromEntries(entries.slice(offset, offset + STORAGE_BATCH_KEYS)));
+        }
         return {
           meta: nextMeta,
           result: {

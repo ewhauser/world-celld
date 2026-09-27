@@ -166,6 +166,10 @@ describe('MinIO single-node queue performance and loss', () => {
   const retentionMs = positiveInteger('PERF_RUN_RETENTION_MS', 1_000);
   const retentionResultPath =
     process.env.PERF_RETENTION_RESULT_PATH ?? '.perf-results/minio-retention-latest.json';
+  const streamChunkCount = positiveInteger('PERF_STREAM_CHUNKS', 1000);
+  const streamChunkBytes = positiveInteger('PERF_STREAM_CHUNK_BYTES', 32);
+  const streamResultPath =
+    process.env.PERF_STREAM_RESULT_PATH ?? '.perf-results/minio-stream-latest.json';
   const workflowRuns = positiveInteger('PERF_WORKFLOW_RUNS', 25);
   const workflowConcurrency = positiveInteger('PERF_WORKFLOW_CONCURRENCY', 8);
   const workflowResultPath =
@@ -693,6 +697,89 @@ describe('MinIO single-node queue performance and loss', () => {
       expect(mismatched).toEqual([]);
     } finally {
       clearInterval(sampler);
+    }
+  });
+
+  it('measures bulk stream writes and replay through the real fleet', async () => {
+    const world = createCelldWorld({
+      fleetUrl,
+      secret,
+      baseUrl: process.env.CELLD_CALLBACK_BASE_URL,
+      deploymentId: `perf-stream-${runId}`,
+      rpcTimeoutMs: timeoutMs,
+    });
+    const created = await world.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId: `perf-stream-${runId}`, workflowName: 'perf-stream', input: [] },
+    });
+    const streamRunId = created.run.runId;
+    const streamName = `perf-bulk-${streamRunId}`;
+    const chunks = Array.from({ length: streamChunkCount }, (_, index) =>
+      new Uint8Array(streamChunkBytes).fill(index % 251),
+    );
+
+    let streamRequests = 0;
+    const fetchBefore = globalThis.fetch;
+    globalThis.fetch = async (input, init) => {
+      const url = input instanceof Request ? input.url : String(input);
+      if (new URL(url).pathname.startsWith('/v1/streams/')) streamRequests++;
+      return await fetchBefore(input, init);
+    };
+    const phase = async (action: () => Promise<void>) => {
+      streamRequests = 0;
+      const began = performance.now();
+      await action();
+      return { ms: Number((performance.now() - began).toFixed(2)), requests: streamRequests };
+    };
+    try {
+      // Registers the stream so the timed write measures only data requests.
+      await world.streams.write(streamRunId, streamName, new Uint8Array([0]));
+      const write = await phase(() => world.streams.writeMulti(streamRunId, streamName, chunks));
+      await world.streams.close(streamRunId, streamName);
+
+      let paged = 0;
+      const page = await phase(async () => {
+        let cursor: string | undefined;
+        for (;;) {
+          const result = await world.streams.getChunks(streamRunId, streamName, {
+            limit: 1000,
+            cursor,
+          });
+          paged += result.data.length;
+          if (!result.hasMore) break;
+          cursor = result.cursor ?? undefined;
+        }
+      });
+
+      let replayed = 0;
+      const replay = await phase(async () => {
+        const reader = (await world.streams.get(streamRunId, streamName)).getReader();
+        for (;;) {
+          const { done } = await reader.read();
+          if (done) break;
+          replayed++;
+        }
+      });
+
+      const result = {
+        schemaVersion: 1,
+        recordedAt: new Date().toISOString(),
+        backend: { name: 'minio', celldVersion: process.env.PERF_CELLD_VERSION ?? 'unknown' },
+        workload: { chunks: streamChunkCount, chunkBytes: streamChunkBytes },
+        correctness: { paged, replayed },
+        performance: {
+          write: { ...write, chunksPerSecond: rate(streamChunkCount, write.ms) },
+          page: { ...page, chunksPerSecond: rate(paged, page.ms) },
+          replay: { ...replay, chunksPerSecond: rate(replayed, replay.ms) },
+        },
+      };
+      await mkdir(path.dirname(streamResultPath), { recursive: true });
+      await writeFile(streamResultPath, `${JSON.stringify(result, null, 2)}\n`);
+      console.log(`\nworld-celld MinIO stream result\n${JSON.stringify(result, null, 2)}`);
+      expect(paged).toBe(streamChunkCount + 1);
+      expect(replayed).toBe(streamChunkCount + 1);
+    } finally {
+      globalThis.fetch = fetchBefore;
     }
   });
 

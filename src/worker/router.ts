@@ -29,8 +29,9 @@ import {
   MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_LONG_POLL_MS,
   MAX_STREAM_READ_BYTES,
-  MAX_STREAM_READ_CHUNKS,
+  NEGOTIATED_STREAM_CHUNKS,
   STREAM_BATCH_CONTENT_TYPE,
+  STREAM_CHUNK_LIMIT_HEADER,
   decodeStreamWriteBatch,
   encodeStreamReadResult,
   encodeStreamWriteResult,
@@ -196,7 +197,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
 
 /** Request body cap: oversize payloads get a clear 413 instead of an OOM. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
-const MAX_STREAM_WRITE_BODY_BYTES = MAX_STREAM_BATCH_BYTES + 1024;
+const MAX_STREAM_WRITE_BODY_BYTES = MAX_STREAM_BATCH_BYTES + 4 * NEGOTIATED_STREAM_CHUNKS + 1024;
 const QUEUE_ORPHAN_GRACE_MS = 5 * 24 * 60 * 60 * 1000;
 
 function errorResponse(status: number, name: string, message: string): Response {
@@ -332,7 +333,10 @@ function parseBoundedInteger(url: URL, name: string, minimum: number, maximum: n
 function streamResponse(body: Uint8Array): Response {
   return new Response(body, {
     status: 200,
-    headers: { 'content-type': STREAM_BATCH_CONTENT_TYPE },
+    headers: {
+      'content-type': STREAM_BATCH_CONTENT_TYPE,
+      [STREAM_CHUNK_LIMIT_HEADER]: String(NEGOTIATED_STREAM_CHUNKS),
+    },
   });
 }
 
@@ -659,7 +663,7 @@ export function createRouter(env: WorkerEnv) {
           const readRequest = {
             runId,
             startIndex: parseBoundedInteger(url, 'startIndex', 0, 0x7fffffff),
-            maxChunks: parseBoundedInteger(url, 'maxChunks', 0, MAX_STREAM_READ_CHUNKS),
+            maxChunks: parseBoundedInteger(url, 'maxChunks', 0, NEGOTIATED_STREAM_CHUNKS),
             maxBytes: parseBoundedInteger(
               url,
               'maxBytes',

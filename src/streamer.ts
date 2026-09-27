@@ -17,6 +17,7 @@ import {
   MAX_STREAM_READ_BYTES,
   MAX_STREAM_READ_CHUNKS,
   MAX_STREAM_WRITE_CHUNKS,
+  isChunkLimitRejection,
   normalizeStreamError,
   type StreamErrorData,
   type StreamReadRequest,
@@ -70,6 +71,13 @@ export interface CelldStreamer extends Omit<Streamer, 'streams'> {
 
 /** Direct StreamDO RPC surface. Remote stubs specialize read/write as binary HTTP. */
 export interface StreamDOStub {
+  /**
+   * Remote stubs only: the per-request chunk limit the fleet has advertised.
+   * Stubs without it are held to the baseline every worker accepts.
+   */
+  streamChunkLimit?(): number;
+  /** Remote stubs only: drop an advertised limit an older worker rejected. */
+  resetStreamChunkLimit?(): void;
   writeChunks(runId: string, chunks: Uint8Array[]): Promise<StreamWriteResult>;
   readChunks(request: StreamReadRequest, signal?: AbortSignal): Promise<StreamReadResult>;
   closeStream(runId: string): Promise<void>;
@@ -170,22 +178,34 @@ export function createStreamer(config: CelldStreamerConfig): CelldStreamer {
     }
     await registerStreamForRun(name, resolvedRunId);
 
-    let batch: Uint8Array[] = [];
-    let batchBytes = 0;
-    for (const chunk of chunks) {
-      if (
-        batch.length > 0 &&
-        (batch.length === MAX_STREAM_WRITE_CHUNKS ||
-          batchBytes + chunk.byteLength > MAX_STREAM_BATCH_BYTES)
+    const stub = getStreamDO(name);
+    let next = 0;
+    while (next < chunks.length) {
+      // Re-read per batch: the first response may advertise a larger limit.
+      const chunkLimit = stub.streamChunkLimit?.() ?? MAX_STREAM_WRITE_CHUNKS;
+      let end = next;
+      let batchBytes = 0;
+      while (
+        end < chunks.length &&
+        end - next < chunkLimit &&
+        (end === next || batchBytes + chunks[end].byteLength <= MAX_STREAM_BATCH_BYTES)
       ) {
-        await getStreamDO(name).writeChunks(resolvedRunId, batch);
-        batch = [];
-        batchBytes = 0;
+        batchBytes += chunks[end].byteLength;
+        end++;
       }
-      batch.push(chunk);
-      batchBytes += chunk.byteLength;
+      const batch = chunks.slice(next, end);
+      try {
+        await stub.writeChunks(resolvedRunId, batch);
+      } catch (error) {
+        // An older worker rejects the batch before writing anything.
+        if (batch.length > MAX_STREAM_WRITE_CHUNKS && isChunkLimitRejection(error)) {
+          stub.resetStreamChunkLimit?.();
+          continue;
+        }
+        throw error;
+      }
+      next = end;
     }
-    if (batch.length > 0) await getStreamDO(name).writeChunks(resolvedRunId, batch);
   };
 
   const writeToStream = (
@@ -245,7 +265,7 @@ export function createStreamer(config: CelldStreamerConfig): CelldStreamer {
               {
                 runId,
                 startIndex: nextIndex,
-                maxChunks: MAX_STREAM_READ_CHUNKS,
+                maxChunks: stub.streamChunkLimit?.() ?? MAX_STREAM_READ_CHUNKS,
                 maxBytes: MAX_STREAM_READ_BYTES,
                 waitMs: streamLongPollMs,
               },
@@ -290,13 +310,14 @@ export function createStreamer(config: CelldStreamerConfig): CelldStreamer {
     if (!Number.isSafeInteger(requestedLimit) || requestedLimit < 1) {
       throw new Error('Stream chunk limit must be a positive safe integer');
     }
-    const limit = Math.min(requestedLimit, MAX_CHUNK_PAGE_SIZE);
+    const stub = getStreamDO(name);
+    const limit = Math.min(requestedLimit, stub.streamChunkLimit?.() ?? MAX_CHUNK_PAGE_SIZE);
     const startIndex = options?.cursor ? Number.parseInt(options.cursor, 10) : 0;
     if (Number.isNaN(startIndex) || startIndex < 0) {
       throw new Error(`Invalid stream cursor: ${options?.cursor}`);
     }
 
-    const result = await getStreamDO(name).readChunks({
+    const result = await stub.readChunks({
       runId,
       startIndex,
       maxChunks: limit,
