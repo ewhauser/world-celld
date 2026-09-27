@@ -1828,15 +1828,21 @@ describe('full stack: vendored storage over the wire', () => {
     expect(calls[1].body).toBeInstanceOf(Uint8Array);
     expect(decodeStreamWriteBatch(calls[1].body!)).toEqual(chunks);
 
+    // A new stream stores the batch as one tightly packed segment row.
     const streamStorage = harness.fleet.cell('streams', `stream:${name}`).storage;
-    const storedPayloads = Array.from(streamStorage.data.entries())
-      .filter(([key]) => key.startsWith('chunk:'))
+    const storedSegments = Array.from(streamStorage.data.entries())
+      .filter(([key]) => key.startsWith('seg:'))
       .map(([, value]) => value as Uint8Array);
-    expect(storedPayloads).toHaveLength(MAX_STREAM_WRITE_CHUNKS);
-    for (const chunk of storedPayloads) {
-      expect(chunk.byteOffset).toBe(0);
-      expect(chunk.buffer.byteLength).toBe(chunk.byteLength);
-    }
+    expect(storedSegments).toHaveLength(1);
+    expect(storedSegments[0].byteOffset).toBe(0);
+    expect(storedSegments[0].buffer.byteLength).toBe(storedSegments[0].byteLength);
+    expect(streamStorage.data.get('segsize:000000000000')).toEqual({
+      count: MAX_STREAM_WRITE_CHUNKS,
+      bytes: 3 * MAX_STREAM_WRITE_CHUNKS,
+    });
+    expect(Array.from(streamStorage.data.keys()).filter((key) => key.startsWith('chunk'))).toEqual(
+      [],
+    );
 
     calls.length = 0;
     streamStorage.resetOperationCounts();
@@ -1860,10 +1866,11 @@ describe('full stack: vendored storage over the wire', () => {
     expect(page.data.map((chunk) => Array.from(chunk.data))).toEqual(
       chunks.map((chunk) => Array.from(chunk)),
     );
+    // One segment size-row list plus one segment multi-get.
     expect(streamStorage.operationCounts).toMatchObject({
       get: 0,
-      getMany: 2,
-      list: 0,
+      getMany: 1,
+      list: 1,
     });
   });
 

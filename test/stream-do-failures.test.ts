@@ -13,10 +13,17 @@ const META_KEY = 'meta';
 const CHUNK_KEY = 'chunk:000000000000';
 const CHUNK_SIZE_KEY = 'chunk-size:000000000000';
 
-function setup(name = 'stream:failure') {
+/**
+ * These cases exercise the per-chunk row layout, which new streams no longer
+ * use: seed the metadata a stream created before segment rows carries.
+ */
+function setup(name = 'stream:failure', options: { existingPerChunkStream?: boolean } = {}) {
   const fleet = new FakeFleet({ streams: StreamDO as never });
   const get = () => fleet.namespace('streams').get({ toString: () => name }) as StreamDO;
   const storage = fleet.cell('streams', name).storage;
+  if (options.existingPerChunkStream ?? true) {
+    storage.data.set(META_KEY, { count: 0, state: 'open' });
+  }
   return { fleet, get, name, storage };
 }
 
@@ -37,7 +44,7 @@ function snapshot(storage: FakeStorage): Map<string, unknown> {
 
 describe('StreamDO persisted-state failure handling', () => {
   it('treats absent metadata as a never-written stream without persisting partial state', async () => {
-    const { get, storage } = setup();
+    const { get, storage } = setup('stream:failure', { existingPerChunkStream: false });
 
     await expect(get().readChunks(readRequest())).resolves.toMatchObject({
       chunks: [],
@@ -62,6 +69,7 @@ describe('StreamDO persisted-state failure handling', () => {
       ['invalid state', { count: 0, state: 'unknown' }],
       ['invalid owner', { count: 0, state: 'open', ownerRunId: 42 }],
       ['non-boolean payloadDeleted', { count: 0, state: 'expired', payloadDeleted: 'true' }],
+      ['unknown layout', { count: 0, state: 'open', layout: 3 }],
     ];
 
     for (const [label, invalid] of invalidMetadata) {
@@ -427,6 +435,7 @@ describe('StreamDO persisted-state failure handling', () => {
 
   it('rolls back failed transactional reads and writes, then retries at offset zero', async () => {
     const readFailure = setup('stream:transaction-read-failure');
+    const readBefore = snapshot(readFailure.storage);
     readFailure.storage.failNextRead(
       (read) => read.operation === 'get' && read.keys?.[0] === META_KEY,
       new Error('injected transaction read failure'),
@@ -435,13 +444,14 @@ describe('StreamDO persisted-state failure handling', () => {
     await expect(readFailure.get().writeChunks(RUN_ID, [Uint8Array.of(1)])).rejects.toThrow(
       'injected transaction read failure',
     );
-    expect(readFailure.storage.data).toEqual(new Map());
+    expect(readFailure.storage.data).toEqual(readBefore);
     await expect(readFailure.get().writeChunks(RUN_ID, [Uint8Array.of(1)])).resolves.toMatchObject({
       startIndex: 0,
       tailIndex: 0,
     });
 
     const writeFailure = setup('stream:transaction-write-failure');
+    const writeBefore = snapshot(writeFailure.storage);
     writeFailure.storage.failNextMutation(
       (mutation) => mutation.operation === 'put' && mutation.key === CHUNK_SIZE_KEY,
       new Error('injected transaction write failure'),
@@ -450,7 +460,7 @@ describe('StreamDO persisted-state failure handling', () => {
     await expect(writeFailure.get().writeChunks(RUN_ID, [Uint8Array.of(1)])).rejects.toThrow(
       'injected transaction write failure',
     );
-    expect(writeFailure.storage.data).toEqual(new Map());
+    expect(writeFailure.storage.data).toEqual(writeBefore);
     await expect(writeFailure.get().writeChunks(RUN_ID, [Uint8Array.of(1)])).resolves.toMatchObject(
       { startIndex: 0, tailIndex: 0 },
     );

@@ -177,8 +177,34 @@ describe('StreamDO segment layout', () => {
     expect(keys('seg')).toEqual([]);
   });
 
-  it('keeps writing per-chunk rows for a stream created without the segment layout', async () => {
+  it('creates new streams in segment layout', async () => {
     const fleet = new FakeFleet({ streams: StreamDO as never });
+    const stream = fleet.namespace('streams').get({ toString: () => 'stream:new' }) as StreamDO;
+    await stream.writeChunks(RUN_ID, [chunk(0), chunk(1)]);
+    const storage = fleet.cell('streams', 'stream:new').storage;
+    expect(storage.data.get('meta')).toMatchObject({ count: 2, layout: 2 });
+    expect(Array.from(storage.data.keys()).toSorted()).toEqual([
+      'meta',
+      'seg:000000000000',
+      'segsize:000000000000',
+    ]);
+  });
+
+  it('reads a written batch back with one list and one multi-get', async () => {
+    const { cell, stream } = segmentStream();
+    await stream.writeChunks(
+      RUN_ID,
+      Array.from({ length: 32 }, (_, index) => chunk(index)),
+    );
+    cell.storage.resetOperationCounts();
+    const result = await stream.readChunks(read());
+    expect(result.chunks.map(indexOf)).toEqual(range(0, 32));
+    expect(cell.storage.operationCounts).toMatchObject({ get: 0, getMany: 1, list: 1 });
+  });
+
+  it('keeps writing per-chunk rows for a stream that already uses them', async () => {
+    const fleet = new FakeFleet({ streams: StreamDO as never });
+    fleet.cell('streams', 'stream:rows').storage.data.set('meta', { count: 0, state: 'open' });
     const stream = fleet.namespace('streams').get({ toString: () => 'stream:rows' }) as StreamDO;
     await stream.writeChunks(RUN_ID, [chunk(0), chunk(1)]);
     const keys = Array.from(fleet.cell('streams', 'stream:rows').storage.data.keys());

@@ -73,7 +73,7 @@ const SEGMENT_SIZE_KEY_PREFIX = 'segsize:';
 /** Payload bytes per segment row, well below the 2 MiB per-value storage limit. */
 const MAX_SEGMENT_BYTES = 1024 * 1024;
 /** Layout of a stream's first write. Existing streams keep the layout they started with. */
-const NEW_STREAM_LAYOUT: StreamMeta['layout'] = undefined;
+const NEW_STREAM_LAYOUT: StreamMeta['layout'] = SEGMENT_LAYOUT;
 /** One storage get or put call accepts at most 128 keys. */
 const STORAGE_BATCH_KEYS = 128;
 
