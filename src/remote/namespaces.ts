@@ -17,7 +17,12 @@ import type { WorkflowRunDOStub } from '../storage.js';
 import type { StreamDOStub } from '../streamer.js';
 import type { RunListPage, RunListRequest } from '../run-list.js';
 import { callDO, callFleetRoute, type RpcTransport } from './rpc-client.js';
-import { readStreamChunks, writeStreamChunks } from './stream-client.js';
+import {
+  readStreamChunks,
+  resetStreamChunkLimit,
+  streamChunkLimit,
+  writeStreamChunks,
+} from './stream-client.js';
 
 interface MethodSpec {
   methods: readonly string[];
@@ -79,6 +84,8 @@ function makeStreamNamespace(transport: RpcTransport) {
       const control = makeStub<StreamDOStub>(transport, 'streams', name, STREAMS);
       control.writeChunks = (runId, chunks) => writeStreamChunks(transport, name, runId, chunks);
       control.readChunks = (request, signal) => readStreamChunks(transport, name, request, signal);
+      control.streamChunkLimit = () => streamChunkLimit(transport);
+      control.resetStreamChunkLimit = () => resetStreamChunkLimit(transport);
       return control;
     },
   };

@@ -17,6 +17,7 @@ import {
 import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../src/lifecycle.js';
 import {
   MAX_STREAM_BATCH_BYTES,
+  NEGOTIATED_STREAM_CHUNKS,
   MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_READ_BYTES,
   MAX_STREAM_WRITE_CHUNKS,
@@ -454,7 +455,9 @@ describe('router auth and shape', () => {
             headers: {
               ...authorization,
               'content-type': STREAM_BATCH_CONTENT_TYPE,
-              'content-length': String(MAX_STREAM_BATCH_BYTES + 1025),
+              'content-length': String(
+                MAX_STREAM_BATCH_BYTES + 4 * NEGOTIATED_STREAM_CHUNKS + 1025,
+              ),
             },
             body: new Uint8Array(),
           }),
@@ -508,7 +511,7 @@ describe('router auth and shape', () => {
         authorization: `Bearer ${SECRET}`,
         'content-type': STREAM_BATCH_CONTENT_TYPE,
       },
-      body: new Uint8Array(MAX_STREAM_BATCH_BYTES + 1025),
+      body: new Uint8Array(MAX_STREAM_BATCH_BYTES + 4 * NEGOTIATED_STREAM_CHUNKS + 1025),
     });
     expect(request.headers.has('content-length')).toBe(false);
     expect((await router(request)).status).toBe(413);

@@ -4,6 +4,7 @@ import {
   MAX_STREAM_CHUNK_BYTES,
   MAX_STREAM_READ_BYTES,
   MAX_STREAM_WRITE_CHUNKS,
+  NEGOTIATED_STREAM_CHUNKS,
   type StreamReadRequest,
 } from '../src/stream-protocol.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
@@ -59,17 +60,25 @@ describe('StreamDO binary batch and long-poll protocol', () => {
     const { get } = setup();
     await expect(get().writeChunks(RUN_ID, [])).rejects.toThrow(/at least one chunk/);
 
-    const chunks = Array.from({ length: MAX_STREAM_WRITE_CHUNKS }, (_, index) =>
-      Uint8Array.of(index),
+    const chunks = Array.from({ length: NEGOTIATED_STREAM_CHUNKS }, (_, index) =>
+      Uint8Array.of(index % 256),
     );
     await expect(get().writeChunks(RUN_ID, chunks)).resolves.toMatchObject({
       startIndex: 0,
-      count: MAX_STREAM_WRITE_CHUNKS,
-      tailIndex: MAX_STREAM_WRITE_CHUNKS - 1,
+      count: NEGOTIATED_STREAM_CHUNKS,
+      tailIndex: NEGOTIATED_STREAM_CHUNKS - 1,
     });
-    await expect(get().writeChunks(RUN_ID, [...chunks, Uint8Array.of(33)])).rejects.toThrow(
-      /exceeds 32 chunks/,
+    await expect(get().writeChunks(RUN_ID, [...chunks, Uint8Array.of(1)])).rejects.toThrow(
+      new RegExp(`exceeds ${NEGOTIATED_STREAM_CHUNKS} chunks`),
     );
+    const read = await get().readChunks({
+      runId: RUN_ID,
+      startIndex: 0,
+      maxChunks: NEGOTIATED_STREAM_CHUNKS,
+      maxBytes: MAX_STREAM_READ_BYTES,
+      waitMs: 0,
+    });
+    expect(read.chunks.map((chunk) => chunk[0])).toEqual(chunks.map((chunk) => chunk[0]));
   });
 
   it('enforces the total batch byte limit', async () => {
