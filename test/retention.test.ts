@@ -436,8 +436,17 @@ describe('terminal workflow retention', () => {
     await harness.fleet.fireDueAlarms();
     expect(await world.retention.getStatus(runId)).toMatchObject({ phase: 'index' });
     const streamStorage = harness.fleet.cell('streams', `stream:${streamName}`).storage;
+    // Counts chunks in either stream layout: per-chunk rows or segment size rows.
     const remainingChunks = () =>
-      Array.from(streamStorage.data.keys()).filter((key) => key.startsWith('chunk:')).length;
+      Array.from(streamStorage.data.entries()).reduce(
+        (total, [key, value]) =>
+          key.startsWith('chunk:')
+            ? total + 1
+            : key.startsWith('segsize:')
+              ? total + (value as { count: number }).count
+              : total,
+        0,
+      );
     expect(remainingChunks()).toBe(300);
 
     harness.fleet.advance(1);

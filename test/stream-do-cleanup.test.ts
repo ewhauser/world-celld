@@ -19,6 +19,8 @@ describe('StreamDO paged KV cleanup', () => {
     const fleet = new FakeFleet({ streams: StreamDO });
     const stream = fleet.namespace('streams').get({ toString: () => 'stream:large' }) as StreamDO;
     const storage = fleet.cell('streams', 'stream:large').storage;
+    // Per-chunk paging applies to streams created before segment rows.
+    storage.data.set('meta', { count: 0, state: 'open' });
     const chunk = new Uint8Array(1024);
     for (let offset = 0; offset < 300; offset += 32) {
       await stream.writeChunks(
@@ -99,6 +101,8 @@ describe('StreamDO paged KV cleanup', () => {
     const fleet = new FakeFleet({ streams: StreamDO });
     const stream = fleet.namespace('streams').get({ toString: () => 'stream:bytes' }) as StreamDO;
     const storage = fleet.cell('streams', 'stream:bytes').storage;
+    // Per-chunk paging applies to streams created before segment rows.
+    storage.data.set('meta', { count: 0, state: 'open' });
     await stream.writeChunks(
       'wrun_bytes',
       Array.from({ length: 4 }, () => new Uint8Array(1024)),
