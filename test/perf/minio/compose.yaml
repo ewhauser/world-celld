@@ -161,7 +161,7 @@ services:
       PERF_FAILOVER_DONE_PATH: /workspace/.perf-results/failover-done
       PERF_FAILOVER_RESULT_PATH: /workspace/.perf-results/minio-failover-latest.json
       PERF_FAILOVER_MESSAGES: '${PERF_FAILOVER_MESSAGES:-32}'
-      PERF_CELLD_VERSION: v0.5.0
+      PERF_CELLD_VERSION: v0.6.0
       PERF_MINIO_VERSION: RELEASE.2025-09-07T16-13-09Z
     command: pnpm vitest run --config vitest.perf.config.ts
     volumes:

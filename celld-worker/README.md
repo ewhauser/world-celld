@@ -15,7 +15,7 @@ Copy this directory and the companion Queue consumer out of `node_modules` so
 worker last. Before deploying, set `vars.WORLD_SECRET` in both copied
 Wrangler configs to the same secret from your secret manager. Keep those
 private deployment copies out of source control; celld stores their variables
-in the fleet bucket. Stop the whole old fleet before starting v0.5.0 nodes:
+in the fleet bucket. Stop the whole old fleet before starting v0.6.0 nodes:
 
 ```sh
 cp -r node_modules/@ewhauser/world-celld/celld-worker ./workflow-world
@@ -30,7 +30,7 @@ to the native Queue.
 
 Requirements:
 
-- celld v0.5.0 (the currently tested runtime baseline).
+- celld v0.6.0 (the currently tested runtime baseline).
 - `esbuild` on PATH (celld shells out to it).
 - A bucket with conditional-write support (celld's fencing requirement).
 - `WORLD_SECRET` set in the deployment config (`vars.WORLD_SECRET`) —
@@ -46,7 +46,7 @@ names the Workers-compatible binding API; it does not require Cloudflare R2.
 The bundled `wrangler.jsonc` declares an hourly UTC cron trigger. It does no
 catalog work by default. Set `vars.WORKFLOW_RETENTION_MS` to `"7776000000"`
 in the primary Wrangler config and redeploy to enable a maximum workflow age
-measured from run creation. v0.5.0 rejects `CELLD_VAR_*` node overrides.
+measured from run creation. celld rejects `CELLD_VAR_*` node overrides.
 `.dev.vars` overrides apply only to `celld dev`, not production deployments.
 
 `7776000000` is 90 days. The policy includes pending and running workflows as

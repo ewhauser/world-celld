@@ -39,7 +39,7 @@ const manifest = {
     cpuModel: cpus()[0]?.model ?? 'unknown',
     cpuCount: cpus().length,
     totalMemoryBytes: totalmem(),
-    celldVersion: 'v0.5.0',
+    celldVersion: 'v0.6.0',
     minioVersion: 'RELEASE.2025-09-07T16-13-09Z',
   },
   profiles: [],

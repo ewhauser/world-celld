@@ -41,7 +41,7 @@ try {
   const paths = new Set(pack.files.map(({ path }) => path));
   const requiredPaths = [
     'CHANGELOG.md',
-    'docs/celld-v0.5-upgrade.md',
+    'docs/celld-v0.6-upgrade.md',
     'LICENSE',
     'NOTICE',
     'README.md',
@@ -67,7 +67,7 @@ try {
 
   const exactPublishedPaths = new Set([
     'CHANGELOG.md',
-    'docs/celld-v0.5-upgrade.md',
+    'docs/celld-v0.6-upgrade.md',
     'LICENSE',
     'NOTICE',
     'README.md',

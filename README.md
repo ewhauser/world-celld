@@ -87,16 +87,17 @@ requests. It must be reachable from every celld node.
 
 ## Deploy the worker
 
-Before deploying, you need a celld v0.5.0 fleet, `esbuild` on `PATH`, and an
+Before deploying, you need a celld v0.6.0 fleet, `esbuild` on `PATH`, and an
 object store that meets celld's conditional-write requirements. Refer to the
 [celld documentation](https://github.com/denoland/celld) for fleet and storage
 setup.
 
-**world-celld 0.5.0 is a breaking release and requires celld v0.5.0.**
-Older runtimes and node-level worker-variable overrides are unsupported.
+**world-celld requires celld v0.6.0.** Older runtimes and node-level
+worker-variable overrides are unsupported.
 
-For an existing fleet, follow the [v0.5.0 upgrade and feature review](docs/celld-v0.5-upgrade.md).
-Stop every old celld node before starting v0.5.0; this is not a rolling upgrade.
+For an existing fleet, follow the [v0.6.0 upgrade and feature review](docs/celld-v0.6-upgrade.md).
+A multi-node fleet uses fleet durability by default; stop every old celld node
+before starting v0.6.0, because that is not a rolling upgrade.
 
 Before either deploy, set `vars.WORLD_SECRET` in both copied Wrangler configs
 to the same secret from your secret manager. Set optional
@@ -104,10 +105,10 @@ to the same secret from your secret manager. Set optional
 `vars.WORKFLOW_RETENTION_MS` there to the desired maximum workflow age
 (for example, `"7776000000"` for 90 days). Use private deployment copies outside
 source control: celld persists these variables in the deployment stored in the
-fleet bucket. v0.5.0 rejects `CELLD_VAR_*`; `.dev.vars` is read only by
+fleet bucket. celld rejects `CELLD_VAR_*`; `.dev.vars` is read only by
 `celld dev`, not by `celld deploy`.
 
-No second storage service is required for queue payloads. celld v0.5.0 serves
+No second storage service is required for queue payloads. celld v0.6.0 serves
 the `WORKFLOW_QUEUE_PAYLOADS` binding from the existing fleet bucket under
 `r2/workflow-world-queue-payloads/`. `r2_buckets` is the Wrangler-compatible
 configuration key for that binding; it does not require Cloudflare R2.
@@ -163,7 +164,7 @@ More deployment detail is in [`celld-worker/README.md`](./celld-worker/README.md
 and [`celld-queue-worker/README.md`](./celld-queue-worker/README.md).
 
 For opt-in bucket or collector telemetry and local `.dev.vars` setup, see
-the [operational examples](docs/celld-v0.5-upgrade.md#adopt-telemetry).
+the [operational examples](docs/celld-v0.6-upgrade.md#adopt-telemetry).
 
 ## How it works
 
@@ -347,7 +348,7 @@ pnpm test:integration
 
 ### Real celld restart smoke
 
-The required CI smoke owns native celld v0.5.0 and MinIO processes on loopback,
+The required CI smoke owns native celld v0.6.0 and MinIO processes on loopback,
 uses fresh temporary bucket and runtime state, and kills celld with `SIGKILL`
 before deleting its local working state and starting a new process against the
 bucket-backed state. It checks that:
@@ -385,7 +386,7 @@ node with Docker Compose. Its queue workload verifies that every accepted
 message reaches a successful callback, including forced `503` redeliveries. It
 also measures a mixed run/step/hook/stream/queue lifecycle and terminal-run
 cleanup. Results include throughput plus p50, p95, p99, and maximum latency and
-are saved under `.perf-results/`. The harness pins celld v0.5.0 and deploys the
+are saved under `.perf-results/`. The harness pins celld v0.6.0 and deploys the
 same two-script native Queue topology as the restart smoke.
 
 > This harness runs a single celld node and leaves the required storage-contract

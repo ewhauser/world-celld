@@ -1,5 +1,9 @@
 # celld v0.5.0 upgrade and feature review
 
+> **Superseded.** world-celld now requires celld v0.6.0; see the
+> [v0.6.0 upgrade and feature review](celld-v0.6-upgrade.md). Keep this guide for
+> the configuration changes a fleet still on celld v0.4.x needs first.
+
 Reviewed September 15, 2026. The previous runtime baseline was celld v0.4.0;
 v0.5.0 is the latest published runtime release. world-celld 0.5.0 adopts it
 as a breaking release: celld v0.4.x and node-level worker-variable overrides
@@ -41,47 +45,11 @@ native Queue attachments and payload keys retain their identities. The older
 QueueDO-to-native-Queue cutover instructions apply only to installations that
 still use QueueDO.
 
-## Adopt telemetry
+## Telemetry and development variables
 
-Enable bucket telemetry on every node to record runtime traces and logs without
-adding a collector. Add these variables to the existing node service definition:
-
-```sh
-CELLD_OTEL=1
-CELLD_OTEL_RETENTION=30d
-OTEL_SERVICE_NAME=world-celld
-```
-
-celld writes Parquet files under `telemetry/` in the fleet bucket and expires
-them after 30 days. The default flush interval is five minutes. Telemetry
-retention is independent of World run retention. This is an opt-in operational
-setting; installing the package does not change node environments.
-
-For an existing OTLP collector, use these settings instead:
-
-```sh
-CELLD_OTEL=https://collector.example.com:4318
-OTEL_SERVICE_NAME=world-celld
-```
-
-celld appends `/v1/traces` and `/v1/logs` to the collector base URL. Supply any
-collector credentials through `OTEL_EXPORTER_OTLP_HEADERS` from your secret
-manager. There is no fallback to the removed sink or endpoint configuration.
-
-## Development variables
-
-For `celld dev`, put local values in `.dev.vars` beside the Wrangler config:
-
-```dotenv
-WORLD_SECRET=local-development-secret
-WORKFLOW_RETENTION_MS=0
-```
-
-Use the same local secret in the consumer and primary worker configurations.
-Changes reload automatically. Both `.dev.vars` and `.celld/` are ignored by
-this repository; add those ignore rules when copying the workers elsewhere.
-These variables do not reach a production deployment. Keep using the native
-smoke for verification of the complete two-script topology.
+The current telemetry and `.dev.vars` examples are in the
+[v0.6.0 guide](celld-v0.6-upgrade.md#adopt-telemetry). The configuration is
+unchanged between v0.5.0 and v0.6.0.
 
 ## Feature decisions
 

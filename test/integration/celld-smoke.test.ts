@@ -309,7 +309,7 @@ class NativeCelldRuntime {
   }
 }
 
-describe.skipIf(!CONFIGURED)('real celld v0.5.0 native-services restart smoke', () => {
+describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', () => {
   const deliveries: CapturedDelivery[] = [];
   let temporaryRoot: string;
   let minio: ManagedProcess | undefined;
@@ -407,8 +407,8 @@ describe.skipIf(!CONFIGURED)('real celld v0.5.0 native-services restart smoke', 
         AWS_EC2_METADATA_DISABLED: 'true',
       };
       const version = await execFileAsync(CELLD_BIN!, ['--version'], { env: storageClientEnv });
-      if (!/\b0\.5\.0\b/.test(version.stdout)) {
-        throw new Error(`expected celld v0.5.0, got ${version.stdout.trim()}`);
+      if (!/\b0\.6\.0\b/.test(version.stdout)) {
+        throw new Error(`expected celld v0.6.0, got ${version.stdout.trim()}`);
       }
       // The consumer deploy establishes the Queue attachment and its named
       // script pointer. The primary deploy goes last so it remains the public

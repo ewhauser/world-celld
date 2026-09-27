@@ -44,14 +44,14 @@ download_verified() {
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)
     celld_asset=celld-x86_64-unknown-linux-gnu.gz
-    celld_sha256=1039eee3737bb432ca0cd399fc55cc0aab4e653b2beae26009e455fea4e5334c
+    celld_sha256=8f1e18072c234ab75459d4da104c13cebc9b29a3e4a4772086bf985829bea8aa
     minio_platform=linux-amd64
     minio_sha256=7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f
     mc_sha256=01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
     ;;
   Darwin-arm64)
     celld_asset=celld-aarch64-apple-darwin.gz
-    celld_sha256=07f6dbded0a2ffe3d7626842908ea81ed517fe94b0cfae784fd0c053d8952e80
+    celld_sha256=bf6f0c06c4f815eecddf61ae40340935a0dbf76be3d643bf75fdd92bfac425cd
     minio_platform=darwin-arm64
     minio_sha256=7c3b3039b76e55a1b80935848ed83998d5e8d317374f87851f46a019ff5c0aa4
     mc_sha256=a877fd0c183409da9f20f9d6e1811987298bbbca1aa03428eebdffba79fb9445
@@ -64,12 +64,12 @@ esac
 
 mkdir -p "$download_root"
 
-celld_archive="$download_root/v0.5.0-$celld_asset"
+celld_archive="$download_root/v0.6.0-$celld_asset"
 minio_binary="$download_root/minio-${minio_platform}-RELEASE.2025-09-07T16-13-09Z"
 mc_binary="$download_root/mc-${minio_platform}-RELEASE.2025-08-13T08-35-41Z"
 
 download_verified \
-  "https://github.com/denoland/celld/releases/download/v0.5.0/$celld_asset" \
+  "https://github.com/denoland/celld/releases/download/v0.6.0/$celld_asset" \
   "$celld_sha256" \
   "$celld_archive"
 download_verified \
