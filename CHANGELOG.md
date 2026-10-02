@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.8.1 (2026-10-02)
+
+## What's Changed
+* fix: harden workflow fault recovery by @ewhauser in https://github.com/ewhauser/world-celld/pull/87
+* chore(deps): bump hono from 4.13.2 to 4.13.7 by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/88
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.8.0...v0.8.1
+
 ## 0.8.0 (2026-09-27)
 
 ## What's Changed
