@@ -5,9 +5,13 @@ packages:
 # the demo and test tooling's Workflow transitive dependencies.
 overrides:
   '@hono/node-server@<1.19.15': 1.19.15
+  'brace-expansion@>=2.0.0 <2.1.6': 2.1.6
+  'brace-expansion@>=5.0.0 <5.0.11': 5.0.11
+  'devalue@>=5.0.0 <5.9.3': 5.9.3
   'hono@<4.12.34': 4.12.34
   'nanoid@>=5.0.0 <5.1.16': 5.1.16
-  'undici@>=7.0.0 <7.29.0': 7.29.0
+  'piscina@>=4.0.0 <4.9.4': 4.9.4
+  'undici@>=7.0.0 <7.29.1': 7.29.1
 # The Workflow meta-package installs every framework adapter. Nest's peers are
 # irrelevant to this Nitro demo and should not force unused framework packages
 # into the development graph.
