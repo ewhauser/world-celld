@@ -66,6 +66,11 @@ export interface WorkflowRunDOStub {
     token: string;
     claimId: string;
   }): Promise<{ committed: boolean }>;
+  resolveExpiredHookClaim(request: {
+    hookId: string;
+    claimId: string;
+    token?: string;
+  }): Promise<Hook | null>;
   getLifecycleStatus(): Promise<import('./retention.js').RunLifecycleStatus>;
   getRun(): Promise<RunReadOutcome<WorkflowRun | null>>;
   getStep(stepId: string): Promise<RunReadOutcome<Step | null>>;
@@ -191,7 +196,10 @@ function parseSuccessEntity<T>(
   const value = outcome[key];
   if (value === undefined) return undefined;
   if (!isRecord(value)) malformedApplyEventOutcome(`${key} is invalid`);
-  const result = schema.safeParse(compact(value));
+  const entity: Record<string, unknown> = compact(value);
+  // A step's error is opaque serialized data; null is a valid thrown value.
+  if (key === 'step') entity.error = value.error;
+  const result = schema.safeParse(entity);
   if (!result.success) malformedApplyEventOutcome(`${key} is invalid`);
   return result.data;
 }
@@ -422,7 +430,7 @@ function throwOutcomeError(
 }
 
 const parseRun = (run: WorkflowRun): WorkflowRun => WorkflowRunSchema.parse(compact(run));
-const parseStep = (step: Step): Step => StepSchema.parse(compact(step));
+const parseStep = (step: Step): Step => StepSchema.parse({ ...compact(step), error: step.error });
 const parseHook = (hook: Hook): Hook => HookSchema.parse(compact(hook));
 const parseEvent = (event: Event): Event => EventSchema.parse(compact(event));
 

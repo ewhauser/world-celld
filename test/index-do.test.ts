@@ -33,6 +33,10 @@ class TestRunLifecycleDO {
   async getLifecycleStatus(): Promise<RunLifecycleStatus> {
     return (await this.ctx.storage.get<RunLifecycleStatus>('status')) ?? 'active';
   }
+
+  async resolveExpiredHookClaim(): Promise<Hook | null> {
+    return null;
+  }
 }
 
 // Each live due record contributes two keys, so record 64 starts delete batch two.

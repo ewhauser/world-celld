@@ -6,6 +6,11 @@ import { parse } from '../../vendor/shared/index.js';
 
 interface RunLifecycleStub {
   getLifecycleStatus(): Promise<RunLifecycleStatus>;
+  resolveExpiredHookClaim(request: {
+    hookId: string;
+    claimId: string;
+    token?: string;
+  }): Promise<Hook | null>;
 }
 
 export interface HookIndexEnv {
@@ -32,4 +37,17 @@ export async function runIsActive(env: HookIndexEnv, runId: string): Promise<boo
   if (!namespace) throw new Error('world-celld hook index missing WORKFLOW_DB binding');
   const target = namespace.get(namespace.idFromName(runId));
   return (await target.getLifecycleStatus()) === 'active';
+}
+
+/** Resolve a stale shard reservation in its authoritative event writer. */
+export async function resolveExpiredHookClaim(
+  env: HookIndexEnv,
+  owner: HookTokenOwner,
+  claimId: string,
+  token?: string,
+): Promise<Hook | null> {
+  const namespace = env.WORKFLOW_DB;
+  if (!namespace) throw new Error('world-celld hook index missing WORKFLOW_DB binding');
+  const target = namespace.get(namespace.idFromName(owner.runId));
+  return await target.resolveExpiredHookClaim({ hookId: owner.hookId, claimId, token });
 }

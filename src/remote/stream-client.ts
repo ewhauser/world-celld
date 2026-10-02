@@ -158,7 +158,13 @@ export async function writeStreamChunks(
   if (!response.ok) throw await errorFromResponse(response);
   recordStreamChunkLimit(transport, response);
   try {
-    return decodeStreamWriteResult(await readBoundedResponse(response, MAX_WRITE_RESPONSE_BYTES));
+    const result = decodeStreamWriteResult(
+      await readBoundedResponse(response, MAX_WRITE_RESPONSE_BYTES),
+    );
+    if (result.count !== chunks.length) {
+      throw new Error('Stream write acknowledgement does not match the requested chunk count');
+    }
+    return result;
   } catch (error) {
     if (error instanceof FleetTransportError) throw error;
     throw new FleetTransportError(`world-celld: malformed stream response from ${url.href}`, error);
@@ -180,6 +186,7 @@ export async function readStreamChunks(
   url.searchParams.set('waitMs', String(request.waitMs));
   const doFetch = transport.fetchImpl ?? fetch;
   let lastError: unknown;
+  let maxChunks = request.maxChunks;
 
   for (let attempt = 1; attempt <= READ_ATTEMPTS; attempt++) {
     if (signal?.aborted) throw aborted(signal);
@@ -205,7 +212,26 @@ export async function readStreamChunks(
     if (response.ok) {
       recordStreamChunkLimit(transport, response);
       try {
-        return decodeStreamReadResult(await readBoundedResponse(response, MAX_READ_RESPONSE_BYTES));
+        const result = decodeStreamReadResult(
+          await readBoundedResponse(response, MAX_READ_RESPONSE_BYTES),
+        );
+        // A structurally valid frame can still be a stale or partial reply.
+        // Do not expose output or advance its offset until it matches this
+        // request's range and bounds. Reads can safely retry the same offset.
+        if (
+          result.startIndex !== request.startIndex ||
+          result.chunks.length > maxChunks ||
+          result.chunks.reduce((bytes, chunk) => bytes + chunk.byteLength, 0) > request.maxBytes ||
+          (result.chunks.length > 0 &&
+            result.startIndex + result.chunks.length - 1 > result.tailIndex) ||
+          (maxChunks > 0 &&
+            result.chunks.length === 0 &&
+            result.startIndex <= result.tailIndex &&
+            result.state !== 'expired')
+        ) {
+          throw new Error('Stream read response does not match the requested range and bounds');
+        }
+        return result;
       } catch (error) {
         if (signal?.aborted) throw aborted(signal);
         lastError =
@@ -244,6 +270,7 @@ export async function readStreamChunks(
     ) {
       // An older worker behind the same fleet URL; reads are safe to repeat.
       resetStreamChunkLimit(transport);
+      maxChunks = MAX_STREAM_READ_CHUNKS;
       url.searchParams.set('maxChunks', String(MAX_STREAM_READ_CHUNKS));
       lastError = error;
       continue;

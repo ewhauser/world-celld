@@ -44,6 +44,8 @@ import { cellQueueClaim, runQueueClaim, type QueueClaimHandle } from './queue-cl
 import { INDEX_OPERATIONS, type IndexOperation, validateIndexRequest } from './index-validation.js';
 import {
   NATIVE_QUEUE_MAX_MESSAGE_BYTES,
+  QUEUE_PUBLICATION_LEASE_MS,
+  QUEUE_RESERVATION_GRACE_MS,
   queueClaimName,
   isInlineRunBody,
   queueOrphanName,
@@ -82,8 +84,11 @@ export interface QueueRunStub {
   reserveQueueMessage(params: {
     messageId: string;
     expiresAt: number;
-  }): Promise<{ admitted: boolean; messageId: string }>;
+    publicationPending?: boolean;
+  }): Promise<{ admitted: boolean; messageId: string; publicationPending?: true }>;
+  confirmQueueMessagePublication(params: { messageId: string; expiresAt: number }): Promise<void>;
   completeQueueMessage(messageId: string): Promise<void>;
+  abandonQueueMessageReservation(messageId: string): Promise<void>;
   claimInflight(params: {
     messageId: string;
     staleMs: number;
@@ -99,7 +104,13 @@ export interface QueueRunStub {
     claimName: string;
     messageId: string;
     expiresAt: number;
+    publicationPending?: boolean;
   }): Promise<RunQueueReservation>;
+  confirmRunQueueMessagePublication(params: {
+    claimName: string;
+    messageId: string;
+    expiresAt: number;
+  }): Promise<void>;
   claimRunQueueMessage(params: {
     claimName: string;
     messageId: string;
@@ -114,6 +125,10 @@ export interface QueueRunStub {
   }): Promise<{ held: boolean }>;
   releaseRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void>;
   completeRunQueueMessage(params: { claimName: string; messageId: string }): Promise<void>;
+  abandonRunQueueMessageReservation(params: {
+    claimName: string;
+    messageId: string;
+  }): Promise<void>;
 }
 
 export interface WorkerEnv {
@@ -210,6 +225,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
       'cleanupNow',
       'rearmCleanup',
       'resolveHookTokenClaim',
+      'resolveExpiredHookClaim',
     ]),
   },
   streams: {
@@ -237,7 +253,6 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
 /** Request body cap: oversize payloads get a clear 413 instead of an OOM. */
 const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_STREAM_WRITE_BODY_BYTES = MAX_STREAM_BATCH_BYTES + 4 * NEGOTIATED_STREAM_CHUNKS + 1024;
-const QUEUE_ORPHAN_GRACE_MS = 5 * 24 * 60 * 60 * 1000;
 
 function errorResponse(status: number, name: string, message: string): Response {
   return Response.json({ error: { name, message } }, { status });
@@ -428,6 +443,7 @@ export function createRouter(env: WorkerEnv) {
           return errorResponse(400, 'BadRequest', (error as Error).message);
         }
 
+        let enqueueClaim: QueueClaimHandle | undefined;
         try {
           const namespace = env.WORKFLOW_DB;
           const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
@@ -453,11 +469,10 @@ export function createRouter(env: WorkerEnv) {
 
           const now = Date.now();
           const reservationExpiresAt =
-            Math.max(now, envelope.notBefore ?? now) + QUEUE_ORPHAN_GRACE_MS;
+            Math.max(now, envelope.notBefore ?? now) + QUEUE_RESERVATION_GRACE_MS;
           const run = envelope.runId
             ? (namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub)
             : undefined;
-          let claim: QueueClaimHandle | undefined;
           let admission: Promise<{ ok: true } | { ok: false; message: string }> | undefined;
           if (envelope.idempotencyKey) {
             const claimName = queueClaimName(envelope.queueName, envelope.idempotencyKey);
@@ -465,19 +480,22 @@ export function createRouter(env: WorkerEnv) {
             // isolate already knows the run keeps claims in claim cells. The
             // run cell reserves in the same call when the run is run-scoped.
             let scope = run && envelope.runId ? runClaimScopes.get(envelope.runId) : 'cell';
-            let reservation: { admitted: boolean; messageId: string } | undefined;
+            let reservation:
+              | { admitted: boolean; messageId: string; publicationPending?: true }
+              | undefined;
             if (run && envelope.runId && scope !== 'cell') {
+              enqueueClaim = runQueueClaim(run, claimName);
               const reserved = await run.reserveRunQueueMessage({
                 claimName,
                 messageId: envelope.messageId,
-                expiresAt: reservationExpiresAt,
+                expiresAt: now + QUEUE_PUBLICATION_LEASE_MS,
+                publicationPending: true,
               });
               if (!reserved.ok) return errorResponse(410, 'RunExpiredError', reserved.message);
               scope = reserved.scope;
               rememberRunClaimScope(envelope.runId, reserved.scope);
               if (reserved.scope === 'run') {
                 reservation = reserved;
-                claim = runQueueClaim(run, claimName);
                 brokerEnvelope = { ...brokerEnvelope, claimScope: 'run' };
               }
             } else if (inlineRunBody && run) {
@@ -487,13 +505,21 @@ export function createRouter(env: WorkerEnv) {
             }
             if (!reservation) {
               const cell = namespace.get(namespace.idFromName(claimName)) as QueueRunStub;
+              enqueueClaim = cellQueueClaim(cell);
               reservation = await cell.reserveQueueMessage({
                 messageId: envelope.messageId,
-                expiresAt: reservationExpiresAt,
+                expiresAt: now + QUEUE_PUBLICATION_LEASE_MS,
+                publicationPending: true,
               });
-              claim = cellQueueClaim(cell);
             }
             if (!reservation.admitted) {
+              if (reservation.publicationPending) {
+                return errorResponse(
+                  503,
+                  'QueuePublicationPending',
+                  'the reserved Queue message has not been confirmed by the broker; retry publication',
+                );
+              }
               return new Response(rpcStringify({ messageId: reservation.messageId }), {
                 status: 200,
                 headers: { 'content-type': 'application/json' },
@@ -507,13 +533,14 @@ export function createRouter(env: WorkerEnv) {
           if (admission) {
             const admitted = await admission;
             if (!admitted.ok) {
-              await claim?.complete(envelope.messageId);
+              await enqueueClaim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', admitted.message);
             }
           }
 
           if (run && envelope.runId && payloadKey) {
             if (!payloadStore) {
+              await enqueueClaim?.abandonReservation(envelope.messageId);
               return errorResponse(
                 500,
                 'WorldMisconfigured',
@@ -527,7 +554,7 @@ export function createRouter(env: WorkerEnv) {
               orphanExpiresAt,
             });
             if (!registered.ok) {
-              await claim?.complete(envelope.messageId);
+              await enqueueClaim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', registered.message);
             }
             const orphan = namespace.get(
@@ -542,30 +569,18 @@ export function createRouter(env: WorkerEnv) {
               });
             } catch (error) {
               await run.unregisterQueuePayload(envelope.messageId);
-              await claim?.complete(envelope.messageId);
               throw error;
             }
-            try {
-              await payloadStore.write(payloadKey, envelope.body, {
-                runId: envelope.runId,
-                messageId: envelope.messageId,
-              });
-            } catch (error) {
-              await claim?.complete(envelope.messageId);
-              throw error;
-            }
-            let finalized: Awaited<ReturnType<QueueRunStub['finalizeQueuePayload']>>;
-            try {
-              finalized = await run.finalizeQueuePayload(envelope.messageId);
-            } catch (error) {
-              await claim?.complete(envelope.messageId);
-              throw error;
-            }
+            await payloadStore.write(payloadKey, envelope.body, {
+              runId: envelope.runId,
+              messageId: envelope.messageId,
+            });
+            const finalized = await run.finalizeQueuePayload(envelope.messageId);
             if (!finalized.ok) {
               await payloadStore.delete(payloadKey);
               await run.unregisterQueuePayload(envelope.messageId);
               await orphan.cancelQueuePayloadOrphan(envelope.messageId);
-              await claim?.complete(envelope.messageId);
+              await enqueueClaim?.complete(envelope.messageId);
               return errorResponse(410, 'RunExpiredError', finalized.message);
             }
           }
@@ -573,11 +588,21 @@ export function createRouter(env: WorkerEnv) {
             contentType: 'text',
             ...options,
           });
+          await enqueueClaim?.confirmPublication(envelope.messageId, reservationExpiresAt);
           return new Response(rpcStringify({ messageId: envelope.messageId }), {
             status: 200,
             headers: { 'content-type': 'application/json' },
           });
         } catch (error) {
+          // A failed publication must not make the next caller's retry look
+          // successful solely because it finds this message's reservation.
+          // Preserve staged payloads: the broker may have accepted the message
+          // before its response failed, and orphan cleanup owns those bytes.
+          try {
+            await enqueueClaim?.abandonReservation(envelope.messageId);
+          } catch (cleanupError) {
+            console.error('world-celld could not abandon a failed Queue reservation', cleanupError);
+          }
           const err = error as { name?: string; message?: string };
           return errorResponse(500, err.name ?? 'Error', err.message ?? String(error));
         }

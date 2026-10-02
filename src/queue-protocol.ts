@@ -7,6 +7,9 @@ export { QUEUE_CLAIM_STALE_MS } from './lifecycle.js';
 export const NATIVE_QUEUE_MAX_DELAY_SECONDS = 86_400;
 export const NATIVE_QUEUE_MAX_MESSAGE_BYTES = 128_000;
 export const MAX_QUEUE_SUSPENSIONS = 256;
+/** Unconfirmed producer reservations must become recoverable after an interrupted send. */
+export const QUEUE_PUBLICATION_LEASE_MS = 5 * 60 * 1000;
+export const QUEUE_RESERVATION_GRACE_MS = 5 * 24 * 60 * 60 * 1000;
 export const QUEUE_PAYLOAD_REGISTRY_PREFIX = 'queue-payload:';
 /** Largest run-bearing body that may travel inline in the broker envelope. */
 export const MAX_INLINE_RUN_BODY_BYTES = 8 * 1024;
@@ -85,7 +88,7 @@ export interface NativeQueueEnvelope {
 export type RunQueueReservation =
   | { ok: false; message: string }
   | { ok: true; scope: 'cell' }
-  | { ok: true; scope: 'run'; admitted: boolean; messageId: string };
+  | { ok: true; scope: 'run'; admitted: boolean; messageId: string; publicationPending?: true };
 
 export interface NativeQueueSendOptions {
   delaySeconds?: number;

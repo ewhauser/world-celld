@@ -495,6 +495,28 @@ export class StreamDO extends DurableObject {
       planned.unshift({ start, size: validateSegmentSize(entry[1], start) });
     }
 
+    // The durable tail promises every offset in this range exists. In
+    // particular, a missing final size row must not look like EOF to a
+    // resumed reader of a closed stream. Check the small index rows before
+    // applying the payload byte budget, including a containing segment.
+    let covered = startIndex;
+    for (let index = 0; index < planned.length; index++) {
+      const { start, size } = planned[index];
+      if (start > covered) {
+        throw new Error(`Missing persisted stream segment at index ${covered}`);
+      }
+      if (index > 0 && start !== covered) {
+        throw new Error(`Overlapping persisted stream segment at index ${start}`);
+      }
+      if (start + size.count <= covered) {
+        throw new Error(`Missing persisted stream segment at index ${covered}`);
+      }
+      covered = start + size.count;
+    }
+    if (covered < endIndex) {
+      throw new Error(`Missing persisted stream segment at index ${covered}`);
+    }
+
     // Load segments until the byte budget is reached; per-chunk sizes are
     // known only after decoding, so the final selection below trims exactly.
     const selected: Array<{ start: number; size: SegmentSize }> = [];
