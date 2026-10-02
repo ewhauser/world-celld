@@ -9,6 +9,17 @@ function rpcResponse(value: unknown, init?: ResponseInit): Response {
   return new Response(rpcStringify(value), { status: 200, ...init });
 }
 
+function interruptedResponse(status: number, failure: Error): Response {
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        controller.error(failure);
+      },
+    }),
+    { status },
+  );
+}
+
 async function abortingFetch(_input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   return await new Promise<Response>((_resolve, reject) => {
     init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
@@ -21,6 +32,59 @@ afterEach(() => {
 });
 
 describe('remote RPC client regressions', () => {
+  it.each([200, 503])('retries an interrupted HTTP %s response body for reads', async (status) => {
+    vi.useFakeTimers();
+    const fetchImpl = vi
+      .fn<typeof fetch>(async () => rpcResponse({ ok: true, value: null }))
+      .mockResolvedValueOnce(interruptedResponse(status, new TypeError('body connection reset')));
+    const outcome = callDO(
+      { fleetUrl: 'http://fleet.test', secret: 'secret', fetchImpl },
+      'runs',
+      'wrun_body_reset',
+      'getRun',
+      [],
+      { idempotent: true },
+    ).catch((error) => error);
+    await vi.runAllTimersAsync();
+
+    await expect(outcome).resolves.toEqual({ ok: true, value: null });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds retries and preserves the cause when error response bodies keep failing', async () => {
+    vi.useFakeTimers();
+    const failure = new TypeError('persistent body connection reset');
+    const fetchImpl = vi.fn<typeof fetch>(async () => interruptedResponse(503, failure));
+    const outcome = callDO(
+      { fleetUrl: 'http://fleet.test', secret: 'secret', fetchImpl },
+      'runs',
+      'wrun_body_exhausted',
+      'getRun',
+      [],
+      { idempotent: true },
+    ).catch((error) => error);
+    await vi.runAllTimersAsync();
+
+    await expect(outcome).resolves.toMatchObject({ name: 'FleetTransportError', cause: failure });
+    expect(fetchImpl).toHaveBeenCalledTimes(FLEET_IDEMPOTENT_ATTEMPTS);
+  });
+
+  it('surfaces an interrupted mutation response without retrying its ambiguous commit', async () => {
+    const failure = new TypeError('mutation response body reset');
+    const fetchImpl = vi.fn<typeof fetch>(async () => interruptedResponse(500, failure));
+
+    await expect(
+      callDO(
+        { fleetUrl: 'http://fleet.test', secret: 'secret', fetchImpl },
+        'runs',
+        'wrun_mutation_body_reset',
+        'applyEvent',
+        [],
+      ),
+    ).rejects.toMatchObject({ name: 'FleetTransportError', cause: failure });
+    expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
   it('retries an idempotent read after fetch rejects and succeeds later', async () => {
     vi.useFakeTimers();
     const fetchImpl = vi

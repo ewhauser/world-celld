@@ -599,6 +599,45 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     );
   });
 
+  it.each(['step_failed', 'step_retrying'] as const)(
+    'preserves opaque %s errors through RPC and an actual celld process restart',
+    async (eventType) => {
+      const deploymentId = `step-error-${randomUUID()}`;
+      const w = world({ deploymentId });
+      const created = await w.events.create(null, {
+        eventType: 'run_created',
+        eventData: { deploymentId, workflowName: deploymentId, input: [] },
+      });
+      const runId = created.run.runId;
+      const errors = [new Uint8Array([0, 1, 127, 128, 254, 255]), null];
+      for (const [index, error] of errors.entries()) {
+        const stepId = `error-step-${index}`;
+        await w.events.create(runId, {
+          eventType: 'step_started',
+          correlationId: stepId,
+          eventData: { stepName: stepId, input: [] },
+        });
+        const outcome = await w.events.create(runId, {
+          eventType,
+          correlationId: stepId,
+          eventData: { error },
+        });
+        expect(outcome.step?.error).toEqual(error);
+        expect(outcome.event?.eventData).toEqual({ error });
+      }
+
+      const restart = await runtime!.restart(0, true);
+      expect(restart.newPid).not.toBe(restart.oldPid);
+      const steps = await w.steps.list({ runId, resolveData: 'all' });
+      expect(steps.data.map((step) => step.error)).toEqual(errors);
+      for (const [index, error] of errors.entries()) {
+        const step = await w.steps.get(runId, `error-step-${index}`, { resolveData: 'all' });
+        expect(step.error).toEqual(error);
+        expect(step.status).toBe(eventType === 'step_failed' ? 'failed' : 'pending');
+      }
+    },
+  );
+
   it('recovers durable state and one accepted native Queue delivery after a process restart', async () => {
     const deploymentId = `restart-${randomUUID()}`;
     const w = world({ deploymentId });

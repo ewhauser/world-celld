@@ -99,7 +99,18 @@ export async function callFleetRoute<T>(
       }
     }
 
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      lastError = new FleetTransportError(
+        `world-celld: interrupted error response from ${url}`,
+        error,
+      );
+      // Headers can arrive before the connection fails. Reading the body is
+      // part of the transport attempt, with the same bounded retry policy.
+      continue;
+    }
     let wire: WireError | undefined;
     try {
       wire = (JSON.parse(text) as { error?: WireError }).error;

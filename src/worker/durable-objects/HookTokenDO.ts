@@ -3,6 +3,7 @@ import { DurableObject } from '../do-base.js';
 import {
   indexKey,
   ownerFromSerializedHook,
+  resolveExpiredHookClaim,
   runIsActive,
   sameOwner,
   type HookIndexEnv,
@@ -64,39 +65,56 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     owner: HookTokenOwner,
     proposedClaimId: string,
   ): Promise<{ claimed: true; claimId: string } | { claimed: false; holder: HookTokenOwner }> {
-    return await this.ctx.storage.transaction(async (txn) => {
-      const record = recordKey(token);
-      const claim = claimKey(token);
-      const values = await txn.get<string | HookClaim>([record, claim]);
-      const indexed = values.get(record) as string | undefined;
-      if (indexed !== undefined) {
-        return { claimed: false, holder: ownerFromSerializedHook(indexed) };
-      }
-      let existing = values.get(claim) as HookClaim | undefined;
-      const now = this.now();
-      if (existing && existing.expiresAt <= now) {
-        await txn.delete([claim, existing.deadlineKey]);
-        existing = undefined;
-      }
-      if (existing !== undefined && !sameOwner(existing.owner, owner)) {
-        return { claimed: false, holder: existing.owner };
-      }
-      if (existing === undefined) {
-        const expiresAt = now + HOOK_CLAIM_LEASE_MS;
-        const deadlineKey = claimDeadlineKey(token, expiresAt);
-        await txn.put(claim, {
-          owner,
-          claimId: proposedClaimId,
-          reservedAt: now,
-          expiresAt,
-          deadlineKey,
-        } satisfies HookClaim);
-        await txn.put<ClaimDeadline>(deadlineKey, { token, claimId: proposedClaimId, expiresAt });
-        await this.armAtMost(txn, expiresAt);
-        return { claimed: true, claimId: proposedClaimId };
-      }
-      return { claimed: true, claimId: existing.claimId };
-    });
+    for (;;) {
+      const observed = await this.ctx.storage.get<HookClaim>(claimKey(token));
+      const expired = observed && observed.expiresAt <= this.now() ? observed : undefined;
+      const committed = expired
+        ? await resolveExpiredHookClaim(this.env, expired.owner, expired.claimId, token)
+        : undefined;
+      const result = await this.ctx.storage.transaction(async (txn) => {
+        const record = recordKey(token);
+        const claim = claimKey(token);
+        const values = await txn.get<string | HookClaim>([record, claim]);
+        const indexed = values.get(record) as string | undefined;
+        if (indexed !== undefined) {
+          return { claimed: false as const, holder: ownerFromSerializedHook(indexed) };
+        }
+        let existing = values.get(claim) as HookClaim | undefined;
+        const now = this.now();
+        if (existing && existing.expiresAt <= now) {
+          if (existing.claimId !== expired?.claimId || existing.expiresAt !== expired.expiresAt) {
+            return null;
+          }
+          if (committed) {
+            await this.renewClaim(txn, token, existing, now);
+            return sameOwner(existing.owner, owner)
+              ? { claimed: true as const, claimId: existing.claimId }
+              : { claimed: false as const, holder: existing.owner };
+          }
+          await txn.delete([claim, existing.deadlineKey]);
+          existing = undefined;
+        }
+        if (existing !== undefined && !sameOwner(existing.owner, owner)) {
+          return { claimed: false as const, holder: existing.owner };
+        }
+        if (existing === undefined) {
+          const expiresAt = now + HOOK_CLAIM_LEASE_MS;
+          const deadlineKey = claimDeadlineKey(token, expiresAt);
+          await txn.put(claim, {
+            owner,
+            claimId: proposedClaimId,
+            reservedAt: now,
+            expiresAt,
+            deadlineKey,
+          } satisfies HookClaim);
+          await txn.put<ClaimDeadline>(deadlineKey, { token, claimId: proposedClaimId, expiresAt });
+          await this.armAtMost(txn, expiresAt);
+          return { claimed: true as const, claimId: proposedClaimId };
+        }
+        return { claimed: true as const, claimId: existing.claimId };
+      });
+      if (result) return result;
+    }
   }
 
   async finalize(
@@ -119,8 +137,10 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
       }
       const existingClaim = values.get(claim) as HookClaim | undefined;
       if (existingClaim && existingClaim.expiresAt <= this.now()) {
-        await txn.delete([claim, existingClaim.deadlineKey]);
-        return { stored: false };
+        // The authoritative hook may already have committed. A successful
+        // response here would strand it without a token lookup; force replay
+        // to reacquire the reservation and finish publication instead.
+        throw new Error(`Hook token ${token} reservation expired`);
       }
       if (
         existingClaim !== undefined &&
@@ -189,23 +209,59 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     if (current === null || at < current) await storage.setAlarm(at);
   }
 
+  private async renewClaim(
+    txn: DurableObjectTransaction,
+    token: string,
+    claim: HookClaim,
+    now: number,
+  ): Promise<void> {
+    const expiresAt = now + HOOK_CLAIM_LEASE_MS;
+    const deadlineKey = claimDeadlineKey(token, expiresAt);
+    await txn.delete(claim.deadlineKey);
+    await txn.put(claimKey(token), { ...claim, expiresAt, deadlineKey });
+    await txn.put<ClaimDeadline>(deadlineKey, { token, claimId: claim.claimId, expiresAt });
+    await this.armAtMost(txn, expiresAt);
+  }
+
   private async compactClaims(): Promise<void> {
     const now = this.now();
+    const due = await this.ctx.storage.list<ClaimDeadline>({
+      prefix: CLAIM_DEADLINE_PREFIX,
+      end: `${CLAIM_DEADLINE_PREFIX}${pad(now + 1)}`,
+      limit: LIFECYCLE_COMPACTION_BATCH + 1,
+    });
+    const page = Array.from(due).slice(0, LIFECYCLE_COMPACTION_BATCH);
+    const observed = await this.ctx.storage.get<HookClaim>(
+      page.map(([, item]) => claimKey(item.token)),
+    );
+    const committed = new Map<string, boolean>();
+    await Promise.all(
+      page.map(async ([, item]) => {
+        const claim = observed.get(claimKey(item.token));
+        if (!claim || claim.claimId !== item.claimId || claim.expiresAt > now) return;
+        const hook = await resolveExpiredHookClaim(
+          this.env,
+          claim.owner,
+          claim.claimId,
+          item.token,
+        );
+        committed.set(claimKey(item.token), hook !== null);
+      }),
+    );
     await this.ctx.storage.transaction(async (txn) => {
-      const due = await txn.list<ClaimDeadline>({
-        prefix: CLAIM_DEADLINE_PREFIX,
-        end: `${CLAIM_DEADLINE_PREFIX}${pad(now + 1)}`,
-        limit: LIFECYCLE_COMPACTION_BATCH + 1,
-      });
-      const page = Array.from(due).slice(0, LIFECYCLE_COMPACTION_BATCH);
       const claims = await txn.get<HookClaim>(page.map(([, item]) => claimKey(item.token)));
-      const deletes = page.flatMap(([deadline, item]) => {
+      const deletes: string[] = [];
+      for (const [deadline, item] of page) {
         const key = claimKey(item.token);
         const claim = claims.get(key);
-        return claim?.claimId === item.claimId && claim.expiresAt <= now
-          ? [deadline, key]
-          : [deadline];
-      });
+        const snapshot = observed.get(key);
+        if (claim?.claimId !== item.claimId || claim.expiresAt > now) {
+          deletes.push(deadline);
+        } else if (claim.claimId === snapshot?.claimId && claim.expiresAt === snapshot.expiresAt) {
+          if (committed.get(key)) await this.renewClaim(txn, item.token, claim, now);
+          else deletes.push(deadline, key);
+        }
+      }
       for (let offset = 0; offset < deletes.length; offset += LIFECYCLE_COMPACTION_BATCH) {
         await txn.delete(deletes.slice(offset, offset + LIFECYCLE_COMPACTION_BATCH));
       }

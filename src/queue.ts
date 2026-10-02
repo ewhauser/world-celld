@@ -29,6 +29,7 @@ import { monotonicFactory } from 'ulid';
 import { debug } from './util.js';
 import {
   nativeQueueDelaySeconds,
+  queueClaimName,
   type NativeQueueEnvelope,
   type NativeQueueSendOptions,
   type NativeQueueSendResult,
@@ -179,7 +180,7 @@ function createTestPump(config: CelldQueueConfig) {
 
   function release(envelope: PumpEnvelope) {
     if (envelope.idempotencyKey) {
-      inflightMessages.delete(envelope.idempotencyKey);
+      inflightMessages.delete(queueClaimName(envelope.queueName, envelope.idempotencyKey));
     }
   }
 
@@ -196,6 +197,31 @@ function createTestPump(config: CelldQueueConfig) {
     });
   }
 
+  function retry(envelope: PumpEnvelope, pathname: Pathname, reason: string): void {
+    if (envelope.attempt >= maxAttempts) {
+      release(envelope);
+      console.error(
+        `[world-celld test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
+      );
+      return;
+    }
+    const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
+    const backoff = Math.min(
+      MAX_TEST_PUMP_BACKOFF_MS,
+      baseBackoffMs * 2 ** Math.min(next.attempt - 1, 30),
+    );
+    if (
+      checkedQueueTimestampAdd(Date.now(), backoff, MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS) === null
+    ) {
+      release(envelope);
+      console.error(
+        `[world-celld test pump] dropping ${envelope.messageId}: retry deadline exceeds the queue timestamp horizon`,
+      );
+      return;
+    }
+    void delayFor(backoff).then(() => enqueue(pathname, next));
+  }
+
   async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
     const url = `${resolveBaseUrl(config)}/.well-known/workflow/v1/${pathname}`;
     const response = await fetch(url, {
@@ -210,7 +236,7 @@ function createTestPump(config: CelldQueueConfig) {
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
 
-    if (response.ok) {
+    if (response.ok || PERMANENT_ERROR_STATUSES.has(response.status)) {
       try {
         await response.body?.cancel();
       } catch {
@@ -218,6 +244,11 @@ function createTestPump(config: CelldQueueConfig) {
         // into a retry solely because releasing an unused body failed.
       }
       release(envelope);
+      if (!response.ok) {
+        debug(
+          `[world-celld test pump] dropping ${envelope.messageId}: permanent HTTP ${response.status}`,
+        );
+      }
       return;
     }
 
@@ -245,37 +276,7 @@ function createTestPump(config: CelldQueueConfig) {
       }
     }
 
-    if (PERMANENT_ERROR_STATUSES.has(response.status)) {
-      release(envelope);
-      debug(
-        `[world-celld test pump] dropping ${envelope.messageId}: permanent HTTP ${response.status}: ${text}`,
-      );
-      return;
-    }
-
-    if (envelope.attempt < maxAttempts) {
-      const next: PumpEnvelope = { ...envelope, attempt: envelope.attempt + 1 };
-      const backoff = Math.min(
-        MAX_TEST_PUMP_BACKOFF_MS,
-        baseBackoffMs * 2 ** Math.min(next.attempt - 1, 30),
-      );
-      if (
-        checkedQueueTimestampAdd(Date.now(), backoff, MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS) ===
-        null
-      ) {
-        release(envelope);
-        console.error(
-          `[world-celld test pump] dropping ${envelope.messageId}: retry deadline exceeds the queue timestamp horizon`,
-        );
-        return;
-      }
-      void delayFor(backoff).then(() => enqueue(pathname, next));
-    } else {
-      release(envelope);
-      console.error(
-        `[world-celld test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: HTTP ${response.status}: ${text}`,
-      );
-    }
+    retry(envelope, pathname, `HTTP ${response.status}: ${text}`);
   }
 
   async function loop(pathname: Pathname) {
@@ -286,16 +287,17 @@ function createTestPump(config: CelldQueueConfig) {
       try {
         await dispatch(envelope, pathname);
       } catch (err) {
-        release(envelope);
-        console.error(`[world-celld test pump] dispatch error on ${pathname}:`, err);
+        retry(envelope, pathname, err instanceof Error ? err.message : String(err));
       }
     }
   }
 
   return {
     /** Returns the inflight messageId when the key is already claimed. */
-    inflight(idempotencyKey: string | undefined): MessageId | undefined {
-      return idempotencyKey ? inflightMessages.get(idempotencyKey) : undefined;
+    inflight(queueName: string, idempotencyKey: string | undefined): MessageId | undefined {
+      return idempotencyKey
+        ? inflightMessages.get(queueClaimName(queueName, idempotencyKey))
+        : undefined;
     },
     push(pathname: Pathname, envelope: PumpEnvelope, delaySeconds?: number) {
       if (
@@ -309,7 +311,10 @@ function createTestPump(config: CelldQueueConfig) {
         throw new Error('world-celld queue delaySeconds lacks required delivery headroom');
       }
       if (envelope.idempotencyKey) {
-        inflightMessages.set(envelope.idempotencyKey, MessageId.parse(envelope.messageId));
+        inflightMessages.set(
+          queueClaimName(envelope.queueName, envelope.idempotencyKey),
+          MessageId.parse(envelope.messageId),
+        );
       }
       if (delaySeconds && delaySeconds > 0) {
         void delayFor(delaySeconds * 1000).then(() => enqueue(pathname, envelope));
@@ -363,7 +368,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         // Dedup on idempotencyKey while a message with the same key is in
         // flight — core re-enqueues every still-pending step on every replay
         // with idempotencyKey = stepId and relies on queue-level dedup.
-        const existing = testPump.inflight(opts?.idempotencyKey);
+        const existing = testPump.inflight(queueName, opts?.idempotencyKey);
         if (existing) {
           return { messageId: existing };
         }

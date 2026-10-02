@@ -51,6 +51,7 @@ import { MAX_RUN_INDEX_PUBLICATION_LIFETIME_MS } from '../../lifecycle.js';
 import { isNonNegativeSafeInteger, isPositiveSafeInteger, isRecord } from '../../validation.js';
 import {
   QUEUE_PAYLOAD_REGISTRY_PREFIX,
+  QUEUE_RESERVATION_GRACE_MS,
   queuePayloadRegistryKey,
   type QueuePayloadOrphan,
   type QueuePayloadRegistration,
@@ -205,7 +206,10 @@ interface InflightClaim {
   retryAt?: number;
 }
 
-type QueueMessageReservation = InflightClaim;
+interface QueueMessageReservation extends InflightClaim {
+  /** Absent on older records, whose broker publication was implicitly confirmed. */
+  publicationPending?: true;
+}
 
 /**
  * Run-scoped equivalent of a claim cell's reservation and in-flight claim.
@@ -412,6 +416,37 @@ export class WorkflowRunDO extends DurableObject {
 
   async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {
     return this.readKey<WorkflowRun>('run');
+  }
+
+  /** Fence both supported event-claim forms before an expired shard claim is released. */
+  async resolveExpiredHookClaim(request: {
+    hookId: string;
+    claimId: string;
+    token?: string;
+  }): Promise<Hook | null> {
+    if (
+      typeof request?.hookId !== 'string' ||
+      request.hookId.length === 0 ||
+      typeof request.claimId !== 'string' ||
+      request.claimId.length === 0 ||
+      (request.token !== undefined && typeof request.token !== 'string')
+    ) {
+      throw new TypeError('world-celld expired hook claim resolution is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const { tombstone } = await this.retentionState(txn);
+      if (tombstone) return null;
+      const run = await txn.get<WorkflowRun>('run');
+      if (run && isTerminalWorkflowRunStatus(run.status)) return null;
+      const hook = await txn.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
+      if (hook && (request.token === undefined || hook.token === request.token)) return hook;
+      const cancellation = { hookId: request.hookId, token: request.token, canceledAt: this.now() };
+      await txn.put({
+        [hookClaimCancellationKey(`${request.claimId}:${request.claimId}`)]: cancellation,
+        [hookClaimCancellationKey(`-:${request.claimId}`)]: cancellation,
+      });
+      return null;
+    });
   }
 
   /** Single authoritative lifecycle answer used after derivative compaction. */
@@ -1240,12 +1275,14 @@ export class WorkflowRunDO extends DurableObject {
     claimName: string;
     messageId: string;
     expiresAt: number;
+    publicationPending?: boolean;
   }): Promise<RunQueueReservation> {
     if (
       !validRunQueueClaimName(params?.claimName) ||
       typeof params.messageId !== 'string' ||
       params.messageId.length === 0 ||
-      !isNonNegativeSafeInteger(params.expiresAt)
+      !isNonNegativeSafeInteger(params.expiresAt) ||
+      (params.publicationPending !== undefined && typeof params.publicationPending !== 'boolean')
     ) {
       throw new TypeError('world-celld run queue reservation is invalid');
     }
@@ -1268,17 +1305,55 @@ export class WorkflowRunDO extends DurableObject {
       if (values.get(RUN_QUEUE_CLAIM_SCOPE_KEY) !== 'run') return { ok: true, scope: 'cell' };
       const state = (values.get(key) as RunQueueClaimState | undefined) ?? {};
       const existing = state.reservation;
-      if (existing && existing.expiresAt > this.now() && existing.messageId !== params.messageId) {
-        return { ok: true, scope: 'run', admitted: false, messageId: existing.messageId };
+      if (
+        existing &&
+        existing.expiresAt > this.now() &&
+        (existing.messageId !== params.messageId || params.publicationPending)
+      ) {
+        return {
+          ok: true,
+          scope: 'run',
+          admitted: false,
+          messageId: existing.messageId,
+          ...(existing.publicationPending ? { publicationPending: true as const } : {}),
+        };
       }
       await txn.put<RunQueueClaimState>(key, {
         ...state,
         reservation: {
           messageId: params.messageId,
           expiresAt: Math.max(existing?.expiresAt ?? 0, params.expiresAt),
+          ...(params.publicationPending ? { publicationPending: true as const } : {}),
         },
       });
       return { ok: true, scope: 'run', admitted: true, messageId: params.messageId };
+    });
+  }
+
+  async confirmRunQueueMessagePublication(params: {
+    claimName: string;
+    messageId: string;
+    expiresAt: number;
+  }): Promise<void> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.expiresAt)
+    ) {
+      throw new TypeError('world-celld run queue publication confirmation is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = await txn.get<RunQueueClaimState>(key);
+      if (state?.reservation?.messageId !== params.messageId) return;
+      await txn.put<RunQueueClaimState>(key, {
+        ...state,
+        reservation: {
+          messageId: params.messageId,
+          expiresAt: Math.max(state.reservation.expiresAt, params.expiresAt),
+        },
+      });
     });
   }
 
@@ -1306,9 +1381,24 @@ export class WorkflowRunDO extends DurableObject {
       if (this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>)) {
         return { expired: true };
       }
-      const state = (values.get(key) as RunQueueClaimState | undefined) ?? {};
-      const existing = state.claim;
+      let state = (values.get(key) as RunQueueClaimState | undefined) ?? {};
       const now = this.now();
+      if (
+        state.reservation?.publicationPending &&
+        state.reservation.messageId === params.messageId
+      ) {
+        state = {
+          ...state,
+          reservation: {
+            messageId: params.messageId,
+            expiresAt: Math.max(state.reservation.expiresAt, now + QUEUE_RESERVATION_GRACE_MS),
+          },
+        };
+        // A delivery from the broker also proves a previously interrupted
+        // producer's publication, before any suspension can extend its lease.
+        await txn.put<RunQueueClaimState>(key, state);
+      }
+      const existing = state.claim;
       if (existing && existing.expiresAt > now) {
         if (existing.messageId !== params.messageId) return { expired: false, claimed: false };
         if (existing.retryAt === undefined || existing.retryAt > now) {
@@ -1398,6 +1488,28 @@ export class WorkflowRunDO extends DurableObject {
       }
       if (state.claim && state.claim.messageId !== params.messageId) next.claim = state.claim;
       if (next.reservation || next.claim) await txn.put<RunQueueClaimState>(key, next);
+      else await txn.delete(key);
+    });
+  }
+
+  /** Failed enqueue cleanup must preserve delivery already accepted by the broker. */
+  async abandonRunQueueMessageReservation(params: {
+    claimName: string;
+    messageId: string;
+  }): Promise<void> {
+    if (
+      !validRunQueueClaimName(params?.claimName) ||
+      typeof params.messageId !== 'string' ||
+      params.messageId.length === 0
+    ) {
+      throw new TypeError('world-celld run queue reservation abandonment is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const key = runQueueClaimKey(params.claimName);
+      const state = await txn.get<RunQueueClaimState>(key);
+      if (state?.reservation?.messageId !== params.messageId) return;
+      const { reservation: _abandoned, ...rest } = state;
+      if (rest.claim) await txn.put<RunQueueClaimState>(key, rest);
       else await txn.delete(key);
     });
   }
@@ -1508,32 +1620,69 @@ export class WorkflowRunDO extends DurableObject {
   async reserveQueueMessage(params: {
     messageId: string;
     expiresAt: number;
-  }): Promise<{ admitted: boolean; messageId: string }> {
+    publicationPending?: boolean;
+  }): Promise<{ admitted: boolean; messageId: string; publicationPending?: true }> {
     if (
       typeof params?.messageId !== 'string' ||
       params.messageId.length === 0 ||
-      !isNonNegativeSafeInteger(params.expiresAt)
+      !isNonNegativeSafeInteger(params.expiresAt) ||
+      (params.publicationPending !== undefined && typeof params.publicationPending !== 'boolean')
     ) {
       throw new TypeError('world-celld queue message reservation is invalid');
     }
     return await this.ctx.storage.transaction(async (txn) => {
-      const values = await txn.get<InflightClaim>([QUEUE_RESERVATION_KEY, 'claim']);
+      const values = await txn.get<QueueMessageReservation>([QUEUE_RESERVATION_KEY, 'claim']);
       const existing = values.get(QUEUE_RESERVATION_KEY);
       const claim = values.get('claim');
       const now = this.now();
-      if (existing && existing.expiresAt > now && existing.messageId !== params.messageId) {
+      if (
+        existing &&
+        existing.expiresAt > now &&
+        (existing.messageId !== params.messageId || params.publicationPending)
+      ) {
         await txn.setAlarm(Math.min(existing.expiresAt, claim?.expiresAt ?? existing.expiresAt));
-        return { admitted: false, messageId: existing.messageId };
+        return {
+          admitted: false,
+          messageId: existing.messageId,
+          ...(existing.publicationPending ? { publicationPending: true as const } : {}),
+        };
       }
       const reservation: QueueMessageReservation = {
         messageId: params.messageId,
         expiresAt: Math.max(existing?.expiresAt ?? 0, params.expiresAt),
+        ...(params.publicationPending ? { publicationPending: true as const } : {}),
       };
       await txn.put(QUEUE_RESERVATION_KEY, reservation);
       await txn.setAlarm(
         Math.min(reservation.expiresAt, claim?.expiresAt ?? reservation.expiresAt),
       );
       return { admitted: true, messageId: params.messageId };
+    });
+  }
+
+  async confirmQueueMessagePublication(params: {
+    messageId: string;
+    expiresAt: number;
+  }): Promise<void> {
+    if (
+      typeof params?.messageId !== 'string' ||
+      params.messageId.length === 0 ||
+      !isNonNegativeSafeInteger(params.expiresAt)
+    ) {
+      throw new TypeError('world-celld queue publication confirmation is invalid');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<QueueMessageReservation>([QUEUE_RESERVATION_KEY, 'claim']);
+      const existing = values.get(QUEUE_RESERVATION_KEY);
+      if (existing?.messageId !== params.messageId) return;
+      const reservation: QueueMessageReservation = {
+        messageId: params.messageId,
+        expiresAt: Math.max(existing.expiresAt, params.expiresAt),
+      };
+      await txn.put(QUEUE_RESERVATION_KEY, reservation);
+      await txn.setAlarm(
+        Math.min(reservation.expiresAt, values.get('claim')?.expiresAt ?? reservation.expiresAt),
+      );
     });
   }
 
@@ -1562,6 +1711,22 @@ export class WorkflowRunDO extends DurableObject {
     });
   }
 
+  /** Abandon the enqueue reservation without releasing an active delivery claim. */
+  async abandonQueueMessageReservation(messageId: string): Promise<void> {
+    if (typeof messageId !== 'string' || messageId.length === 0) {
+      throw new TypeError('world-celld queue reservation messageId must be a non-empty string');
+    }
+    await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<InflightClaim>([QUEUE_RESERVATION_KEY, 'claim']);
+      const reservation = values.get(QUEUE_RESERVATION_KEY);
+      if (reservation?.messageId !== messageId) return;
+      await txn.delete(QUEUE_RESERVATION_KEY);
+      const claim = values.get('claim');
+      if (claim) await txn.setAlarm(claim.expiresAt);
+      else await txn.deleteAlarm();
+    });
+  }
+
   async claimInflight(params: {
     messageId: string;
     staleMs: number;
@@ -1574,10 +1739,17 @@ export class WorkflowRunDO extends DurableObject {
       throw new TypeError('world-celld queue claim is invalid');
     }
     return await this.ctx.storage.transaction(async (txn) => {
-      const values = await txn.get<InflightClaim>(['claim', QUEUE_RESERVATION_KEY]);
+      const values = await txn.get<QueueMessageReservation>(['claim', QUEUE_RESERVATION_KEY]);
       const existing = values.get('claim');
-      const reservation = values.get(QUEUE_RESERVATION_KEY);
+      let reservation = values.get(QUEUE_RESERVATION_KEY);
       const now = this.now();
+      if (reservation?.publicationPending && reservation.messageId === params.messageId) {
+        reservation = {
+          messageId: params.messageId,
+          expiresAt: Math.max(reservation.expiresAt, now + QUEUE_RESERVATION_GRACE_MS),
+        };
+        await txn.put<QueueMessageReservation>(QUEUE_RESERVATION_KEY, reservation);
+      }
       if (existing && existing.expiresAt > now) {
         if (existing.messageId !== params.messageId) return { claimed: false };
         if (existing.retryAt === undefined || existing.retryAt > now) {

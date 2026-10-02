@@ -19,6 +19,8 @@ export interface QueueClaimHandle {
     reservationExpiresAt?: number;
   }): Promise<{ held: boolean }>;
   release(messageId: string): Promise<void>;
+  abandonReservation(messageId: string): Promise<void>;
+  confirmPublication(messageId: string, expiresAt: number): Promise<void>;
   complete(messageId: string): Promise<void>;
 }
 
@@ -27,6 +29,9 @@ export function cellQueueClaim(cell: QueueRunStub): QueueClaimHandle {
     claim: (messageId, staleMs) => cell.claimInflight({ messageId, staleMs }),
     hold: (params) => cell.holdInflight(params),
     release: (messageId) => cell.releaseInflight(messageId),
+    abandonReservation: (messageId) => cell.abandonQueueMessageReservation(messageId),
+    confirmPublication: (messageId, expiresAt) =>
+      cell.confirmQueueMessagePublication({ messageId, expiresAt }),
     complete: (messageId) => cell.completeQueueMessage(messageId),
   };
 }
@@ -39,6 +44,10 @@ export function runQueueClaim(run: QueueRunStub, claimName: string): QueueClaimH
     },
     hold: (params) => run.holdRunQueueMessage({ claimName, ...params }),
     release: (messageId) => run.releaseRunQueueMessage({ claimName, messageId }),
+    abandonReservation: (messageId) =>
+      run.abandonRunQueueMessageReservation({ claimName, messageId }),
+    confirmPublication: (messageId, expiresAt) =>
+      run.confirmRunQueueMessagePublication({ claimName, messageId, expiresAt }),
     complete: (messageId) => run.completeRunQueueMessage({ claimName, messageId }),
   };
 }

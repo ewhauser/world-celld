@@ -44,6 +44,7 @@ const RUNS: MethodSpec = {
     'cleanupNow',
     'rearmCleanup',
     'resolveHookTokenClaim',
+    'resolveExpiredHookClaim',
   ],
   mutating: new Set([
     'applyEvent',
@@ -51,6 +52,7 @@ const RUNS: MethodSpec = {
     'cleanupNow',
     'rearmCleanup',
     'resolveHookTokenClaim',
+    'resolveExpiredHookClaim',
   ]),
 };
 

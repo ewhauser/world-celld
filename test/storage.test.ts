@@ -362,7 +362,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         // counter only advances on step_started.
         expect(updated.status).toBe('pending');
         expect(updated.attempt).toBe(1);
-        expect(updated.error?.message).toBe('retry error');
+        expect(updated.error).toBe('retry error');
 
         const restarted = await storage.events.create(testRunId, {
           eventType: 'step_started',

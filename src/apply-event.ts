@@ -329,8 +329,8 @@ function readStringProp(value: unknown, key: string): string | undefined {
 }
 
 /**
- * Map a failure eventData.error (which may be a string, an Error-shaped
- * object, or anything else) to the structured error stored on entities.
+ * Map a run failure eventData.error (which may be a string, an Error-shaped
+ * object, or anything else) to the structured error stored on runs.
  * Matches upstream: string errors keep their text, errorCode is preserved.
  */
 function toStructuredError(
@@ -1012,8 +1012,8 @@ export async function applyEvent(
           },
         );
       }
-      const updated = StepSchema.parse(
-        compact({
+      const updated = StepSchema.parse({
+        ...compact({
           ...step,
           status: 'running',
           // Only set startedAt on the first start; increment attempt each start.
@@ -1022,7 +1022,8 @@ export async function applyEvent(
           retryAfter: undefined,
           updatedAt: now,
         }),
-      );
+        error: step.error,
+      });
       const event = buildEvent({ ...data });
       await store.put(`${STEP_KEY_PREFIX}${data.correlationId}`, updated);
       await putEvent(event);
@@ -1040,15 +1041,16 @@ export async function applyEvent(
       if (!step) {
         return failure('STEP_NOT_FOUND', `Step "${data.correlationId}" not found`);
       }
-      const updated = StepSchema.parse(
-        compact({
+      const updated = StepSchema.parse({
+        ...compact({
           ...step,
           status: 'completed',
           output: data.eventData.result,
           completedAt: now,
           updatedAt: now,
         }),
-      );
+        error: step.error,
+      });
       const event = buildEvent({ ...data });
       await store.put(`${STEP_KEY_PREFIX}${data.correlationId}`, updated);
       await putEvent(event);
@@ -1060,15 +1062,15 @@ export async function applyEvent(
       if (!step) {
         return failure('STEP_NOT_FOUND', `Step "${data.correlationId}" not found`);
       }
-      const updated = StepSchema.parse(
-        compact({
-          ...step,
-          status: 'failed',
-          error: toStructuredError(data.eventData.error),
-          completedAt: now,
-          updatedAt: now,
-        }),
-      );
+      // Step errors are opaque runtime serialization, unlike run errors.
+      // Preserve bytes and legacy thrown values (including null) verbatim.
+      const updated = StepSchema.parse({
+        ...step,
+        status: 'failed',
+        error: data.eventData.error,
+        completedAt: now,
+        updatedAt: now,
+      });
       const event = buildEvent({ ...data });
       await store.put(`${STEP_KEY_PREFIX}${data.correlationId}`, updated);
       await putEvent(event);
@@ -1080,15 +1082,13 @@ export async function applyEvent(
       if (!step) {
         return failure('STEP_NOT_FOUND', `Step "${data.correlationId}" not found`);
       }
-      const updated = StepSchema.parse(
-        compact({
-          ...step,
-          status: 'pending',
-          error: toStructuredError(data.eventData.error),
-          retryAfter: data.eventData.retryAfter ? new Date(data.eventData.retryAfter) : undefined,
-          updatedAt: now,
-        }),
-      );
+      const updated = StepSchema.parse({
+        ...step,
+        status: 'pending',
+        error: data.eventData.error,
+        retryAfter: data.eventData.retryAfter ? new Date(data.eventData.retryAfter) : undefined,
+        updatedAt: now,
+      });
       const event = buildEvent({ ...data });
       await store.put(`${STEP_KEY_PREFIX}${data.correlationId}`, updated);
       await putEvent(event);
@@ -1129,7 +1129,7 @@ export async function applyEvent(
       const existingMarker = await store.get<string>(markerKey);
       if (existingMarker !== undefined) {
         const existingHook = await store.get<Hook>(hookKey);
-        if (existingHook && !holder) {
+        if (existingHook && !holder && existingHook.token === token) {
           // Crash orphan: hook + event committed but one or both sharded
           // index writes were lost. Complete the partial write by re-indexing.
           return { ok: true, hook: existingHook, hookToIndex: existingHook, releasedHooks: [] };

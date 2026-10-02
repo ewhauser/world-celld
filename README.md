@@ -316,6 +316,11 @@ fleet-wide maximum age are both enabled, the earlier deadline wins.
 
 - Delivery is at least once. Workflow steps and other external side effects
   must be idempotent.
+- A concurrent enqueue with the same idempotency key returns a retryable `503`
+  while broker publication is pending. Publication confirmation starts the
+  normal deduplication window. If a producer stops before publication completes,
+  its pending reservation can be replaced after five minutes. Broker delivery
+  also confirms publication when the producer's confirmation was interrupted.
 - Native Queue operations are administered with celld's `queue info`, `peek`,
   `pause`, `resume`, `purge`, and `redrive` commands.
 - Run cells expose retention status, scheduling, immediate cleanup, and alarm
