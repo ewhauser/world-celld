@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.0 (2026-10-06)
+
+## What's Changed
+* feat: support World spec v8 and deliver demo queues by @ewhauser in https://github.com/ewhauser/world-celld/pull/90
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.8.1...v0.9.0
+
 ## 0.8.1 (2026-10-02)
 
 ## What's Changed
