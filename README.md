@@ -14,11 +14,18 @@ self-hosted alternative to platform-specific Workflow backends.
 
 ## World protocol compatibility
 
-This adapter supports World spec v7 with the Workflow 5 beta packages. Event
-slots are allocated in the same transaction that stores each event, so reads
-see a dense log and failed writes leave no gaps. No background sealing or
-`noop` events are needed. Runs stamped with earlier spec versions are rejected
-when applying events; finish existing runs before upgrading.
+This adapter supports World spec v8 with the Workflow 5 beta packages. This is
+a breaking upgrade for applications using a v7 Workflow runtime: that runtime
+rejects a World advertising v8. This adapter also rejects event writes to runs
+stamped v7. Keep the v7 adapter and matching Workflow packages in place until
+those runs finish, then upgrade the application and adapter together.
+
+Event slots are allocated in the same transaction that stores each event, so
+reads see a dense log and failed writes leave no gaps. No background sealing or
+`noop` events are needed.
+
+World v8 adds forced hook claims. This adapter does not advertise the optional
+`hookForceClaim` capability, so `experimental_force` is unavailable.
 
 Run listing accepts either a single status or an array of statuses (OR matching).
 An empty status array matches no runs.

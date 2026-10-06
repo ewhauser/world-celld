@@ -468,7 +468,13 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
             queueName: reqQueueName,
             messageId: reqMessageId,
           });
-          if (result && typeof result.timeoutSeconds === 'number') {
+          if (
+            !('invoke' in parsedBody.data && parsedBody.data.invoke) &&
+            result !== null &&
+            typeof result === 'object' &&
+            'timeoutSeconds' in result &&
+            typeof result.timeoutSeconds === 'number'
+          ) {
             if (
               queueDelayDeadline(
                 Date.now(),
