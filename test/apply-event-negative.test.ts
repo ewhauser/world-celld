@@ -105,11 +105,11 @@ function applyOutcomeFetch(outcome: unknown): typeof fetch {
 }
 
 describe('negative apply-event contract', () => {
-  it('advertises v7 and commits concurrent events densely across rejections and restart', async () => {
-    const runId = 'wrun_sealed_log_v7';
+  it('advertises v8 and commits concurrent events densely across rejections and restart', async () => {
+    const runId = 'wrun_sealed_log_v8';
     const run = await createRun(runId);
-    expect(SPEC_VERSION_CURRENT).toBe(7);
-    expect(run.specVersion).toBe(7);
+    expect(SPEC_VERSION_CURRENT).toBe(8);
+    expect(run.specVersion).toBe(8);
     const writer = storage();
     const write = (id: string) =>
       writer.events.create(runId, {
@@ -125,7 +125,7 @@ describe('negative apply-event contract', () => {
     expect(events.data.map((event) => event.eventId)).toEqual(
       Array.from({ length: 10 }, (_, index) => slotToEventId(index + 1)),
     );
-    expect(events.data.every((event) => event.specVersion === 7)).toBe(true);
+    expect(events.data.every((event) => event.specVersion === 8)).toBe(true);
     expect(events.data.some((event) => event.eventType === 'noop')).toBe(false);
   });
 

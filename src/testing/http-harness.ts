@@ -11,13 +11,26 @@ import { RunCatalogDO } from '../worker/durable-objects/RunCatalogDO.js';
 import { StreamDO } from '../worker/durable-objects/StreamDO.js';
 import { WorkflowRunDO } from '../worker/durable-objects/WorkflowRunDO.js';
 import { createQueuePayloadStore } from '../worker/queue-payload-store.js';
+import { deliverQueueMessage, type QueueDeliveryResult } from '../worker/queue-delivery.js';
+import type { NativeQueueEnvelope } from '../queue-protocol.js';
 import { FakeFleet } from './fake-cell.js';
+
+export interface QueuedMessage {
+  body: string;
+  delaySeconds: number;
+}
 
 export interface Harness {
   url: string;
   fleet: FakeFleet;
   queueMessages: string[];
+  queuePublications: QueuedMessage[];
   queuePayloads: ReadonlyMap<string, string>;
+  deliverQueueMessage(
+    secret: string,
+    envelope: NativeQueueEnvelope,
+    attempt: number,
+  ): Promise<QueueDeliveryResult>;
   close(): Promise<void>;
 }
 
@@ -34,6 +47,7 @@ export interface HarnessOptions {
 export async function startHarness(options: HarnessOptions = {}): Promise<Harness> {
   const cellEnv = { ...options.cellEnv };
   const queueMessages: string[] = [];
+  const queuePublications: QueuedMessage[] = [];
   const queuePayloads = new Map<string, string>();
   const queuePayloadBucket = {
     async put(key: string, value: string) {
@@ -48,8 +62,9 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     },
   };
   const nativeQueue = {
-    async send(body: string) {
+    async send(body: string, sendOptions?: { delaySeconds?: number }) {
       queueMessages.push(body);
+      queuePublications.push({ body, delaySeconds: sendOptions?.delaySeconds ?? 0 });
     },
   };
   const fleet = new FakeFleet(
@@ -135,7 +150,10 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     url: `http://127.0.0.1:${port}`,
     fleet,
     queueMessages,
+    queuePublications,
     queuePayloads,
+    deliverQueueMessage: (secret, envelope, attempt) =>
+      deliverQueueMessage(env, secret, envelope, attempt),
     close: () =>
       new Promise<void>((resolve, reject) => {
         // Test clients may retain an active keep-alive connection after their
