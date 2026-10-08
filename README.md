@@ -391,6 +391,19 @@ probe at startup; the smoke runs exactly one celld process at a time. It proves 
 single-process restart boundaries above, not multi-node ownership, handoff, or
 failover correctness.
 
+### Queue batch qualification
+
+The optional `queueBatch` API uses native broker batches automatically. The
+pinned Workflow beta.58 SDK only calls it when the World also supplies
+`events.createBatch`, which this adapter currently lacks. Exposing queue batching
+alone therefore does not accelerate SDK fan-out. See the
+[qualification report](docs/queue-batch-qualification.md) for recovery tests,
+real SDK coverage, and the local A/B benchmark:
+
+```sh
+pnpm test:perf:queue-batch
+```
+
 ### Local MinIO performance and loss test
 
 The opt-in performance harness starts a fresh MinIO bucket and a single celld

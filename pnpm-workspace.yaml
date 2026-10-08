@@ -1,6 +1,7 @@
 packages:
   - '.'
   - 'examples/*'
+  - 'test/fixtures/workflow-v*'
 # Converge compatible ranges on the first releases patched for advisories in
 # the demo and test tooling's Workflow transitive dependencies.
 overrides:

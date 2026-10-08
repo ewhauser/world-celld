@@ -15,7 +15,7 @@ afterAll(async () => {
   await harness.close();
 });
 
-test('reports a failed native chunk per entry and permits retrying its key', async () => {
+test('replays a whole partially published batch without republishing its confirmed entries', async () => {
   const previousMode = process.env.CELLD_QUEUE_MODE;
   process.env.CELLD_QUEUE_MODE = 'native';
   const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
@@ -54,13 +54,12 @@ test('reports a failed native chunk per entry and permits retrying its key', asy
       error: 'broker unavailable',
       retryable: true,
     });
-    const retry = await queue.queue(
-      '__wkf_workflow_batch',
-      messages[100].message,
-      messages[100].opts,
-    );
-    expect(retry.messageId).toMatch(/^msg_/);
-    expect(send).toHaveBeenCalledOnce();
+    const retry = await queue.queueBatch!('__wkf_workflow_batch', messages);
+    expect(retry.slice(0, 100)).toEqual(results.slice(0, 100));
+    expect(retry[100].messageId).toMatch(/^msg_/);
+    expect(retry.every((result) => result.error === undefined)).toBe(true);
+    expect(sendBatch.mock.calls.map(([entries]) => entries.length)).toEqual([100, 1, 1]);
+    expect(send).not.toHaveBeenCalled();
   } finally {
     if (previousMode === undefined) delete process.env.CELLD_QUEUE_MODE;
     else process.env.CELLD_QUEUE_MODE = previousMode;

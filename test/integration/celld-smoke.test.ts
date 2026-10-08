@@ -1,16 +1,18 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes, createHash } from 'node:crypto';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, rm, symlink, copyFile, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { promisify } from 'node:util';
 import { RunExpiredError } from '@workflow/errors';
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
 import { build } from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../../src/index.js';
+import { rpcParse, rpcStringify } from '../../src/codec.js';
+import type { NativeQueueEnvelope, NativeQueueBatchResult } from '../../src/queue-protocol.js';
 
 const execFileAsync = promisify(execFile);
 const CELLD_BIN = process.env.CELLD_SMOKE_CELLD_BIN;
@@ -39,6 +41,10 @@ interface RestartEvidence {
   oldPid: number;
   newPid: number;
   startedAt: number;
+}
+
+function percentile(values: number[], p: number): number {
+  return values.toSorted((a, b) => a - b)[Math.ceil(values.length * p) - 1];
 }
 
 function delay(ms: number): Promise<void> {
@@ -160,6 +166,17 @@ async function prepareWorker(
       export default {
         ...worker,
         async fetch(request, env) {
+          const gate = request.headers.get('x-test-broker-gate');
+          if (gate && new URL(request.url).pathname === '/v1/queue/send-batch') {
+            const binding = env.WORKFLOW_QUEUE;
+            return worker.fetch(request, {...env, WORKFLOW_QUEUE: {
+              send: binding.send.bind(binding),
+              async sendBatch(messages) {
+                await binding.sendBatch(messages);
+                await fetch(gate, {method: 'POST', body: JSON.stringify(messages)});
+              },
+            }});
+          }
           if (new URL(request.url).pathname !== '/__test/queue-rpc') return worker.fetch(request, env);
           const [secret, envelope, attempt] = await request.json();
           try {
@@ -221,11 +238,18 @@ class NativeCelldRuntime {
       CELLD_OTEL: '1',
       CELLD_OTEL_FLUSH_MS: '1000',
       CELLD_OPERATION_DEADLINE_MS: '10000',
-      CELLD_TTL_MS: '2000',
+      // Restart checks use a short lease; load measurements need headroom for
+      // object-store renewal under concurrent payload publication.
+      CELLD_TTL_MS: process.env.CELLD_QUEUE_BENCHMARK ? '30000' : '2000',
       CELLD_WAKER_TICK_MS: '50',
       CELLD_WATCH: watchDirectory,
       RUST_LOG: 'info',
     };
+  }
+
+  get pid(): number {
+    if (!this.celld?.child.pid) throw new Error('celld is not running');
+    return this.celld.child.pid;
   }
 
   get url(): string {
@@ -312,6 +336,7 @@ class NativeCelldRuntime {
 
 describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', () => {
   const deliveries: CapturedDelivery[] = [];
+  const suspendedQueues = new Set<string>();
   let temporaryRoot: string;
   let minio: ManagedProcess | undefined;
   let runtime: NativeCelldRuntime | undefined;
@@ -453,6 +478,11 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
         });
         const queueName = String(request.headers['x-vqs-queue-name'] ?? '');
         const matching = deliveries.filter((d) => d.headers['x-vqs-queue-name'] === queueName);
+        if (suspendedQueues.has(queueName)) {
+          response.writeHead(503, { 'content-type': 'application/json' });
+          response.end('{"timeoutSeconds":5}');
+          return;
+        }
         if (matching.length === 1 && queueName.includes('rpc_suspend')) {
           response.writeHead(503, { 'content-type': 'application/json' });
           response.end('{"timeoutSeconds":1}');
@@ -513,6 +543,733 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
       ...options,
     });
   }
+
+  async function sdkHost(
+    version: 7 | 8,
+    path: 'single' | 'batch',
+    execution: 'queued' | 'inline' = 'queued',
+  ) {
+    const directory = join(temporaryRoot, `sdk-v${version}-${path}-${execution}`);
+    await mkdir(directory, { recursive: true });
+    const fixture = resolvePath(`test/fixtures/workflow-v${version}`);
+    await symlink(join(fixture, 'node_modules'), join(directory, 'node_modules'), 'dir');
+    await copyFile(join(fixture, 'package.json'), join(directory, 'package.json'));
+    await copyFile('test/fixtures/queue-fanout/fanout.ts', join(directory, 'fanout.ts'));
+    await copyFile('test/fixtures/queue-fanout/server.mjs', join(directory, 'server.mjs'));
+    await execFileAsync(
+      process.execPath,
+      [join(fixture, 'node_modules/workflow/bin/run.js'), 'build'],
+      {
+        cwd: directory,
+        env: process.env,
+        maxBuffer: 4 * 1024 * 1024,
+      },
+    );
+    const port = await freePort();
+    const url = `http://127.0.0.1:${port}`;
+    const app = startManaged(
+      `sdk-v${version}-${path}-${execution}`,
+      process.execPath,
+      [join(directory, 'server.mjs')],
+      {
+        ...process.env,
+        PORT: String(port),
+        WORKFLOW_BASE_URL: url,
+        WORKFLOW_TARGET_WORLD: resolvePath('test/fixtures/queue-fanout/world.mjs'),
+        CELLD_FLEET_URL: runtime!.url,
+        CELLD_WORLD_SECRET: SECRET,
+        CELLD_DEPLOYMENT_ID: `sdk-v${version}-${path}-${randomUUID()}`,
+        QUALIFICATION_QUEUE_PATH: path,
+        WORKFLOW_TURBO: execution === 'queued' ? '0' : '1',
+      },
+    );
+    try {
+      await waitFor(
+        async () => {
+          if (app.child.exitCode !== null) throw new Error(app.logs());
+          return (await fetch(`${url}/health`)).ok;
+        },
+        30_000,
+        `SDK host readiness\n${app.logs()}`,
+      );
+    } catch (error) {
+      await stopManaged(app);
+      throw new Error(`${String(error)}\n${app.logs()}`, { cause: error });
+    }
+    return { app, url };
+  }
+
+  interface FanoutValue {
+    results: Array<{
+      index: number;
+      length: number;
+      attempt: number;
+      startedAt: number;
+      digest: string;
+    }>;
+    sum: number;
+  }
+
+  async function invokeFanout(url: string, count: number, input: string, retry: boolean) {
+    const startedAt = Date.now();
+    const response = await fetch(`${url}/invoke`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify([count, input, retry]),
+    });
+    if (!response.ok) throw new Error(await response.text());
+    expect(response.status).toBe(200);
+    const { runId } = (await response.json()) as { runId: string };
+    const value = await waitFor(
+      async () => {
+        const status = (await fetch(`${url}/runs/${runId}`).then((r) => r.json())) as {
+          status: string;
+          value?: FanoutValue;
+          error?: unknown;
+        };
+        if (status.status === 'failed') throw new Error(JSON.stringify(status.error));
+        return status.status === 'completed' ? status.value : null;
+      },
+      120_000,
+      `SDK fanout ${count}, run ${runId}`,
+    );
+    expect(value.results.map((result) => result.index)).toEqual(
+      Array.from({ length: count }, (_, i) => i),
+    );
+    expect(value.results.every((result) => result.length === input.length)).toBe(true);
+    const digest = createHash('sha256').update(input).digest('hex');
+    expect(value.results.every((result) => result.digest === digest)).toBe(true);
+    expect(value.sum).toBe((count * (count - 1)) / 2);
+    expect(value.results[0].attempt).toBe(retry ? 2 : 1);
+    return {
+      runId,
+      count,
+      bytes: input.length,
+      firstStepMs: Math.min(...value.results.map((result) => result.startedAt)) - startedAt,
+      completionMs: Date.now() - startedAt,
+    };
+  }
+
+  it('completes SDK v8 queued Promise.all fan-out, retries, and offloaded inputs', async () => {
+    const { app, url } = await sdkHost(8, 'batch');
+    try {
+      for (const count of [1, 8, 32, 128]) {
+        const result = await invokeFanout(url, count, 'qualification', false);
+        console.log(`CELLD_SDK_FANOUT ${JSON.stringify({ version: 8, ...result })}`);
+      }
+      await invokeFanout(url, 8, randomBytes(150_000).toString('base64'), true);
+      const metrics = (await fetch(`${url}/metrics`).then((r) => r.json())) as {
+        batches: number;
+        singles: number;
+        queueBatchPresent: boolean;
+        eventBatchPresent: boolean;
+      };
+      // beta.58 gates queueBatch on events.createBatch, absent in this adapter.
+      expect(metrics.batches).toBe(0);
+      expect(metrics.singles).toBeGreaterThan(128);
+      expect(metrics.queueBatchPresent).toBe(true);
+      expect(metrics.eventBatchPresent).toBe(false);
+    } finally {
+      await stopManaged(app);
+    }
+  }, 300_000);
+
+  it('completes default inline fan-out without relying on queue batching', async () => {
+    const { app, url } = await sdkHost(8, 'batch', 'inline');
+    try {
+      await invokeFanout(url, 128, 'inline-qualification', false);
+      const metrics = (await fetch(`${url}/metrics`).then((r) => r.json())) as { batches: number };
+      expect(metrics.batches).toBe(0);
+    } finally {
+      await stopManaged(app);
+    }
+  });
+
+  it('preserves the documented v7 SDK rejection of a World declaring v8', async () => {
+    await expect(
+      execFileAsync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          "import {getWorld} from '@workflow/core/runtime'; await getWorld();",
+        ],
+        {
+          cwd: resolvePath('test/fixtures/workflow-v7'),
+          env: {
+            ...process.env,
+            WORKFLOW_TARGET_WORLD: resolvePath('test/fixtures/queue-fanout/world.mjs'),
+            CELLD_FLEET_URL: runtime!.url,
+            CELLD_WORLD_SECRET: SECRET,
+          },
+        },
+      ),
+    ).rejects.toThrow(
+      /supports Worlds with spec version 6 through 7.*World declares spec version 8/,
+    );
+  });
+
+  it.skipIf(!process.env.CELLD_QUEUE_BENCHMARK)(
+    'measures alternating SDK fan-out batches against singles',
+    async () => {
+      const hosts = { single: await sdkHost(8, 'single'), batch: await sdkHost(8, 'batch') };
+      type Path = keyof typeof hosts;
+      const samples: Array<{
+        path: Path;
+        bytes: number;
+        concurrency: number;
+        round: number;
+        firstStepMs: number;
+        completionMs: number;
+        runId: string;
+      }> = [];
+      const groups: Array<Record<string, unknown>> = [];
+      async function processResources(pid: number) {
+        const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'time=,rss=']);
+        const [time, rss] = stdout.trim().split(/\s+/);
+        const parts = time.split(':').map(Number);
+        const cpuMs = parts.reduce((total, part) => total * 60 + part, 0) * 1000;
+        return { cpuMs, rssKiB: Number(rss) };
+      }
+      const metrics = (path: Path) =>
+        fetch(`${hosts[path].url}/metrics`).then((r) => r.json()) as Promise<{
+          singles: number;
+          batches: number;
+          entries: number;
+          resources: { userCPUTime: number; systemCPUTime: number; maxRSS: number };
+          memory: { rss: number };
+        }>;
+      const largeInput = randomBytes(150_000).toString('base64');
+      const nativeGroups: Array<{
+        path: Path;
+        bytes: number;
+        concurrency: number;
+        round: number;
+        publicationMs: number;
+        firstDeliveryMs: number;
+        completionMs: number;
+        celldCpuMs: number;
+        celldRssKiB: number;
+        minioCpuMs: number;
+        minioRssKiB: number;
+      }> = [];
+      try {
+        for (const bytes of [0, 200_000]) {
+          for (const concurrency of [1, 4]) {
+            for (let round = -1; round < 10; round++) {
+              const paths: Path[] = round % 2 === 0 ? ['single', 'batch'] : ['batch', 'single'];
+              for (const path of paths) {
+                const deploymentId = `native-ab-${randomUUID()}`;
+                const w = world({ deploymentId });
+                const queueName = `__wkf_workflow_native_ab_${randomUUID().slice(0, 8)}`;
+                const runs = await Promise.all(
+                  Array.from({ length: concurrency }, () =>
+                    w.events.create(null, {
+                      eventType: 'run_created',
+                      eventData: { deploymentId, workflowName: deploymentId, input: [] },
+                    }),
+                  ),
+                );
+                const messages = runs.map(({ run }) =>
+                  Array.from({ length: 32 }, (_, index) => ({
+                    message:
+                      bytes === 0
+                        ? { runId: run.runId, stepId: `step_${index}` }
+                        : {
+                            runId: run.runId,
+                            runInput: {
+                              input: largeInput,
+                              deploymentId,
+                              workflowName: deploymentId,
+                              specVersion: SPEC_VERSION_CURRENT,
+                            },
+                          },
+                    opts: { idempotencyKey: `${run.runId}-${index}` },
+                  })),
+                );
+                const celldBefore = await processResources(runtime!.pid);
+                const minioBefore = await processResources(minio!.child.pid!);
+                const startedAt = Date.now();
+                const outcomes =
+                  path === 'batch'
+                    ? (
+                        await Promise.all(
+                          messages.map((entries) => w.queueBatch!(queueName, entries)),
+                        )
+                      ).flat()
+                    : await Promise.all(
+                        messages
+                          .flat()
+                          .map((entry) => w.queue(queueName, entry.message, entry.opts)),
+                      );
+                expect(
+                  outcomes.every((outcome) => !('error' in outcome) || outcome.error === undefined),
+                ).toBe(true);
+                expect(new Set(outcomes.map((outcome) => outcome.messageId)).size).toBe(
+                  32 * concurrency,
+                );
+                const publicationMs = Date.now() - startedAt;
+                await waitFor(
+                  async () =>
+                    new Set(
+                      deliveries
+                        .filter((d) => d.headers['x-vqs-queue-name'] === queueName)
+                        .map((d) => d.headers['x-vqs-message-id']),
+                    ).size ===
+                    32 * concurrency,
+                  30_000,
+                  'native A/B callbacks',
+                );
+                const delivered = deliveries.filter(
+                  (d) => d.headers['x-vqs-queue-name'] === queueName,
+                );
+                const celldAfter = await processResources(runtime!.pid);
+                const minioAfter = await processResources(minio!.child.pid!);
+                if (round >= 0)
+                  nativeGroups.push({
+                    path,
+                    bytes,
+                    concurrency,
+                    round,
+                    publicationMs,
+                    firstDeliveryMs: Math.min(...delivered.map((d) => d.receivedAt)) - startedAt,
+                    completionMs: Math.max(...delivered.map((d) => d.receivedAt)) - startedAt,
+                    celldCpuMs: celldAfter.cpuMs - celldBefore.cpuMs,
+                    celldRssKiB: celldAfter.rssKiB,
+                    minioCpuMs: minioAfter.cpuMs - minioBefore.cpuMs,
+                    minioRssKiB: minioAfter.rssKiB,
+                  });
+                for (let i = deliveries.length - 1; i >= 0; i--)
+                  if (deliveries[i].headers['x-vqs-queue-name'] === queueName)
+                    deliveries.splice(i, 1);
+              }
+              if (round >= 0)
+                console.log(
+                  `CELLD_NATIVE_AB_PROGRESS ${JSON.stringify({ bytes, concurrency, round: round + 1, rounds: 10 })}`,
+                );
+            }
+          }
+        }
+        for (const path of ['single', 'batch'] as const) {
+          await invokeFanout(hosts[path].url, 32, 'warmup', false);
+          await invokeFanout(hosts[path].url, 32, largeInput, false);
+        }
+        for (const bytes of [32, 200_000]) {
+          for (const concurrency of [1, 4]) {
+            for (let round = 0; round < 10; round++) {
+              const paths: Path[] = round % 2 === 0 ? ['single', 'batch'] : ['batch', 'single'];
+              for (const path of paths) {
+                const appBefore = await metrics(path);
+                const celldBefore = await processResources(runtime!.pid);
+                const minioBefore = await processResources(minio!.child.pid!);
+                const started = Date.now();
+                const results = await Promise.all(
+                  Array.from({ length: concurrency }, () =>
+                    invokeFanout(
+                      hosts[path].url,
+                      32,
+                      bytes === 200_000 ? largeInput : 'x'.repeat(bytes),
+                      false,
+                    ),
+                  ),
+                );
+                const elapsedMs = Date.now() - started;
+                const appAfter = await metrics(path);
+                const celldAfter = await processResources(runtime!.pid);
+                const minioAfter = await processResources(minio!.child.pid!);
+                samples.push(
+                  ...results.map((result) =>
+                    Object.assign({}, result, { path, bytes, concurrency, round }),
+                  ),
+                );
+                groups.push({
+                  path,
+                  bytes,
+                  concurrency,
+                  round,
+                  elapsedMs,
+                  stepsPerSecond: (32 * concurrency * 1000) / elapsedMs,
+                  singles: appAfter.singles - appBefore.singles,
+                  batches: appAfter.batches - appBefore.batches,
+                  batchEntries: appAfter.entries - appBefore.entries,
+                  appCpuMs:
+                    (appAfter.resources.userCPUTime +
+                      appAfter.resources.systemCPUTime -
+                      appBefore.resources.userCPUTime -
+                      appBefore.resources.systemCPUTime) /
+                    1000,
+                  appRssBytes: appAfter.memory.rss,
+                  appMaxRssKiB: appAfter.resources.maxRSS,
+                  celldCpuMs: celldAfter.cpuMs - celldBefore.cpuMs,
+                  celldRssKiB: celldAfter.rssKiB,
+                  minioCpuMs: minioAfter.cpuMs - minioBefore.cpuMs,
+                  minioRssKiB: minioAfter.rssKiB,
+                });
+              }
+              console.log(
+                `CELLD_SDK_AB_PROGRESS ${JSON.stringify({ bytes, concurrency, round: round + 1, rounds: 10 })}`,
+              );
+            }
+          }
+        }
+        const summaries = [32, 200_000].flatMap((bytes) =>
+          [1, 4].flatMap((concurrency) =>
+            (['single', 'batch'] as const).map((path) => {
+              const rows = samples.filter(
+                (row) =>
+                  row.path === path && row.bytes === bytes && row.concurrency === concurrency,
+              );
+              const workloads = groups.filter(
+                (group) =>
+                  group.path === path && group.bytes === bytes && group.concurrency === concurrency,
+              );
+              return {
+                path,
+                bytes,
+                concurrency,
+                runs: rows.length,
+                queueBatchCalls: workloads.reduce(
+                  (total, group) => total + Number(group.batches),
+                  0,
+                ),
+                singleQueueCalls: workloads.reduce(
+                  (total, group) => total + Number(group.singles),
+                  0,
+                ),
+                firstStepP50Ms: percentile(
+                  rows.map((row) => row.firstStepMs),
+                  0.5,
+                ),
+                firstStepP95Ms: percentile(
+                  rows.map((row) => row.firstStepMs),
+                  0.95,
+                ),
+                completionP50Ms: percentile(
+                  rows.map((row) => row.completionMs),
+                  0.5,
+                ),
+                completionP95Ms: percentile(
+                  rows.map((row) => row.completionMs),
+                  0.95,
+                ),
+                stepsPerSecond:
+                  (32 * rows.length * 1000) /
+                  workloads.reduce((total, group) => total + Number(group.elapsedMs), 0),
+              };
+            }),
+          ),
+        );
+        const nativeSummaries = [0, 200_000].flatMap((bytes) =>
+          [1, 4].flatMap((concurrency) =>
+            (['single', 'batch'] as const).map((path) => {
+              const rows = nativeGroups.filter(
+                (row) =>
+                  row.bytes === bytes && row.concurrency === concurrency && row.path === path,
+              );
+              return {
+                path,
+                bytes,
+                concurrency,
+                groups: rows.length,
+                publicationP50Ms: percentile(
+                  rows.map((row) => row.publicationMs),
+                  0.5,
+                ),
+                publicationP95Ms: percentile(
+                  rows.map((row) => row.publicationMs),
+                  0.95,
+                ),
+                firstDeliveryP50Ms: percentile(
+                  rows.map((row) => row.firstDeliveryMs),
+                  0.5,
+                ),
+                firstDeliveryP95Ms: percentile(
+                  rows.map((row) => row.firstDeliveryMs),
+                  0.95,
+                ),
+                completionP50Ms: percentile(
+                  rows.map((row) => row.completionMs),
+                  0.5,
+                ),
+                completionP95Ms: percentile(
+                  rows.map((row) => row.completionMs),
+                  0.95,
+                ),
+                messagesPerSecond:
+                  (32 * concurrency * rows.length * 1000) /
+                  rows.reduce((total, row) => total + row.completionMs, 0),
+              };
+            }),
+          ),
+        );
+        const report = {
+          schemaVersion: 1,
+          createdAt: new Date().toISOString(),
+          node: process.version,
+          platform: process.platform,
+          arch: process.arch,
+          sdk: '5.0.0-beta.58',
+          celld: '0.6.0',
+          nodeLeaseTtlMs: 30_000,
+          operationDeadlineMs: 10_000,
+          sdkExecution: 'WORKFLOW_TURBO=0; events.createBatch absent',
+          nativeSummaries,
+          nativeGroups,
+          summaries,
+          samples,
+          groups,
+        };
+        const reportPath = resolvePath(
+          process.env.CELLD_QUEUE_BENCHMARK_OUTPUT ??
+            '.perf-results/queue-batch-qualification.json',
+        );
+        await mkdir(resolvePath(reportPath, '..'), { recursive: true });
+        await writeFile(reportPath, JSON.stringify(report, null, 2) + '\n');
+        console.log(`CELLD_NATIVE_AB_SUMMARY ${JSON.stringify(nativeSummaries)}`);
+        console.log(`CELLD_SDK_AB_SUMMARY ${JSON.stringify(summaries)}`);
+        expect(nativeGroups).toHaveLength(80);
+        expect(samples).toHaveLength(200);
+        expect(groups.every((group) => group.batches === 0)).toBe(true);
+        expect(
+          summaries
+            .filter((summary) => summary.path === 'batch')
+            .every((summary) => summary.runs > 0),
+        ).toBe(true);
+      } catch (error) {
+        const failurePath = resolvePath('.perf-results/queue-batch-failure.log');
+        await mkdir(resolvePath(failurePath, '..'), { recursive: true });
+        await writeFile(
+          failurePath,
+          `${String(error)}\nCELLD\n${runtime!.logs()}\nMINIO\n${minio!.logs()}\nHOSTS\n${Object.values(
+            hosts,
+          )
+            .map((host) => host.app.logs())
+            .join('\n')}`,
+        );
+        await writeFile(
+          resolvePath('.perf-results/queue-batch-partial.json'),
+          JSON.stringify({ complete: false, nativeGroups, groups, samples }, null, 2),
+        );
+        throw new Error(`Queue benchmark failed; diagnostics: ${failurePath}`, { cause: error });
+      } finally {
+        await Promise.all(Object.values(hosts).map(({ app }) => stopManaged(app)));
+      }
+    },
+    900_000,
+  );
+
+  it('replays a whole offloaded batch after losing the successful HTTP publication response', async () => {
+    const deploymentId = `lost-batch-reply-${randomUUID()}`;
+    const real = world({ deploymentId });
+    const created = await real.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId, workflowName: deploymentId, input: [] },
+    });
+    const queueName = `__wkf_workflow_lost_batch_${randomUUID().slice(0, 8)}`;
+    let acceptedIds: Array<string | null> = [];
+    let acceptedStatus: number | undefined;
+    let publicationCalls = 0;
+    const proxy = http.createServer(async (incoming, outgoing) => {
+      try {
+        const chunks: Buffer[] = [];
+        for await (const chunk of incoming) chunks.push(chunk as Buffer);
+        const upstream = await fetch(`${runtime!.url}${incoming.url}`, {
+          method: incoming.method,
+          headers: incoming.headers as Record<string, string>,
+          body: Buffer.concat(chunks),
+        });
+        const body = await upstream.text();
+        if (incoming.url === '/v1/queue/send-batch' && ++publicationCalls === 1) {
+          acceptedStatus = upstream.status;
+          acceptedIds = (rpcParse(body) as NativeQueueBatchResult[]).map(
+            (result) => result.messageId,
+          );
+          outgoing.writeHead(503);
+          outgoing.end('accepted publication response lost');
+        } else {
+          outgoing.writeHead(upstream.status, Object.fromEntries(upstream.headers));
+          outgoing.end(body);
+        }
+      } catch (error) {
+        outgoing.writeHead(500);
+        outgoing.end(String(error));
+      }
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const client = createCelldWorld({
+      fleetUrl: `http://127.0.0.1:${(proxy.address() as AddressInfo).port}`,
+      secret: SECRET,
+      baseUrl: callbackBaseUrl,
+      deploymentId,
+    });
+    const entries = Array.from({ length: 8 }, (_, index) => ({
+      message: {
+        runId: created.run.runId,
+        runInput: {
+          input: `${index}${'x'.repeat(200_000)}`,
+          deploymentId,
+          workflowName: deploymentId,
+          specVersion: SPEC_VERSION_CURRENT,
+        },
+      },
+      opts: { idempotencyKey: `${queueName}-${index}` },
+    }));
+    suspendedQueues.add(queueName);
+    try {
+      await expect(client.queueBatch!(queueName, entries)).rejects.toThrow(
+        /accepted publication response lost/,
+      );
+      expect(acceptedStatus).toBe(200);
+      expect(publicationCalls).toBe(1);
+      const replay = await client.queueBatch!(queueName, entries);
+      expect(replay.map((result) => result.messageId)).toEqual(acceptedIds);
+      expect(replay.every((result) => result.error === undefined)).toBe(true);
+      expect(publicationCalls).toBe(2);
+      await waitFor(
+        async () =>
+          new Set(
+            deliveries
+              .filter((d) => d.headers['x-vqs-queue-name'] === queueName)
+              .map((d) => d.headers['x-vqs-message-id']),
+          ).size === entries.length,
+        30_000,
+        'accepted offloaded batch delivery',
+      );
+      suspendedQueues.delete(queueName);
+      const before = deliveries.length;
+      await waitFor(
+        async () =>
+          new Set(
+            deliveries
+              .slice(before)
+              .filter((d) => d.headers['x-vqs-queue-name'] === queueName)
+              .map((d) => d.headers['x-vqs-message-id']),
+          ).size === entries.length,
+        30_000,
+        'completion after lost batch HTTP response',
+      );
+    } finally {
+      suspendedQueues.delete(queueName);
+      proxy.closeAllConnections();
+      await new Promise<void>((resolve) => proxy.close(() => resolve()));
+    }
+  });
+
+  it('recovers an offloaded batch after SIGKILL between broker acceptance and claim confirmation', async () => {
+    const w = world({ deploymentId: `batch-crash-${randomUUID()}` });
+    const created = await w.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId: 'batch-crash',
+        workflowName: 'batch-crash',
+        input: [],
+      },
+    });
+    const queueName = `__wkf_workflow_batch_crash_${randomUUID().slice(0, 8)}`;
+    const accepted = Promise.withResolvers<NativeQueueEnvelope[]>();
+    const gate = http.createServer(async (request, _response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(chunk as Buffer);
+      const messages = JSON.parse(Buffer.concat(chunks).toString()) as Array<{ body: string }>;
+      accepted.resolve(messages.map((message) => JSON.parse(message.body) as NativeQueueEnvelope));
+      // Hold the broker reply until the producer process is killed.
+    });
+    await new Promise<void>((resolve) => gate.listen(0, '127.0.0.1', resolve));
+    const gateUrl = `http://127.0.0.1:${(gate.address() as AddressInfo).port}`;
+    const entries = Array.from({ length: 8 }, (_, index) => ({
+      envelope: {
+        version: 1 as const,
+        messageId: `msg_crash_${randomUUID()}`,
+        queueName,
+        targetBaseUrl: callbackBaseUrl,
+        runId: created.run.runId,
+        idempotencyKey: `${queueName}-${index}`,
+        notBefore: Date.now() + 3_000,
+        body: rpcStringify({
+          runId: created.run.runId,
+          stepInput: { input: new TextEncoder().encode(`${index}${'x'.repeat(200_000)}`) },
+        }),
+      },
+      options: { delaySeconds: 3 },
+    }));
+    const publish = async (pause: boolean) => {
+      const response = await fetch(`${runtime!.url}/v1/queue/send-batch`, {
+        method: 'POST',
+        headers: {
+          authorization: `Bearer ${SECRET}`,
+          'content-type': 'application/json',
+          ...(pause ? { 'x-test-broker-gate': gateUrl } : {}),
+        },
+        body: rpcStringify([entries]),
+        signal: AbortSignal.timeout(30_000),
+      });
+      return {
+        status: response.status,
+        results: rpcParse(await response.text()) as NativeQueueBatchResult[],
+      };
+    };
+    suspendedQueues.add(queueName);
+    try {
+      const pending = publish(true).then(
+        (result) => result,
+        () => null,
+      );
+      const brokerMessages = await Promise.race([
+        accepted.promise,
+        delay(30_000).then(() => {
+          throw new Error('broker acceptance gate timed out');
+        }),
+      ]);
+      expect(brokerMessages.every((message) => message.payloadKey && !message.body)).toBe(true);
+      const contender = await publish(false);
+      expect(
+        contender.results.every((result) => result.messageId === null && result.retryable),
+      ).toBe(true);
+      await runtime!.restart(200, true);
+      expect(await pending).toBeNull();
+      await waitFor(
+        async () =>
+          new Set(
+            deliveries
+              .filter((d) => d.headers['x-vqs-queue-name'] === queueName)
+              .map((d) => d.headers['x-vqs-message-id']),
+          ).size === entries.length,
+        30_000,
+        'all accepted batch callbacks after restart',
+      );
+      const replay = await publish(false);
+      expect(replay.status).toBe(200);
+      expect(replay.results.map((result) => result.messageId)).toEqual(
+        entries.map((entry) => entry.envelope.messageId),
+      );
+      for (const entry of entries) {
+        expect(
+          deliveries.some(
+            (d) =>
+              d.headers['x-vqs-message-id'] === entry.envelope.messageId &&
+              d.body === entry.envelope.body,
+          ),
+        ).toBe(true);
+      }
+      suspendedQueues.delete(queueName);
+      const before = deliveries.length;
+      await waitFor(
+        async () =>
+          new Set(
+            deliveries
+              .slice(before)
+              .filter((d) => d.headers['x-vqs-queue-name'] === queueName)
+              .map((d) => d.headers['x-vqs-message-id']),
+          ).size === entries.length,
+        30_000,
+        'eventual completion of the recovered batch',
+      );
+    } finally {
+      suspendedQueues.delete(queueName);
+      gate.closeAllConnections();
+      await new Promise<void>((resolve) => gate.close(() => resolve()));
+    }
+  });
 
   it('delivers a native Queue batch and measures wide fan-out publication', async () => {
     const w = world({ deploymentId: `batch-${randomUUID()}` });

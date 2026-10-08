@@ -76,7 +76,8 @@
     "check:worker-bundle": "node scripts/check-worker-bundle.mjs",
     "pack:check": "node scripts/check-package.mjs",
     "pack:release": "node scripts/pack-release.mjs",
-    "prepack": "pnpm build"
+    "prepack": "pnpm build",
+    "test:perf:queue-batch": "CELLD_QUEUE_BENCHMARK=1 bash test/integration/celld-smoke/run.sh -t 'measures alternating SDK' --silent=false"
   },
   "dependencies": {
     "@workflow/errors": "5.0.0-beta.25",
