@@ -15,6 +15,8 @@ export type { CelldWorldConfig, CelldWorldEnv, IndexNamespace } from './config.j
 export type { CelldQueueProducer } from './queue.js';
 export type {
   NativeQueueEnvelope,
+  NativeQueueBatchEntry,
+  NativeQueueBatchResult,
   NativeQueueSendOptions,
   NativeQueueSendResult,
 } from './queue-protocol.js';

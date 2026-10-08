@@ -25,6 +25,7 @@ export interface Harness {
   fleet: FakeFleet;
   queueMessages: string[];
   queuePublications: QueuedMessage[];
+  queueBatchCalls: number[];
   queuePayloads: ReadonlyMap<string, string>;
   deliverQueueMessage(
     secret: string,
@@ -48,6 +49,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   const cellEnv = { ...options.cellEnv };
   const queueMessages: string[] = [];
   const queuePublications: QueuedMessage[] = [];
+  const queueBatchCalls: number[] = [];
   const queuePayloads = new Map<string, string>();
   const queuePayloadBucket = {
     async put(key: string, value: string) {
@@ -65,6 +67,13 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     async send(body: string, sendOptions?: { delaySeconds?: number }) {
       queueMessages.push(body);
       queuePublications.push({ body, delaySeconds: sendOptions?.delaySeconds ?? 0 });
+    },
+    async sendBatch(messages: readonly { body: string; delaySeconds?: number }[]) {
+      queueBatchCalls.push(messages.length);
+      for (const message of messages) {
+        queueMessages.push(message.body);
+        queuePublications.push({ body: message.body, delaySeconds: message.delaySeconds ?? 0 });
+      }
     },
   };
   const fleet = new FakeFleet(
@@ -151,6 +160,7 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
     fleet,
     queueMessages,
     queuePublications,
+    queueBatchCalls,
     queuePayloads,
     deliverQueueMessage: (secret, envelope, attempt) =>
       deliverQueueMessage(env, secret, envelope, attempt),

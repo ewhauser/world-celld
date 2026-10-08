@@ -21,6 +21,7 @@ import {
   parseQueueName,
   QueuePayloadSchema,
   type Queue,
+  type QueueBatchResult,
   type QueuePayload,
   type ValidQueueName,
 } from '@workflow/world';
@@ -31,6 +32,8 @@ import {
   nativeQueueDelaySeconds,
   queueClaimName,
   type NativeQueueEnvelope,
+  type NativeQueueBatchEntry,
+  type NativeQueueBatchResult,
   type NativeQueueSendOptions,
   type NativeQueueSendResult,
 } from './queue-protocol.js';
@@ -101,6 +104,7 @@ export interface CelldQueueProducer {
     envelope: NativeQueueEnvelope,
     options?: NativeQueueSendOptions,
   ): Promise<NativeQueueSendResult>;
+  sendBatch?(entries: readonly NativeQueueBatchEntry[]): Promise<NativeQueueBatchResult[]>;
 }
 
 export interface CelldQueueConfig {
@@ -342,79 +346,146 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
   const generateMessageId = monotonicFactory();
   const testPump = createTestPump(config);
 
-  return {
-    async queue(queueName, message, opts) {
-      parseQueueName(queueName);
-      const parsedMessage = QueuePayloadSchema.safeParse(message);
-      if (!parsedMessage.success) {
-        throw new WorkflowWorldError('world-celld queue payload is invalid', { status: 422 });
-      }
-      if (
-        queueDelayDeadline(
-          Date.now(),
-          opts?.delaySeconds ?? 0,
-          0,
-          MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
-        ) === null
-      ) {
-        throw new Error('world-celld queue delaySeconds lacks required delivery headroom');
-      }
-      const runId =
-        'runId' in parsedMessage.data && typeof parsedMessage.data.runId === 'string'
-          ? parsedMessage.data.runId
-          : undefined;
-
-      if (isTestMode()) {
-        // Dedup on idempotencyKey while a message with the same key is in
-        // flight — core re-enqueues every still-pending step on every replay
-        // with idempotencyKey = stepId and relies on queue-level dedup.
-        const existing = testPump.inflight(queueName, opts?.idempotencyKey);
-        if (existing) {
-          return { messageId: existing };
-        }
-        const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-        testPump.push(
-          QUEUE_PATHNAME,
-          {
-            messageId,
-            queueName,
-            attempt: 1,
-            message: parsedMessage.data,
-            idempotencyKey: opts?.idempotencyKey,
-          },
-          opts?.delaySeconds,
-        );
-        return { messageId };
-      }
-
-      // Production: publish through celld's native Queue. The worker-side send
-      // route moves run-bearing payload bytes into object storage before it publishes this
-      // envelope, so only a bounded pointer reaches the broker.
-      const messageId = MessageId.parse(`msg_${generateMessageId()}`);
-      const body = stringify(parsedMessage.data);
-      const notBefore =
-        opts?.delaySeconds && opts.delaySeconds > 0
-          ? (queueDelayDeadline(
-              Date.now(),
-              opts.delaySeconds,
-              0,
-              MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
-            ) ?? undefined)
-          : undefined;
-      const envelope: NativeQueueEnvelope = {
-        version: 1,
-        messageId,
-        queueName,
-        targetBaseUrl: resolveBaseUrl(config),
-        runId,
-        idempotencyKey: opts?.idempotencyKey,
-        body,
-        notBefore,
-      };
-      const published = await env.WORKFLOW_QUEUE.send(envelope, {
+  function prepareMessage(
+    queueName: ValidQueueName,
+    message: QueuePayload,
+    opts?: Parameters<Queue['queue']>[2],
+  ) {
+    parseQueueName(queueName);
+    const parsedMessage = QueuePayloadSchema.safeParse(message);
+    if (!parsedMessage.success) {
+      throw new WorkflowWorldError('world-celld queue payload is invalid', { status: 422 });
+    }
+    if (
+      queueDelayDeadline(
+        Date.now(),
+        opts?.delaySeconds ?? 0,
+        0,
+        MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+      ) === null
+    ) {
+      throw new Error('world-celld queue delaySeconds lacks required delivery headroom');
+    }
+    const runId =
+      'runId' in parsedMessage.data && typeof parsedMessage.data.runId === 'string'
+        ? parsedMessage.data.runId
+        : undefined;
+    const messageId = MessageId.parse(`msg_${generateMessageId()}`);
+    const notBefore =
+      opts?.delaySeconds && opts.delaySeconds > 0
+        ? (queueDelayDeadline(
+            Date.now(),
+            opts.delaySeconds,
+            0,
+            MAX_QUEUE_DERIVED_DEADLINE_HEADROOM_MS,
+          ) ?? undefined)
+        : undefined;
+    const envelope: NativeQueueEnvelope = {
+      version: 1,
+      messageId,
+      queueName,
+      targetBaseUrl: resolveBaseUrl(config),
+      runId,
+      idempotencyKey: opts?.idempotencyKey,
+      body: stringify(parsedMessage.data),
+      notBefore,
+    };
+    return {
+      messageId,
+      parsedMessage: parsedMessage.data,
+      envelope,
+      options: {
         delaySeconds: nativeQueueDelaySeconds(notBefore, Date.now()),
-      });
-      return { messageId: MessageId.parse(published.messageId) };
+      },
+    };
+  }
+
+  const queueOne: Queue['queue'] = async (queueName, message, opts) => {
+    const prepared = prepareMessage(queueName, message, opts);
+    if (isTestMode()) {
+      const existing = testPump.inflight(queueName, opts?.idempotencyKey);
+      if (existing) return { messageId: existing };
+      testPump.push(
+        QUEUE_PATHNAME,
+        {
+          messageId: prepared.messageId,
+          queueName,
+          attempt: 1,
+          message: prepared.parsedMessage,
+          idempotencyKey: opts?.idempotencyKey,
+        },
+        opts?.delaySeconds,
+      );
+      return { messageId: prepared.messageId };
+    }
+    const published = await env.WORKFLOW_QUEUE.send(prepared.envelope, prepared.options);
+    return { messageId: MessageId.parse(published.messageId) };
+  };
+
+  return {
+    queue: queueOne,
+    async queueBatch(queueName, messages) {
+      if (messages.length === 0) return [];
+      if (isTestMode() || !env.WORKFLOW_QUEUE.sendBatch) {
+        return Promise.all(
+          messages.map(async ({ message, opts }) => {
+            try {
+              return await queueOne(queueName, message, opts);
+            } catch (error) {
+              return {
+                messageId: null,
+                error: error instanceof Error ? error.message : String(error),
+                retryable: !(error instanceof WorkflowWorldError && error.status === 422),
+              };
+            }
+          }),
+        );
+      }
+      const results: QueueBatchResult[] = [];
+      results.length = messages.length;
+      const entries: NativeQueueBatchEntry[] = [];
+      const indexes: number[] = [];
+      parseQueueName(queueName);
+      for (const [index, { message, opts }] of messages.entries()) {
+        try {
+          const { envelope, options } = prepareMessage(queueName, message, opts);
+          entries.push({ envelope, options });
+          indexes.push(index);
+        } catch (error) {
+          results[index] = {
+            messageId: null,
+            error: error instanceof Error ? error.message : String(error),
+            retryable: false,
+          };
+        }
+      }
+      if (entries.length > 0) {
+        const encoder = new TextEncoder();
+        let offset = 0;
+        while (offset < entries.length) {
+          const chunk: NativeQueueBatchEntry[] = [];
+          let bytes = 0;
+          while (offset + chunk.length < entries.length && chunk.length < 100) {
+            const entry = entries[offset + chunk.length];
+            const size = encoder.encode(JSON.stringify(entry)).byteLength;
+            if (chunk.length > 0 && bytes + size > 16 * 1024 * 1024) break;
+            chunk.push(entry);
+            bytes += size;
+          }
+          const published = await env.WORKFLOW_QUEUE.sendBatch(chunk);
+          if (published.length !== chunk.length) {
+            throw new Error('world-celld Queue batch returned the wrong number of results');
+          }
+          for (const [position, result] of published.entries()) {
+            results[indexes[offset + position]] =
+              result.error === undefined
+                ? { messageId: MessageId.parse(result.messageId) }
+                : result;
+          }
+          offset += chunk.length;
+        }
+      }
+      return results;
     },
 
     createQueueHandler(queueNamePrefix, handler) {

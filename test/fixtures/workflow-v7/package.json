@@ -1,0 +1,8 @@
+{
+  "name": "celld-qualification-sdk-v7",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "@workflow/core": "5.0.0-beta.53"
+  }
+}

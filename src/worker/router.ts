@@ -53,6 +53,9 @@ import {
   validateNativeQueueEnvelope,
   validateNativeQueueSendOptions,
   type NativeQueueEnvelope,
+  type NativeQueueBatchEntry,
+  type NativeQueueBatchResult,
+  type NativeQueueSendOptions,
   type QueuePayloadOrphan,
   type QueuePayloadRegistration,
   type RunQueueReservation,
@@ -70,6 +73,9 @@ export interface DONamespaceLike {
 
 interface NativeQueueBindingLike {
   send(body: string, options?: { contentType?: 'text'; delaySeconds?: number }): Promise<unknown>;
+  sendBatch?(
+    messages: readonly { body: string; contentType: 'text'; delaySeconds?: number }[],
+  ): Promise<unknown>;
 }
 
 export interface QueueRunStub {
@@ -394,6 +400,214 @@ function streamResponse(body: Uint8Array): Response {
   });
 }
 
+interface PreparedQueueSend {
+  envelope: NativeQueueEnvelope;
+  encoded: string;
+  options: NativeQueueSendOptions;
+  claim?: QueueClaimHandle;
+  reservationExpiresAt: number;
+}
+
+function queueSendResponse(messageId: string): Response {
+  return new Response(rpcStringify({ messageId }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+async function prepareQueueSend(
+  env: WorkerEnv,
+  envelope: NativeQueueEnvelope,
+  options: NativeQueueSendOptions,
+): Promise<PreparedQueueSend | Response> {
+  if (envelope.body === undefined || envelope.payloadKey !== undefined) {
+    return errorResponse(400, 'BadRequest', 'queue send requires an inline body');
+  }
+  const body = envelope.body;
+  let enqueueClaim: QueueClaimHandle | undefined;
+  try {
+    const namespace = env.WORKFLOW_DB;
+    const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
+    // Small bodies without user data stay inline; the rest move to the
+    // fleet bucket so run retention can delete them.
+    const inlineRunBody = envelope.runId !== undefined && isInlineRunBody(body);
+    const payloadKey =
+      envelope.runId && !inlineRunBody
+        ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
+        : undefined;
+    let brokerEnvelope: NativeQueueEnvelope = payloadKey
+      ? { ...envelope, payloadKey, body: undefined }
+      : envelope;
+    // Sized with the claim scope a run-scoped claim may add.
+    const sized = JSON.stringify({ ...brokerEnvelope, claimScope: 'run' });
+    if (new TextEncoder().encode(sized).byteLength > NATIVE_QUEUE_MAX_MESSAGE_BYTES) {
+      return errorResponse(
+        413,
+        'PayloadTooLarge',
+        `native queue envelope exceeds ${NATIVE_QUEUE_MAX_MESSAGE_BYTES} bytes`,
+      );
+    }
+
+    const now = Date.now();
+    const reservationExpiresAt =
+      Math.max(now, envelope.notBefore ?? now) + QUEUE_RESERVATION_GRACE_MS;
+    const run = envelope.runId
+      ? (namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub)
+      : undefined;
+    let admission: Promise<{ ok: true } | { ok: false; message: string }> | undefined;
+    if (envelope.idempotencyKey) {
+      const claimName = queueClaimName(envelope.queueName, envelope.idempotencyKey);
+      // A keyed run-bearing message asks its run cell first unless this
+      // isolate already knows the run keeps claims in claim cells. The
+      // run cell reserves in the same call when the run is run-scoped.
+      let scope = run && envelope.runId ? runClaimScopes.get(envelope.runId) : 'cell';
+      let reservation:
+        | { admitted: boolean; messageId: string; publicationPending?: true }
+        | undefined;
+      if (run && envelope.runId && scope !== 'cell') {
+        enqueueClaim = runQueueClaim(run, claimName);
+        const reserved = await run.reserveRunQueueMessage({
+          claimName,
+          messageId: envelope.messageId,
+          expiresAt: now + QUEUE_PUBLICATION_LEASE_MS,
+          publicationPending: true,
+        });
+        if (!reserved.ok) return errorResponse(410, 'RunExpiredError', reserved.message);
+        scope = reserved.scope;
+        rememberRunClaimScope(envelope.runId, reserved.scope);
+        if (reserved.scope === 'run') {
+          reservation = reserved;
+          brokerEnvelope = { ...brokerEnvelope, claimScope: 'run' };
+        }
+      } else if (inlineRunBody && run) {
+        // The read-only expiry check overlaps the claim-cell reservation.
+        admission = run.getQueueAdmission();
+        admission.catch(() => undefined);
+      }
+      if (!reservation) {
+        const cell = namespace.get(namespace.idFromName(claimName)) as QueueRunStub;
+        enqueueClaim = cellQueueClaim(cell);
+        reservation = await cell.reserveQueueMessage({
+          messageId: envelope.messageId,
+          expiresAt: now + QUEUE_PUBLICATION_LEASE_MS,
+          publicationPending: true,
+        });
+      }
+      if (!reservation.admitted) {
+        if (reservation.publicationPending) {
+          return errorResponse(
+            503,
+            'QueuePublicationPending',
+            'the reserved Queue message has not been confirmed by the broker; retry publication',
+          );
+        }
+        return new Response(rpcStringify({ messageId: reservation.messageId }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+    } else if (inlineRunBody && run) {
+      admission = run.getQueueAdmission();
+    }
+    const encoded = JSON.stringify(brokerEnvelope);
+
+    if (admission) {
+      const admitted = await admission;
+      if (!admitted.ok) {
+        await enqueueClaim?.complete(envelope.messageId);
+        return errorResponse(410, 'RunExpiredError', admitted.message);
+      }
+    }
+
+    if (run && envelope.runId && payloadKey) {
+      if (!payloadStore) {
+        await enqueueClaim?.abandonReservation(envelope.messageId);
+        return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_QUEUE_PAYLOADS');
+      }
+      const orphanExpiresAt = reservationExpiresAt;
+      const registered = await run.registerQueuePayload({
+        messageId: envelope.messageId,
+        key: payloadKey,
+        orphanExpiresAt,
+      });
+      if (!registered.ok) {
+        await enqueueClaim?.complete(envelope.messageId);
+        return errorResponse(410, 'RunExpiredError', registered.message);
+      }
+      const orphan = namespace.get(
+        namespace.idFromName(queueOrphanName(envelope.messageId)),
+      ) as QueueRunStub;
+      try {
+        await orphan.scheduleQueuePayloadOrphan({
+          messageId: envelope.messageId,
+          runId: envelope.runId,
+          key: payloadKey,
+          expiresAt: orphanExpiresAt,
+        });
+      } catch (error) {
+        await run.unregisterQueuePayload(envelope.messageId);
+        throw error;
+      }
+      await payloadStore.write(payloadKey, body, {
+        runId: envelope.runId,
+        messageId: envelope.messageId,
+      });
+      const finalized = await run.finalizeQueuePayload(envelope.messageId);
+      if (!finalized.ok) {
+        await payloadStore.delete(payloadKey);
+        await run.unregisterQueuePayload(envelope.messageId);
+        await orphan.cancelQueuePayloadOrphan(envelope.messageId);
+        await enqueueClaim?.complete(envelope.messageId);
+        return errorResponse(410, 'RunExpiredError', finalized.message);
+      }
+    }
+    return {
+      envelope,
+      encoded,
+      options,
+      claim: enqueueClaim,
+      reservationExpiresAt,
+    };
+  } catch (error) {
+    // A failed publication must not make the next caller's retry look
+    // successful solely because it finds this message's reservation.
+    // Preserve staged payloads: the broker may have accepted the message
+    // before its response failed, and orphan cleanup owns those bytes.
+    try {
+      await enqueueClaim?.abandonReservation(envelope.messageId);
+    } catch (cleanupError) {
+      console.error('world-celld could not abandon a failed Queue reservation', cleanupError);
+    }
+    const err = error as { name?: string; message?: string };
+    return errorResponse(500, err.name ?? 'Error', err.message ?? String(error));
+  }
+}
+
+async function abandonQueueSend(prepared: PreparedQueueSend): Promise<void> {
+  try {
+    await prepared.claim?.abandonReservation(prepared.envelope.messageId);
+  } catch (error) {
+    console.error('world-celld could not abandon a failed Queue reservation', error);
+  }
+}
+
+async function queueBatchResultFromResponse(response: Response): Promise<NativeQueueBatchResult> {
+  const body = rpcParse<{ messageId?: string; error?: { message?: string } }>(
+    await response.text(),
+  );
+  return response.ok && body.messageId
+    ? { messageId: body.messageId }
+    : {
+        messageId: null,
+        error: body.error?.message ?? `Queue send failed with HTTP ${response.status}`,
+        retryable: response.status >= 500,
+      };
+}
+
+const NATIVE_QUEUE_MAX_BATCH_MESSAGES = 100;
+const NATIVE_QUEUE_MAX_BATCH_BYTES = 256_000;
+const WORLD_QUEUE_MAX_BATCH_MESSAGES = 1000;
+
 export function createRouter(env: WorkerEnv) {
   return async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
@@ -443,169 +657,181 @@ export function createRouter(env: WorkerEnv) {
           return errorResponse(400, 'BadRequest', (error as Error).message);
         }
 
-        let enqueueClaim: QueueClaimHandle | undefined;
+        const prepared = await prepareQueueSend(env, envelope, options);
+        if (prepared instanceof Response) return prepared;
         try {
-          const namespace = env.WORKFLOW_DB;
-          const payloadStore = env.WORKFLOW_QUEUE_PAYLOADS;
-          // Small bodies without user data stay inline; the rest move to the
-          // fleet bucket so run retention can delete them.
-          const inlineRunBody = envelope.runId !== undefined && isInlineRunBody(envelope.body);
-          const payloadKey =
-            envelope.runId && !inlineRunBody
-              ? queuePayloadObjectKey(envelope.runId, envelope.messageId)
-              : undefined;
-          let brokerEnvelope: NativeQueueEnvelope = payloadKey
-            ? { ...envelope, payloadKey, body: undefined }
-            : envelope;
-          // Sized with the claim scope a run-scoped claim may add.
-          const sized = JSON.stringify({ ...brokerEnvelope, claimScope: 'run' });
-          if (new TextEncoder().encode(sized).byteLength > NATIVE_QUEUE_MAX_MESSAGE_BYTES) {
-            return errorResponse(
-              413,
-              'PayloadTooLarge',
-              `native queue envelope exceeds ${NATIVE_QUEUE_MAX_MESSAGE_BYTES} bytes`,
-            );
-          }
-
-          const now = Date.now();
-          const reservationExpiresAt =
-            Math.max(now, envelope.notBefore ?? now) + QUEUE_RESERVATION_GRACE_MS;
-          const run = envelope.runId
-            ? (namespace.get(namespace.idFromName(envelope.runId)) as QueueRunStub)
-            : undefined;
-          let admission: Promise<{ ok: true } | { ok: false; message: string }> | undefined;
-          if (envelope.idempotencyKey) {
-            const claimName = queueClaimName(envelope.queueName, envelope.idempotencyKey);
-            // A keyed run-bearing message asks its run cell first unless this
-            // isolate already knows the run keeps claims in claim cells. The
-            // run cell reserves in the same call when the run is run-scoped.
-            let scope = run && envelope.runId ? runClaimScopes.get(envelope.runId) : 'cell';
-            let reservation:
-              | { admitted: boolean; messageId: string; publicationPending?: true }
-              | undefined;
-            if (run && envelope.runId && scope !== 'cell') {
-              enqueueClaim = runQueueClaim(run, claimName);
-              const reserved = await run.reserveRunQueueMessage({
-                claimName,
-                messageId: envelope.messageId,
-                expiresAt: now + QUEUE_PUBLICATION_LEASE_MS,
-                publicationPending: true,
-              });
-              if (!reserved.ok) return errorResponse(410, 'RunExpiredError', reserved.message);
-              scope = reserved.scope;
-              rememberRunClaimScope(envelope.runId, reserved.scope);
-              if (reserved.scope === 'run') {
-                reservation = reserved;
-                brokerEnvelope = { ...brokerEnvelope, claimScope: 'run' };
-              }
-            } else if (inlineRunBody && run) {
-              // The read-only expiry check overlaps the claim-cell reservation.
-              admission = run.getQueueAdmission();
-              admission.catch(() => undefined);
-            }
-            if (!reservation) {
-              const cell = namespace.get(namespace.idFromName(claimName)) as QueueRunStub;
-              enqueueClaim = cellQueueClaim(cell);
-              reservation = await cell.reserveQueueMessage({
-                messageId: envelope.messageId,
-                expiresAt: now + QUEUE_PUBLICATION_LEASE_MS,
-                publicationPending: true,
-              });
-            }
-            if (!reservation.admitted) {
-              if (reservation.publicationPending) {
-                return errorResponse(
-                  503,
-                  'QueuePublicationPending',
-                  'the reserved Queue message has not been confirmed by the broker; retry publication',
-                );
-              }
-              return new Response(rpcStringify({ messageId: reservation.messageId }), {
-                status: 200,
-                headers: { 'content-type': 'application/json' },
-              });
-            }
-          } else if (inlineRunBody && run) {
-            admission = run.getQueueAdmission();
-          }
-          const encoded = JSON.stringify(brokerEnvelope);
-
-          if (admission) {
-            const admitted = await admission;
-            if (!admitted.ok) {
-              await enqueueClaim?.complete(envelope.messageId);
-              return errorResponse(410, 'RunExpiredError', admitted.message);
-            }
-          }
-
-          if (run && envelope.runId && payloadKey) {
-            if (!payloadStore) {
-              await enqueueClaim?.abandonReservation(envelope.messageId);
-              return errorResponse(
-                500,
-                'WorldMisconfigured',
-                'missing binding: WORKFLOW_QUEUE_PAYLOADS',
-              );
-            }
-            const orphanExpiresAt = reservationExpiresAt;
-            const registered = await run.registerQueuePayload({
-              messageId: envelope.messageId,
-              key: payloadKey,
-              orphanExpiresAt,
-            });
-            if (!registered.ok) {
-              await enqueueClaim?.complete(envelope.messageId);
-              return errorResponse(410, 'RunExpiredError', registered.message);
-            }
-            const orphan = namespace.get(
-              namespace.idFromName(queueOrphanName(envelope.messageId)),
-            ) as QueueRunStub;
-            try {
-              await orphan.scheduleQueuePayloadOrphan({
-                messageId: envelope.messageId,
-                runId: envelope.runId,
-                key: payloadKey,
-                expiresAt: orphanExpiresAt,
-              });
-            } catch (error) {
-              await run.unregisterQueuePayload(envelope.messageId);
-              throw error;
-            }
-            await payloadStore.write(payloadKey, envelope.body, {
-              runId: envelope.runId,
-              messageId: envelope.messageId,
-            });
-            const finalized = await run.finalizeQueuePayload(envelope.messageId);
-            if (!finalized.ok) {
-              await payloadStore.delete(payloadKey);
-              await run.unregisterQueuePayload(envelope.messageId);
-              await orphan.cancelQueuePayloadOrphan(envelope.messageId);
-              await enqueueClaim?.complete(envelope.messageId);
-              return errorResponse(410, 'RunExpiredError', finalized.message);
-            }
-          }
-          await env.WORKFLOW_QUEUE.send(encoded, {
+          await env.WORKFLOW_QUEUE.send(prepared.encoded, {
             contentType: 'text',
-            ...options,
+            ...prepared.options,
           });
-          await enqueueClaim?.confirmPublication(envelope.messageId, reservationExpiresAt);
-          return new Response(rpcStringify({ messageId: envelope.messageId }), {
-            status: 200,
-            headers: { 'content-type': 'application/json' },
-          });
+          await prepared.claim?.confirmPublication(
+            envelope.messageId,
+            prepared.reservationExpiresAt,
+          );
+          return queueSendResponse(envelope.messageId);
         } catch (error) {
-          // A failed publication must not make the next caller's retry look
-          // successful solely because it finds this message's reservation.
-          // Preserve staged payloads: the broker may have accepted the message
-          // before its response failed, and orphan cleanup owns those bytes.
-          try {
-            await enqueueClaim?.abandonReservation(envelope.messageId);
-          } catch (cleanupError) {
-            console.error('world-celld could not abandon a failed Queue reservation', cleanupError);
-          }
+          await abandonQueueSend(prepared);
           const err = error as { name?: string; message?: string };
           return errorResponse(500, err.name ?? 'Error', err.message ?? String(error));
         }
+      }
+
+      if (parts[2] === 'send-batch') {
+        if (parsed.length !== 1 || !Array.isArray(parsed[0])) {
+          return errorResponse(400, 'BadRequest', 'queue send-batch expects an entry array');
+        }
+        if (!env.WORKFLOW_QUEUE) {
+          return errorResponse(500, 'WorldMisconfigured', 'missing binding: WORKFLOW_QUEUE');
+        }
+        const entries = parsed[0] as unknown[];
+        if (entries.length > WORLD_QUEUE_MAX_BATCH_MESSAGES) {
+          return errorResponse(413, 'PayloadTooLarge', 'queue batch has too many messages');
+        }
+        const results: NativeQueueBatchResult[] = [];
+        results.length = entries.length;
+        const prepared: Array<{ index: number; value: PreparedQueueSend }> = [];
+        const validated: Array<{ index: number; entry: NativeQueueBatchEntry }> = [];
+        const duplicateIndexes = new Map<number, number>();
+        const keyedIndexes = new Map<string, number>();
+
+        for (const [index, raw] of entries.entries()) {
+          let entry: NativeQueueBatchEntry;
+          try {
+            if (raw === null || typeof raw !== 'object')
+              throw new TypeError('entry must be an object');
+            const candidate = raw as Record<string, unknown>;
+            const envelope = validateNativeQueueEnvelope(candidate.envelope);
+            if (envelope.body === undefined || envelope.payloadKey !== undefined) {
+              throw new TypeError('queue batch requires inline bodies');
+            }
+            entry = { envelope, options: validateNativeQueueSendOptions(candidate.options) };
+          } catch (error) {
+            results[index] = {
+              messageId: null,
+              error: (error as Error).message,
+              retryable: false,
+            };
+            continue;
+          }
+          const { envelope, options } = entry;
+          const claimName = envelope.idempotencyKey
+            ? queueClaimName(envelope.queueName, envelope.idempotencyKey)
+            : undefined;
+          const duplicate = claimName === undefined ? undefined : keyedIndexes.get(claimName);
+          if (duplicate !== undefined) {
+            duplicateIndexes.set(index, duplicate);
+            continue;
+          }
+          if (claimName) keyedIndexes.set(claimName, index);
+          validated.push({ index, entry: { envelope, options } });
+        }
+        for (let start = 0; start < validated.length; start += 16) {
+          const group = validated.slice(start, start + 16);
+          const staged = await Promise.all(
+            group.map(({ entry }) => prepareQueueSend(env, entry.envelope, entry.options ?? {})),
+          );
+          for (const [position, { index }] of group.entries()) {
+            const value = staged[position];
+            if (value instanceof Response) {
+              results[index] = await queueBatchResultFromResponse(value);
+            } else {
+              prepared.push({ index, value });
+            }
+          }
+        }
+
+        let offset = 0;
+        while (offset < prepared.length) {
+          const chunk: typeof prepared = [];
+          let bytes = 0;
+          while (offset < prepared.length && chunk.length < NATIVE_QUEUE_MAX_BATCH_MESSAGES) {
+            const item = prepared[offset];
+            const size = new TextEncoder().encode(item.value.encoded).byteLength;
+            if (chunk.length > 0 && bytes + size > NATIVE_QUEUE_MAX_BATCH_BYTES) break;
+            chunk.push(item);
+            bytes += size;
+            offset++;
+          }
+          if (!env.WORKFLOW_QUEUE.sendBatch) {
+            const settled = await Promise.allSettled(
+              chunk.map(({ value }) =>
+                env.WORKFLOW_QUEUE.send(value.encoded, {
+                  contentType: 'text',
+                  ...value.options,
+                }),
+              ),
+            );
+            for (const [indexInChunk, { index, value }] of chunk.entries()) {
+              const outcome = settled[indexInChunk];
+              if (outcome.status === 'rejected') {
+                await abandonQueueSend(value);
+                results[index] = {
+                  messageId: null,
+                  error:
+                    outcome.reason instanceof Error
+                      ? outcome.reason.message
+                      : String(outcome.reason),
+                  retryable: true,
+                };
+                continue;
+              }
+              try {
+                await value.claim?.confirmPublication(
+                  value.envelope.messageId,
+                  value.reservationExpiresAt,
+                );
+                results[index] = { messageId: value.envelope.messageId };
+              } catch (error) {
+                await abandonQueueSend(value);
+                results[index] = {
+                  messageId: null,
+                  error: error instanceof Error ? error.message : String(error),
+                  retryable: true,
+                };
+              }
+            }
+            continue;
+          }
+          try {
+            await env.WORKFLOW_QUEUE.sendBatch(
+              chunk.map(({ value }) => ({
+                body: value.encoded,
+                contentType: 'text' as const,
+                ...value.options,
+              })),
+            );
+            for (const { index, value } of chunk) {
+              try {
+                await value.claim?.confirmPublication(
+                  value.envelope.messageId,
+                  value.reservationExpiresAt,
+                );
+                results[index] = { messageId: value.envelope.messageId };
+              } catch (error) {
+                await abandonQueueSend(value);
+                results[index] = {
+                  messageId: null,
+                  error: error instanceof Error ? error.message : String(error),
+                  retryable: true,
+                };
+              }
+            }
+          } catch (error) {
+            for (const { index, value } of chunk) {
+              await abandonQueueSend(value);
+              results[index] = {
+                messageId: null,
+                error: error instanceof Error ? error.message : String(error),
+                retryable: true,
+              };
+            }
+          }
+        }
+        for (const [index, source] of duplicateIndexes) results[index] = results[source]!;
+        return new Response(rpcStringify(results), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
       }
 
       return errorResponse(404, 'NotFound', `unknown queue operation: ${parts[2]}`);

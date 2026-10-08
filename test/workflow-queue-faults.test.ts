@@ -1,9 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { rpcParse, rpcStringify } from '../src/codec.js';
+import { TOMBSTONE_KEY, type RunTombstone } from '../src/retention.js';
 import { createQueue, type CelldQueueProducer } from '../src/queue.js';
 import {
   QUEUE_PUBLICATION_LEASE_MS,
   queueClaimName,
+  queueOrphanName,
+  QUEUE_RESERVATION_GRACE_MS,
   type NativeQueueEnvelope,
 } from '../src/queue-protocol.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
@@ -33,9 +36,12 @@ function setupProducer(scope: 'cell' | 'run', suffix: string) {
     }),
   };
   const send = vi.fn<WorkerEnv['WORKFLOW_QUEUE']['send']>().mockResolvedValue(undefined);
+  const sendBatch = vi
+    .fn<NonNullable<WorkerEnv['WORKFLOW_QUEUE']['sendBatch']>>()
+    .mockResolvedValue(undefined);
   const env = {
     WORKFLOW_DB: fleet.namespace('runs'),
-    WORKFLOW_QUEUE: { send },
+    WORKFLOW_QUEUE: { send, sendBatch },
     WORKFLOW_QUEUE_PAYLOADS: store,
     WORLD_SECRET: SECRET,
   } as WorkerEnv;
@@ -61,7 +67,15 @@ function setupProducer(scope: 'cell' | 'run', suffix: string) {
         body: rpcStringify([message]),
       }),
     );
-  return { env, fleet, objects, store, send, run, envelope, publish };
+  const publishBatch = (messages: NativeQueueEnvelope[]) =>
+    router(
+      new Request('https://world.internal/v1/queue/send-batch', {
+        method: 'POST',
+        headers: { authorization: `Bearer ${SECRET}`, 'content-type': 'application/json' },
+        body: rpcStringify([messages.map((message) => ({ envelope: message }))]),
+      }),
+    );
+  return { env, fleet, objects, store, send, sendBatch, run, envelope, publish, publishBatch };
 }
 
 function brokerMessage(envelope: NativeQueueEnvelope, attempts = 1) {
@@ -94,6 +108,180 @@ describe('workflow Queue fault recovery', () => {
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+  });
+
+  describe.each(['cell', 'run'] as const)('%s-scoped batch recovery', (scope) => {
+    function batch(suffix: string) {
+      const producer = setupProducer(scope, suffix);
+      const entries = Array.from({ length: 4 }, (_, index) => ({
+        ...producer.envelope,
+        messageId: `${producer.envelope.messageId}_${index}`,
+        idempotencyKey: `${producer.envelope.idempotencyKey}_${index}`,
+        body: rpcStringify({
+          runId: producer.envelope.runId,
+          stepInput: { input: new Uint8Array([index]) },
+        }),
+      }));
+      return { ...producer, entries };
+    }
+
+    it('replays a whole batch after a lost broker response and preserves accepted payloads', async () => {
+      const { sendBatch, publishBatch, entries, objects, env } = batch('batch-lost-response');
+      let accepted: NativeQueueEnvelope[] = [];
+      sendBatch.mockImplementationOnce(async (messages) => {
+        accepted = messages.map((message) => JSON.parse(message.body) as NativeQueueEnvelope);
+        throw new Error('accepted batch response lost');
+      });
+      const failed = rpcParse(await (await publishBatch(entries)).text()) as Array<{
+        messageId: string | null;
+        retryable?: boolean;
+      }>;
+      expect(failed.every((result) => result.messageId === null && result.retryable)).toBe(true);
+      expect(accepted.map((message) => objects.get(message.payloadKey!))).toEqual(
+        entries.map((entry) => entry.body),
+      );
+      const replay = entries.map((entry) =>
+        Object.assign({}, entry, { messageId: `${entry.messageId}_replay` }),
+      );
+      const retry = rpcParse(await (await publishBatch(replay)).text()) as Array<{
+        messageId: string;
+      }>;
+      expect(retry.map((result) => result.messageId)).toEqual(
+        replay.map((entry) => entry.messageId),
+      );
+      expect(sendBatch).toHaveBeenCalledTimes(2);
+      const callback = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, { status: 204 }));
+      vi.stubGlobal('fetch', callback);
+      for (const message of accepted) {
+        expect(await deliverQueueMessage(env, SECRET, message, 1)).toEqual({ kind: 'complete' });
+      }
+      expect(callback.mock.calls.map(([, init]) => init?.body)).toEqual(
+        entries.map((entry) => entry.body),
+      );
+    });
+
+    it('never reports success for a batch still held at the broker boundary', async () => {
+      const { sendBatch, publishBatch, entries } = batch('batch-pending');
+      const started = Promise.withResolvers<void>();
+      const accepted = Promise.withResolvers<void>();
+      sendBatch.mockImplementationOnce(() => {
+        started.resolve();
+        return accepted.promise;
+      });
+      const pending = publishBatch(entries);
+      await started.promise;
+      const replay = entries.map((entry) =>
+        Object.assign({}, entry, { messageId: `${entry.messageId}_replay` }),
+      );
+      const blocked = rpcParse(await (await publishBatch(replay)).text()) as Array<{
+        messageId: string | null;
+        retryable?: boolean;
+      }>;
+      expect(blocked.every((result) => result.messageId === null && result.retryable)).toBe(true);
+      expect(sendBatch).toHaveBeenCalledOnce();
+      accepted.resolve();
+      const original = rpcParse(await (await pending).text()) as Array<{ messageId: string }>;
+      const retried = rpcParse(await (await publishBatch(replay)).text()) as Array<{
+        messageId: string;
+      }>;
+      expect(retried).toEqual(original);
+      expect(sendBatch).toHaveBeenCalledOnce();
+    });
+
+    it('rejects entries whose payload staging races with run retention', async () => {
+      const { sendBatch, publishBatch, entries, objects, store, run, fleet } =
+        batch('batch-retention-race');
+      const started = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      store.write.mockImplementation(async (key, body) => {
+        started.resolve();
+        await resume.promise;
+        objects.set(key, body);
+      });
+      const publishing = publishBatch(entries);
+      await started.promise;
+      run.storage.data.set(TOMBSTONE_KEY, {
+        runId: entries[0].runId,
+        version: 1,
+        expiredAt: new Date(fleet.now),
+        tombstonedAt: new Date(fleet.now),
+        cleanup: {
+          version: 1,
+          runId: entries[0].runId!,
+          workflowName: 'batch-retention-race',
+          createdAt: new Date(fleet.now),
+          dueAt: new Date(fleet.now),
+          phase: 'tombstoned',
+          generation: 1,
+          attempts: 0,
+          deletedPayloadKeys: 0,
+          deletedStreams: 0,
+          deletedQueuePayloads: 0,
+        },
+      } satisfies RunTombstone);
+      resume.resolve();
+      const result = rpcParse(await (await publishing).text()) as Array<{
+        messageId: string | null;
+        error?: string;
+        retryable?: boolean;
+      }>;
+      expect(
+        result.every(
+          (entry) =>
+            entry.messageId === null &&
+            entry.retryable === false &&
+            entry.error?.includes('expired'),
+        ),
+      ).toBe(true);
+      expect(sendBatch).not.toHaveBeenCalled();
+      expect(objects.size).toBe(0);
+      for (const entry of entries) {
+        expect(fleet.cell('runs', queueOrphanName(entry.messageId)).storage.data.size).toBe(0);
+      }
+    });
+
+    it('isolates a lost confirmation reply and preserves confirmed siblings on whole-batch replay', async () => {
+      const { sendBatch, publishBatch, entries, fleet, run, objects } = batch('batch-confirmation');
+      const claim =
+        scope === 'run'
+          ? (run.instance as WorkflowRunDO)
+          : (fleet.cell('runs', queueClaimName(entries[0].queueName, entries[0].idempotencyKey))
+              .instance as WorkflowRunDO);
+      vi.spyOn(
+        claim,
+        scope === 'run' ? 'confirmRunQueueMessagePublication' : 'confirmQueueMessagePublication',
+      ).mockRejectedValueOnce(new Error('confirmation reply lost'));
+      const first = rpcParse(await (await publishBatch(entries)).text()) as Array<{
+        messageId: string | null;
+        retryable?: boolean;
+      }>;
+      expect(first[0]).toMatchObject({ messageId: null, retryable: true });
+      expect(first.slice(1).map((result) => result.messageId)).toEqual(
+        entries.slice(1).map((entry) => entry.messageId),
+      );
+      expect(objects.size).toBe(entries.length);
+      const retry = entries.map((entry) =>
+        Object.assign({}, entry, { messageId: `${entry.messageId}_replay` }),
+      );
+      const second = rpcParse(await (await publishBatch(retry)).text()) as Array<{
+        messageId: string;
+      }>;
+      expect(second[0].messageId).toBe(retry[0].messageId);
+      expect(second.slice(1)).toEqual(first.slice(1));
+      expect(sendBatch.mock.calls.map(([messages]) => messages.length)).toEqual([4, 1]);
+    });
+
+    it('cleans abandoned offloaded batch payloads after restarting orphan cells', async () => {
+      const { sendBatch, publishBatch, entries, objects, fleet } = batch('batch-orphans');
+      sendBatch.mockRejectedValueOnce(new Error('broker unavailable'));
+      await publishBatch(entries);
+      expect(objects.size).toBe(entries.length);
+      for (const entry of entries) fleet.restartCell('runs', queueOrphanName(entry.messageId));
+      fleet.advance(QUEUE_RESERVATION_GRACE_MS + 1);
+      vi.setSystemTime(fleet.now);
+      await fleet.fireDueAlarms();
+      expect(objects.size).toBe(0);
+    });
   });
 
   describe('test pump', () => {

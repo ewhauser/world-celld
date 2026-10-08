@@ -12,7 +12,11 @@ import {
   type RunCatalogShardStub,
 } from '../indexes.js';
 import type { CelldQueueProducer } from '../queue.js';
-import type { NativeQueueSendResult } from '../queue-protocol.js';
+import type {
+  NativeQueueBatchEntry,
+  NativeQueueBatchResult,
+  NativeQueueSendResult,
+} from '../queue-protocol.js';
 import type { WorkflowRunDOStub } from '../storage.js';
 import type { StreamDOStub } from '../streamer.js';
 import type { RunListPage, RunListRequest } from '../run-list.js';
@@ -205,6 +209,43 @@ export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
           // consumer are at-least-once; do not add a blind transport retry.
           idempotent: false,
         }),
+      sendBatch: async (entries: readonly NativeQueueBatchEntry[]) => {
+        try {
+          return await callFleetRoute<NativeQueueBatchResult[]>(
+            transport,
+            '/v1/queue/send-batch',
+            [entries],
+            {
+              // A lost response may follow publication of any or all entries.
+              idempotent: false,
+            },
+          );
+        } catch (error) {
+          // Older worker deployments only expose /send. Keep mixed-version
+          // deploys functional while the fleet rolls forward.
+          if ((error as { status?: unknown }).status !== 404) throw error;
+          return Promise.all(
+            entries.map(async ({ envelope, options }) => {
+              try {
+                return await callFleetRoute<NativeQueueSendResult>(
+                  transport,
+                  '/v1/queue/send',
+                  [envelope, options],
+                  { idempotent: false },
+                );
+              } catch (entryError) {
+                return {
+                  messageId: null,
+                  error: entryError instanceof Error ? entryError.message : String(entryError),
+                  retryable: ![400, 404, 410, 413, 422].includes(
+                    (entryError as { status?: number }).status ?? 0,
+                  ),
+                };
+              }
+            }),
+          );
+        }
+      },
     } satisfies CelldQueueProducer,
   };
 }
