@@ -514,6 +514,73 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     });
   }
 
+  it('delivers a native Queue batch and measures wide fan-out publication', async () => {
+    const w = world({ deploymentId: `batch-${randomUUID()}` });
+    const marker = randomUUID().slice(0, 8);
+    const count = 32;
+    const singleQueue = `__wkf_workflow_single_${marker}`;
+    const batchQueue = `__wkf_workflow_batch_${marker}`;
+    const messages = Array.from({ length: count }, (_, index) => ({
+      message: { __healthCheck: true as const, correlationId: `${marker}-${index}` },
+      opts: { idempotencyKey: `${marker}-${index}` },
+    }));
+    const singlesStarted = performance.now();
+    const singles = await Promise.all(
+      messages.map(({ message, opts }) => w.queue(singleQueue, message, opts)),
+    );
+    const singlesMs = performance.now() - singlesStarted;
+    const batchStarted = performance.now();
+    const batched = await w.queueBatch!(batchQueue, messages);
+    const batchMs = performance.now() - batchStarted;
+    expect(singles).toHaveLength(count);
+    expect(batched).toHaveLength(count);
+    expect(batched.every((result) => result.error === undefined)).toBe(true);
+    await waitFor(
+      async () =>
+        deliveries.filter((delivery) => delivery.headers['x-vqs-queue-name'] === singleQueue)
+          .length >= count &&
+        deliveries.filter((delivery) => delivery.headers['x-vqs-queue-name'] === batchQueue)
+          .length >= count,
+      30_000,
+      'single and batch Queue deliveries',
+    );
+    console.log(`CELLD_QUEUE_FANOUT ${JSON.stringify({ count, singlesMs, batchMs })}`);
+  });
+
+  it('delivers offloaded run input from a native Queue batch', async () => {
+    const deploymentId = `batch-payload-${randomUUID()}`;
+    const w = world({ deploymentId });
+    const created = await w.events.create(null, {
+      eventType: 'run_created',
+      eventData: { deploymentId, workflowName: 'batch-payload', input: [] },
+    });
+    const marker = `batch-payload-${randomUUID()}`;
+    const queueName = `__wkf_workflow_${randomUUID().slice(0, 8)}`;
+    const results = await w.queueBatch!(queueName, [
+      {
+        message: {
+          runId: created.run.runId,
+          runInput: {
+            input: `${marker}${'x'.repeat(200_000)}`,
+            deploymentId,
+            workflowName: 'batch-payload',
+            specVersion: SPEC_VERSION_CURRENT,
+          },
+        },
+        opts: { idempotencyKey: marker },
+      },
+    ]);
+    expect(results).toHaveLength(1);
+    expect(results[0].error).toBeUndefined();
+    const delivered = await waitFor(
+      async () => deliveries.find((delivery) => delivery.body.includes(marker)),
+      30_000,
+      'offloaded batch payload delivery',
+    );
+    expect(delivered.headers['x-vqs-queue-name']).toBe(queueName);
+    expect(delivered.body).toContain('x'.repeat(1000));
+  });
+
   it.each([
     ['wrong-secret', { version: 1 }, 1, 'Unauthorized'],
     [SECRET, {}, 1, 'version'],

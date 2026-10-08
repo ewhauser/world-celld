@@ -98,6 +98,15 @@ export interface NativeQueueSendResult {
   messageId: string;
 }
 
+export interface NativeQueueBatchEntry {
+  envelope: NativeQueueEnvelope;
+  options?: NativeQueueSendOptions;
+}
+
+export type NativeQueueBatchResult =
+  | { messageId: string; error?: undefined }
+  | { messageId: null; error: string; retryable: boolean };
+
 export function queuePayloadRegistryKey(messageId: string): string {
   return `${QUEUE_PAYLOAD_REGISTRY_PREFIX}${messageId}`;
 }

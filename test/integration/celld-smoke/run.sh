@@ -92,4 +92,4 @@ CELLD_SMOKE_CELLD_BIN="$celld_binary" \
 CELLD_SMOKE_MINIO_BIN="$minio_binary" \
 CELLD_SMOKE_MC_BIN="$mc_binary" \
 CELLD_SMOKE_TEMP_ROOT="$runtime_root/harness" \
-  pnpm vitest run --config vitest.celld-smoke.config.ts
+  pnpm vitest run --config vitest.celld-smoke.config.ts "$@"

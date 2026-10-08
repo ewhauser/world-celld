@@ -122,3 +122,85 @@ test('current queue fan-out sends one public RPC per message', async () => {
     else process.env.CELLD_QUEUE_MODE = previousMode;
   }
 });
+
+test('queueBatch publishes wide fan-out in one public and one broker call', async () => {
+  const previousMode = process.env.CELLD_QUEUE_MODE;
+  process.env.CELLD_QUEUE_MODE = 'native';
+  let publicRpcs = 0;
+  try {
+    const env = createRemoteEnv({
+      fleetUrl: harness.url,
+      secret: SECRET,
+      fetchImpl: async (input, init) => {
+        publicRpcs++;
+        return fetch(input, init);
+      },
+    });
+    const queue = createQueue({
+      env: { WORKFLOW_QUEUE: env.WORKFLOW_QUEUE },
+      deploymentId: 'feature-evaluation',
+      baseUrl: 'http://127.0.0.1:9',
+    });
+    const count = 64;
+    const previousBatches = harness.queueBatchCalls.length;
+    const previousPublications = harness.queuePublications.length;
+    const results = await queue.queueBatch!(
+      '__wkf_workflow_evaluation',
+      Array.from({ length: count }, (_, index) => ({
+        message: { __healthCheck: true as const, correlationId: `batched-${index}` },
+        opts: { idempotencyKey: `batch-${index}` },
+      })),
+    );
+    expect(results).toHaveLength(count);
+    expect(results.every((result) => result.error === undefined)).toBe(true);
+    expect(new Set(results.map((result) => result.messageId)).size).toBe(count);
+    expect(publicRpcs).toBe(1);
+    expect(harness.queueBatchCalls.slice(previousBatches)).toEqual([count]);
+    expect(
+      harness.queuePublications
+        .slice(previousPublications)
+        .map((publication) => JSON.parse(publication.body).messageId),
+    ).toEqual(results.map((result) => result.messageId));
+  } finally {
+    if (previousMode === undefined) delete process.env.CELLD_QUEUE_MODE;
+    else process.env.CELLD_QUEUE_MODE = previousMode;
+  }
+});
+
+test('queueBatch preserves keyed deduplication and offloads run input', async () => {
+  const previousMode = process.env.CELLD_QUEUE_MODE;
+  process.env.CELLD_QUEUE_MODE = 'native';
+  try {
+    const runId = 'wrun_feature_eval_batch_payload';
+    await createRun(runId);
+    const env = createRemoteEnv({ fleetUrl: harness.url, secret: SECRET });
+    const queue = createQueue({
+      env: { WORKFLOW_QUEUE: env.WORKFLOW_QUEUE },
+      deploymentId: 'feature-evaluation',
+      baseUrl: 'http://127.0.0.1:9',
+    });
+    const before = harness.queuePublications.length;
+    const message = {
+      runId,
+      runInput: {
+        input: 'x'.repeat(200_000),
+        deploymentId: 'feature-evaluation',
+        workflowName: 'evaluation',
+        specVersion: 8,
+      },
+    };
+    const results = await queue.queueBatch!('__wkf_workflow_evaluation', [
+      { message, opts: { idempotencyKey: 'same-batch-key' } },
+      { message, opts: { idempotencyKey: 'same-batch-key' } },
+    ]);
+    expect(results[0]?.error).toBeUndefined();
+    expect(results[1]).toEqual(results[0]);
+    expect(harness.queuePublications).toHaveLength(before + 1);
+    const brokerEnvelope = JSON.parse(harness.queuePublications[before].body);
+    expect(brokerEnvelope).not.toHaveProperty('body');
+    expect(harness.queuePayloads.get(brokerEnvelope.payloadKey)).toContain('x'.repeat(1000));
+  } finally {
+    if (previousMode === undefined) delete process.env.CELLD_QUEUE_MODE;
+    else process.env.CELLD_QUEUE_MODE = previousMode;
+  }
+});
