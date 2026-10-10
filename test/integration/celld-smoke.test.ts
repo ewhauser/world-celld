@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { RunExpiredError } from '@workflow/errors';
-import { SPEC_VERSION_CURRENT } from '@workflow/world';
+import { slotToEventId, SPEC_VERSION_CURRENT } from '@workflow/world';
 import { build } from 'esbuild';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createCelldWorld } from '../../src/index.js';
@@ -567,6 +567,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     deploymentId: string;
     runRetentionMs?: number;
     streamLongPollMs?: number;
+    enableEventBatching?: boolean;
   }) {
     return createCelldWorld({
       fleetUrl: runtime!.url,
@@ -1112,6 +1113,43 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
       }
     },
   );
+
+  it('persists one atomic step batch through an actual celld process restart', async () => {
+    const deploymentId = `batch-${randomUUID()}`;
+    const w = world({ deploymentId, enableEventBatching: true });
+    const created = await w.events.create(null, {
+      eventType: 'run_created',
+      eventData: {
+        deploymentId,
+        workflowName: deploymentId,
+        input: [],
+      },
+    });
+    const runId = created.run.runId;
+    const batch = ['a', 'b'].flatMap((id) => [
+      {
+        event: {
+          eventType: 'step_created' as const,
+          correlationId: id,
+          eventData: { stepName: id, input: [] },
+        },
+      },
+      { event: { eventType: 'step_started' as const, correlationId: id } },
+    ]);
+    const result = await w.events.createBatch!(runId, batch);
+    expect(result.results.map((item) => item.event?.eventId)).toEqual(
+      [2, 3, 4, 5].map(slotToEventId),
+    );
+    const restart = await runtime!.restart(0, true);
+    expect(restart.newPid).not.toBe(restart.oldPid);
+    expect((await w.events.createBatch!(runId, batch)).results.map((item) => item.status)).toEqual([
+      409, 409, 409, 409,
+    ]);
+    expect((await w.steps.get(runId, 'a')).attempt).toBe(1);
+    expect((await w.events.list({ runId })).data.map((event) => event.eventId)).toEqual(
+      [1, 2, 3, 4, 5].map(slotToEventId),
+    );
+  });
 
   it('recovers durable state and one accepted native Queue delivery after a process restart', async () => {
     const deploymentId = `restart-${randomUUID()}`;

@@ -1,0 +1,6 @@
+{"kind":"throughput","enabled":false,"width":64,"sample":0,"cold":true,"concurrentRuns":4,"elapsedMs":1849.214625,"runsPerSecond":2.163080448274088}
+{"kind":"throughput","enabled":false,"width":64,"sample":1,"cold":false,"concurrentRuns":4,"elapsedMs":1870.6545,"runsPerSecond":2.138289031993882}
+{"kind":"throughput","enabled":false,"width":64,"sample":2,"cold":false,"concurrentRuns":4,"elapsedMs":1779.4387499999998,"runsPerSecond":2.2478997942469223}
+{"kind":"throughput","enabled":true,"width":64,"sample":0,"cold":true,"concurrentRuns":4,"elapsedMs":1811.101667,"runsPerSecond":2.208600473890459}
+{"kind":"throughput","enabled":true,"width":64,"sample":1,"cold":false,"concurrentRuns":4,"elapsedMs":1759.1560000000009,"runsPerSecond":2.2738176716561793}
+{"kind":"throughput","enabled":true,"width":64,"sample":2,"cold":false,"concurrentRuns":4,"elapsedMs":1726.5017079999998,"runsPerSecond":2.3168236564524736}

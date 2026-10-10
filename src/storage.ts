@@ -8,6 +8,9 @@ import {
   WorkflowWorldError,
 } from '@workflow/errors';
 import type {
+  BatchEventRequest,
+  CreateEventBatchParams,
+  EventBatchResult,
   CreateEventParams,
   CreateEventRequest,
   Event,
@@ -61,6 +64,10 @@ import type { RunReadOutcome } from './retention.js';
  */
 export interface WorkflowRunDOStub {
   applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome>;
+  applyEventBatch?(request: {
+    runId: string;
+    events: BatchEventRequest[];
+  }): Promise<ApplyEventOutcome[]>;
   resolveHookTokenClaim(request: {
     hookId: string;
     token: string;
@@ -116,6 +123,7 @@ export interface CloudflareStorageConfig {
   };
   deploymentId: string;
   runRetentionMs?: number;
+  enableEventBatching?: boolean;
 }
 
 function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
@@ -687,6 +695,64 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           ...eventPage,
         };
       },
+
+      ...(config.enableEventBatching
+        ? {
+            async createBatch(
+              runId: string,
+              events: BatchEventRequest[],
+              _params?: CreateEventBatchParams,
+            ): Promise<EventBatchResult> {
+              if (typeof runId !== 'string' || !runId) {
+                throw new WorkflowWorldError('createBatch requires a runId', { status: 400 });
+              }
+              // The server validates the complete envelope before opening a
+              // transaction. Never downgrade a batch to individual RPCs here.
+              const stub = getRunDO(runId);
+              if (!stub.applyEventBatch) {
+                throw new WorkflowWorldError('Worker does not support event batching', {
+                  status: 501,
+                });
+              }
+              const wire: unknown = await stub.applyEventBatch({ runId, events });
+              if (!Array.isArray(wire) || wire.length !== events.length) {
+                malformedApplyEventOutcome('batch result length does not match request');
+              }
+              return {
+                results: wire.map((value) => {
+                  const parsed = parseApplyEventOutcome(value);
+                  if (parsed.kind !== 'success') {
+                    const failure = parsed.outcome;
+                    const status =
+                      failure.code === 'ENTITY_CONFLICT'
+                        ? 409
+                        : failure.code.endsWith('_NOT_FOUND')
+                          ? 404
+                          : failure.code === 'RUN_EXPIRED'
+                            ? 410
+                            : failure.code === 'TOO_EARLY'
+                              ? 425
+                              : (failure.status ?? 400);
+                    return {
+                      status,
+                      error: status === 409 ? 'conflict' : failure.code,
+                      message: failure.message,
+                    };
+                  }
+                  const success = parsed.outcome;
+                  if (!success.event) malformedApplyEventOutcome('batch success omitted event');
+                  return {
+                    status: 200 as const,
+                    event: success.event,
+                    run: success.run,
+                    step: success.step,
+                    wait: success.wait,
+                  };
+                }),
+              };
+            },
+          }
+        : {}),
 
       async get(runId: string, eventId: string, _params?: GetEventParams): Promise<Event> {
         const stub = getRunDO(runId);
