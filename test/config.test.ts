@@ -12,6 +12,7 @@ describe('runtime configuration validation', () => {
     delete process.env.CELLD_RUN_RETENTION_MS;
     delete process.env.CELLD_FLEET_URL;
     delete process.env.CELLD_WORLD_SECRET;
+    delete process.env.WORKFLOW_DEPLOYMENT_URLS;
     delete (globalThis as { CELLD_ENV?: CelldWorldEnv }).CELLD_ENV;
   });
 
@@ -32,6 +33,26 @@ describe('runtime configuration validation', () => {
       streamLongPollMs: MAX_STREAM_LONG_POLL_MS,
       streamFlushIntervalMs: 0,
     });
+  });
+
+  it('accepts a trusted deployment map from the environment or direct config', () => {
+    vi.stubEnv('WORKFLOW_DEPLOYMENT_URLS', '{"old":"https://old.internal/path/"}');
+    expect(resolveConfig().deploymentUrls).toEqual({ old: 'https://old.internal/path' });
+    expect(
+      resolveConfig({ deploymentUrls: { current: 'https://current.internal' } }).deploymentUrls,
+    ).toEqual({ current: 'https://current.internal' });
+  });
+
+  it.each([
+    'not json',
+    '[]',
+    '{"old":"relative/path"}',
+    '{"old":"ftp://old.internal"}',
+    '{"old":"https://user:pass@old.internal"}',
+    '{"old":"https://old.internal/?secret=x"}',
+  ])('rejects invalid deployment URL configuration %s', (value) => {
+    vi.stubEnv('WORKFLOW_DEPLOYMENT_URLS', value);
+    expect(() => resolveConfig()).toThrow(/deployment URL|WORKFLOW_DEPLOYMENT_URLS/);
   });
 
   it('does not coerce numeric strings in typed configuration options', () => {

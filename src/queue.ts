@@ -44,6 +44,11 @@ import {
   queueDelayDeadline,
   strictIntegerSetting,
 } from './validation.js';
+import {
+  configuredDeploymentUrl,
+  type DeploymentUrls,
+  validateDeploymentUrls,
+} from './deployment-routing.js';
 
 const MAX_TIMER_DELAY_MS = 0x7fffffff;
 const MAX_TEST_PUMP_BACKOFF_MS = 60_000;
@@ -115,6 +120,7 @@ export interface CelldQueueConfig {
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${process.env.PORT ?? 3000}`
    */
   baseUrl?: string;
+  deploymentUrls?: DeploymentUrls;
   /** Per-job HTTP request timeout (ms) for the test pump. Default/max: 300_000 */
   httpTimeoutMs?: number;
   /** Maximum retry attempts in the test pump before dropping a job. Default: 5 */
@@ -129,6 +135,7 @@ interface PumpEnvelope {
   attempt: number;
   message: QueuePayload;
   idempotencyKey?: string;
+  targetBaseUrl: string;
 }
 
 function resolveBaseUrl(config: CelldQueueConfig): string {
@@ -198,7 +205,8 @@ function createTestPump(config: CelldQueueConfig) {
   }
 
   function retry(envelope: PumpEnvelope, pathname: Pathname, reason: string): void {
-    if (envelope.attempt >= maxAttempts) {
+    const mappedRun = config.deploymentUrls !== undefined && 'runId' in envelope.message;
+    if (envelope.attempt >= maxAttempts && !mappedRun) {
       release(envelope);
       console.error(
         `[world-celld test pump] dropping ${envelope.messageId} after ${envelope.attempt} attempts: ${reason}`,
@@ -223,7 +231,7 @@ function createTestPump(config: CelldQueueConfig) {
   }
 
   async function dispatch(envelope: PumpEnvelope, pathname: Pathname): Promise<void> {
-    const url = `${resolveBaseUrl(config)}/.well-known/workflow/v1/${pathname}`;
+    const url = `${envelope.targetBaseUrl}/.well-known/workflow/v1/${pathname}`;
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -236,7 +244,11 @@ function createTestPump(config: CelldQueueConfig) {
       signal: AbortSignal.timeout(httpTimeoutMs),
     });
 
-    if (response.ok || PERMANENT_ERROR_STATUSES.has(response.status)) {
+    if (
+      response.ok ||
+      (!config.deploymentUrls && PERMANENT_ERROR_STATUSES.has(response.status)) ||
+      (!('runId' in envelope.message) && PERMANENT_ERROR_STATUSES.has(response.status))
+    ) {
       try {
         await response.body?.cancel();
       } catch {
@@ -336,6 +348,8 @@ function createTestPump(config: CelldQueueConfig) {
 
 export function createQueue(config: CelldQueueConfig): Queue & { start(): Promise<void> } {
   const { env, deploymentId } = config;
+  const deploymentUrls =
+    config.deploymentUrls === undefined ? undefined : validateDeploymentUrls(config.deploymentUrls);
   if (!env?.WORKFLOW_QUEUE) {
     throw new Error('world-celld queue missing WORKFLOW_QUEUE binding');
   }
@@ -363,6 +377,27 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         'runId' in parsedMessage.data && typeof parsedMessage.data.runId === 'string'
           ? parsedMessage.data.runId
           : undefined;
+      const targetIds = [
+        opts?.deploymentId,
+        'runInput' in parsedMessage.data ? parsedMessage.data.runInput?.deploymentId : undefined,
+        'runContext' in parsedMessage.data
+          ? parsedMessage.data.runContext?.deploymentId
+          : undefined,
+        'hookInput' in parsedMessage.data ? parsedMessage.data.hookInput?.deploymentId : undefined,
+      ].filter((id): id is string => typeof id === 'string');
+      if (targetIds.some((id) => id !== targetIds[0])) {
+        throw new Error('world-celld: queue deployment hints disagree');
+      }
+      const targetId = targetIds[0] ?? deploymentId;
+      if (deploymentUrls && runId && targetIds.length === 0) {
+        throw new Error('world-celld: queued run has no deployment routing hint');
+      }
+      if (!deploymentUrls && opts?.deploymentId && targetId !== deploymentId) {
+        throw new Error(`world-celld: no callback URL configured for deployment ${targetId}`);
+      }
+      const targetBaseUrl = deploymentUrls
+        ? configuredDeploymentUrl(deploymentUrls, targetId)
+        : resolveBaseUrl(config).replace(/\/$/, '');
 
       if (isTestMode()) {
         // Dedup on idempotencyKey while a message with the same key is in
@@ -381,6 +416,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
             attempt: 1,
             message: parsedMessage.data,
             idempotencyKey: opts?.idempotencyKey,
+            targetBaseUrl,
           },
           opts?.delaySeconds,
         );
@@ -405,7 +441,7 @@ export function createQueue(config: CelldQueueConfig): Queue & { start(): Promis
         version: 1,
         messageId,
         queueName,
-        targetBaseUrl: resolveBaseUrl(config),
+        targetBaseUrl,
         runId,
         idempotencyKey: opts?.idempotencyKey,
         body,

@@ -110,6 +110,7 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     },
     deploymentId: resolved.deploymentId,
     baseUrl: resolved.baseUrl,
+    deploymentUrls: resolved.deploymentUrls,
   });
 
   const streamer = createStreamer({

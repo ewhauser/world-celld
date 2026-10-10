@@ -108,6 +108,66 @@ describe('Queue (celld native Queue integration)', () => {
       expect(result.messageId).toBe(enq.messageId);
     });
 
+    it('refuses a foreign deployment without a trusted route', async () => {
+      await expect(
+        queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD, { deploymentId: 'beta' }),
+      ).rejects.toThrow(/no callback URL configured/);
+      expect(recordedEnqueues).toHaveLength(0);
+    });
+
+    it('snapshots a configured immutable destination for a cross-deployment hook wake', async () => {
+      const routed = createQueue({
+        env: { WORKFLOW_QUEUE: mockEnv.WORKFLOW_QUEUE },
+        deploymentId: 'stable',
+        baseUrl: 'https://current.internal',
+        deploymentUrls: {
+          stable: 'https://stable.internal/',
+          'celld-default': 'https://beta.internal/',
+        },
+      });
+      const message = {
+        runId: 'wrun_old',
+        hookInput: {
+          deploymentId: 'celld-default',
+          resumeId: 'resume_old',
+          hookId: 'hook_old',
+          token: 'token_old',
+          payload: true,
+          payloadDigest: 'digest_old',
+        },
+      };
+      await routed.queue('__wkf_workflow_test', message, {
+        deploymentId: 'celld-default',
+        idempotencyKey: 'old-hook',
+        delaySeconds: 12,
+      });
+      expect(recordedEnqueues[0].envelope.targetBaseUrl).toBe('https://beta.internal');
+      expect(recordedEnqueues[0].envelope.idempotencyKey).toBe('old-hook');
+      expect(recordedEnqueues[0].envelope.notBefore).toBeDefined();
+    });
+
+    it('refuses unknown or conflicting mapped deployment IDs before publication', async () => {
+      const routed = createQueue({
+        env: { WORKFLOW_QUEUE: mockEnv.WORKFLOW_QUEUE },
+        deploymentId: 'stable',
+        deploymentUrls: { stable: 'https://stable.internal' },
+      });
+      await expect(
+        routed.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD, { deploymentId: 'unknown' }),
+      ).rejects.toThrow(/no callback URL/);
+      await expect(
+        routed.queue(
+          '__wkf_workflow_test',
+          {
+            runId: 'wrun_old',
+            runInput: { deploymentId: 'stable', input: [], workflowName: 'old', specVersion: 8 },
+          },
+          { deploymentId: 'celld-default' },
+        ),
+      ).rejects.toThrow(/disagree/);
+      expect(recordedEnqueues).toHaveLength(0);
+    });
+
     it('preserves the workflow queue name', async () => {
       await queue.queue('__wkf_workflow_test', WORKFLOW_PAYLOAD);
       expect(recordedEnqueues[0].envelope.queueName).toBe('__wkf_workflow_test');

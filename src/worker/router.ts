@@ -74,6 +74,10 @@ interface NativeQueueBindingLike {
 
 export interface QueueRunStub {
   getQueueAdmission(): Promise<{ ok: true } | { ok: false; message: string }>;
+  getRun(): Promise<
+    | { ok: true; value: { deploymentId: string } | null }
+    | { ok: false; code: 'RUN_EXPIRED'; message: string }
+  >;
   registerQueuePayload(
     registration: QueuePayloadRegistration,
   ): Promise<{ ok: true } | { ok: false; message: string }>;
@@ -141,6 +145,7 @@ export interface WorkerEnv {
   WORKFLOW_QUEUE_PAYLOADS?: QueuePayloadStore;
   WORLD_SECRET?: string;
   WORKFLOW_CALLBACK_SECRET?: string;
+  WORKFLOW_DEPLOYMENT_URLS?: string;
   WORKFLOW_RETENTION_MS?: string | number;
   WORKFLOW_RETENTION_BATCH_SIZE?: string | number;
 }

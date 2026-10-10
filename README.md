@@ -14,7 +14,7 @@ self-hosted alternative to platform-specific Workflow backends.
 
 ## World protocol compatibility
 
-This adapter supports World spec v8 with the Workflow 5 beta packages. This is
+This adapter supports World spec v8 with the Workflow 5 stable packages. This is
 a breaking upgrade for applications using a v7 Workflow runtime: that runtime
 rejects a World advertising v8. This adapter also rejects event writes to runs
 stamped v7. Keep the v7 adapter and matching Workflow packages in place until
@@ -91,6 +91,22 @@ const world = createCelldWorld({
 
 `WORKFLOW_BASE_URL` (or `baseUrl`) is where the native Queue bridge delivers flow
 requests. It must be reachable from every celld node.
+
+For overlapping Workflow builds, give each build a distinct `CELLD_DEPLOYMENT_ID`
+and keep its compiled workflow endpoints available while any of its runs remain
+active. Set `WORKFLOW_DEPLOYMENT_URLS` on every app that may accept hooks for those
+runs and in the primary celld worker's private `vars` to the same JSON map, for
+example `{"celld-default":"https://beta.internal","stable-v1":"https://stable.internal"}`.
+The equivalent `createCelldWorld({ deploymentUrls: { ... } })` option configures
+an app directly. Each URL must be an absolute HTTP(S) origin or base path without
+credentials, query, or fragment. Keep every mapped destination reachable from
+the Queue delivery worker. A mapped run's stored deployment ID selects its
+callback build, including for messages queued before this setting was added;
+new messages also snapshot their destination at enqueue. Missing mappings and
+unavailable destinations remain retryable rather than acknowledging the work.
+Keep the map and old build in service through the last old run and pending
+delivery. Do not change an existing deployment ID to point at different
+compiled workflow code. The in-process test queue accepts the same map.
 
 ## Deploy the worker
 
@@ -227,16 +243,17 @@ post-compaction costs are recorded in
 Application options can be passed to `createCelldWorld()` unless an environment
 variable is shown below.
 
-| Option                  | Environment variable     | Default                  |
-| ----------------------- | ------------------------ | ------------------------ |
-| `fleetUrl`              | `CELLD_FLEET_URL`        | required                 |
-| `secret`                | `CELLD_WORLD_SECRET`     | required with `fleetUrl` |
-| `baseUrl`               | `WORKFLOW_BASE_URL`      | `http://localhost:$PORT` |
-| `deploymentId`          | `CELLD_DEPLOYMENT_ID`    | `celld-default`          |
-| `runRetentionMs`        | `CELLD_RUN_RETENTION_MS` | `0` (disabled)           |
-| `streamLongPollMs`      | —                        | `20000`                  |
-| `streamFlushIntervalMs` | —                        | `0`                      |
-| `rpcTimeoutMs`          | —                        | `30000` (max `300000`)   |
+| Option                  | Environment variable       | Default                  |
+| ----------------------- | -------------------------- | ------------------------ |
+| `fleetUrl`              | `CELLD_FLEET_URL`          | required                 |
+| `secret`                | `CELLD_WORLD_SECRET`       | required with `fleetUrl` |
+| `baseUrl`               | `WORKFLOW_BASE_URL`        | `http://localhost:$PORT` |
+| `deploymentId`          | `CELLD_DEPLOYMENT_ID`      | `celld-default`          |
+| `deploymentUrls`        | `WORKFLOW_DEPLOYMENT_URLS` | unset                    |
+| `runRetentionMs`        | `CELLD_RUN_RETENTION_MS`   | `0` (disabled)           |
+| `streamLongPollMs`      | —                          | `20000`                  |
+| `streamFlushIntervalMs` | —                          | `0`                      |
+| `rpcTimeoutMs`          | —                          | `30000` (max `300000`)   |
 
 The deployed worker also accepts these celld variables:
 
@@ -244,6 +261,7 @@ The deployed worker also accepts these celld variables:
 | ------------------------------- | ------- | ---------------------------------------------------- |
 | `WORLD_SECRET`                  | none    | Required bearer secret for RPC routes                |
 | `WORKFLOW_CALLBACK_SECRET`      | none    | Sent with deliveries as `x-workflow-callback-secret` |
+| `WORKFLOW_DEPLOYMENT_URLS`      | unset   | JSON map of pinned deployment IDs to callback URLs   |
 | `WORKFLOW_RETENTION_MS`         | `0`     | Maximum run age from creation; includes active runs  |
 | `WORKFLOW_RETENTION_BATCH_SIZE` | `128`   | Runs admitted by each cron sweep (maximum `1000`)    |
 

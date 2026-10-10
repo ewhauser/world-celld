@@ -48,6 +48,9 @@
     "WORLD_SECRET": "",
     // Optional: forwarded as x-workflow-callback-secret on queue deliveries.
     "WORKFLOW_CALLBACK_SECRET": "",
+    // Optional trusted JSON map of persisted deployment IDs to immutable app
+    // callback URLs. Keep celld-default mapped to its original beta build.
+    "WORKFLOW_DEPLOYMENT_URLS": "",
     // Optional fleet-wide maximum workflow age, measured from run creation.
     // Applies to pending, running, and terminal runs. "0" disables it.
     "WORKFLOW_RETENTION_MS": "0",
