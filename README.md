@@ -35,8 +35,9 @@ default, so applications with an older worker continue using single-event
 writes. The batch path uses one RunDO transaction per chunk, returns a result
 for each input event, and never retries a commit-ambiguous inline claim in the
 client. It does not change Queue publication. See the [compiled fan-out
-benchmark](docs/benchmarks/events-create-batch-2026-10-10.md) for measured
-results and limits.
+benchmark](docs/benchmarks/events-create-batch-2026-10-10.md) and the
+[real celld/MinIO follow-up](docs/benchmarks/events-create-batch-real-celld-2026-10-10.md)
+for measured results and limits.
 
 Run listing accepts either a single status or an array of statuses (OR matching).
 An empty status array matches no runs.

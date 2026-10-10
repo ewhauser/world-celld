@@ -243,6 +243,43 @@ async function prepareWorker(
   );
 }
 
+async function forwardBenchmarkHttp(
+  request: http.IncomingMessage,
+  response: http.ServerResponse,
+  target: string,
+): Promise<number> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(chunk as Buffer);
+  const headers = Object.fromEntries(
+    Object.entries(request.headers)
+      .filter(
+        ([key, value]) =>
+          !['host', 'connection', 'content-length'].includes(key) && value !== undefined,
+      )
+      .map(([key, value]) => [key, String(value)]),
+  );
+  try {
+    const upstream = await fetch(`${target}${request.url}`, {
+      method: request.method,
+      headers,
+      body: request.method === 'GET' ? undefined : Buffer.concat(chunks),
+    });
+    const body = Buffer.from(await upstream.arrayBuffer());
+    const responseHeaders = Object.fromEntries(
+      [...upstream.headers].filter(
+        ([key]) => !['content-length', 'transfer-encoding', 'connection'].includes(key),
+      ),
+    );
+    response.writeHead(upstream.status, responseHeaders);
+    response.end(body);
+    return upstream.status;
+  } catch (error) {
+    response.writeHead(502);
+    response.end(String(error));
+    return 502;
+  }
+}
+
 class NativeCelldRuntime {
   private celld: ManagedProcess | undefined;
   private readonly baseEnv: NodeJS.ProcessEnv;
@@ -576,6 +613,267 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
       ...options,
     });
   }
+
+  it.skipIf(process.env.CELLD_FANOUT_BENCH !== '1')(
+    'benchmarks compiled fan-out on real celld and MinIO with interleaved modes',
+    async () => {
+      const appDirectory = process.env.CELLD_SMOKE_STABLE_APP;
+      if (!appDirectory)
+        throw new Error('CELLD_SMOKE_STABLE_APP is required for compiled benchmark');
+      const fleetCalls: Array<{
+        path: string;
+        startedAt: number;
+        elapsedMs: number;
+        status: number;
+      }> = [];
+      const benchDeliveries: Array<{ enabled: boolean; receivedAt: number; attempt: number }> = [];
+      const servers: http.Server[] = [];
+      const apps: ManagedProcess[] = [];
+      const records: Array<Record<string, unknown>> = [];
+      const listen = async (server: http.Server): Promise<string> => {
+        await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+        servers.push(server);
+        return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      };
+      const fleetProxy = await listen(
+        http.createServer(async (request, response) => {
+          const startedAt = Date.now();
+          const started = performance.now();
+          const status = await forwardBenchmarkHttp(request, response, runtime!.url);
+          fleetCalls.push({
+            path: request.url ?? '',
+            startedAt,
+            elapsedMs: performance.now() - started,
+            status,
+          });
+        }),
+      );
+      const modeUrls = new Map<boolean, string>();
+      try {
+        for (const enabled of [false, true]) {
+          const appPort = await freePort();
+          const backendUrl = `http://127.0.0.1:${appPort}`;
+          const appProxy = await listen(
+            http.createServer(async (request, response) => {
+              if (request.url?.startsWith('/.well-known/workflow/v1/flow')) {
+                benchDeliveries.push({
+                  enabled,
+                  receivedAt: Date.now(),
+                  attempt: Number(request.headers['x-vqs-message-attempt'] ?? 1),
+                });
+              }
+              await forwardBenchmarkHttp(request, response, backendUrl);
+            }),
+          );
+          modeUrls.set(enabled, appProxy);
+          const app = startManaged(
+            enabled ? 'batched fan-out app' : 'single-event fan-out app',
+            process.execPath,
+            [join(appDirectory, '.output/server/index.mjs')],
+            {
+              ...process.env,
+              WORKFLOW_TARGET_WORLD: '@ewhauser/world-celld',
+              CELLD_FLEET_URL: fleetProxy,
+              CELLD_WORLD_SECRET: SECRET,
+              CELLD_EVENT_BATCHING: enabled ? '1' : '0',
+              CELLD_DEPLOYMENT_ID: 'real-fanout-benchmark',
+              WORKFLOW_BASE_URL: appProxy,
+              PORT: String(appPort),
+              NODE_ENV: 'production',
+            },
+            appDirectory,
+          );
+          apps.push(app);
+          await waitFor(
+            async () => {
+              if (app.child.exitCode !== null || app.child.signalCode !== null) {
+                throw new Error(`${app.name} exited: ${app.logs()}`);
+              }
+              const response = await fetch(appProxy, { signal: AbortSignal.timeout(1_000) });
+              return response.ok ? true : null;
+            },
+            20_000,
+            `${app.name} readiness`,
+          );
+        }
+        const reader = world({ deploymentId: 'real-fanout-benchmark' });
+        const completedModes = new Set<boolean>();
+        for (const width of process.env.CELLD_FANOUT_BENCH_ONLY_THROUGHPUT === '1'
+          ? []
+          : [8, 64, 128]) {
+          // Five trials per mode at each width, alternating ABBA blocks to
+          // dampen one-directional warmup and backend drift.
+          for (const enabled of [false, true, true, false, false, true, true, false, false, true]) {
+            const appUrl = modeUrls.get(enabled)!;
+            const callOffset = fleetCalls.length;
+            const deliveryOffset = benchDeliveries.length;
+            const requestedAt = Date.now();
+            const started = performance.now();
+            const startResponse = await fetch(`${appUrl}/bench/fanout/${width}`, {
+              method: 'POST',
+            });
+            if (!startResponse.ok)
+              throw new Error(
+                `fan-out start ${startResponse.status}: ${await startResponse.text()}`,
+              );
+            const { runId } = (await startResponse.json()) as { runId: string };
+            await waitFor(
+              async () => {
+                const run = await reader.runs.get(runId);
+                if (run.status === 'failed') throw new Error(`fan-out run ${runId} failed`);
+                return run.status === 'completed' ? true : null;
+              },
+              180_000,
+              `${width}-branch ${enabled ? 'batch' : 'single'} run`,
+            );
+            const totalMs = performance.now() - started;
+            const resultResponse = await fetch(`${appUrl}/bench/result/${runId}`);
+            if (!resultResponse.ok)
+              throw new Error(
+                `fan-out result ${resultResponse.status}: ${await resultResponse.text()}`,
+              );
+            const result = (await resultResponse.json()) as {
+              branches: Array<{
+                index: number;
+                startedAt: number;
+                finishedAt: number;
+                bytes: number;
+              }>;
+              joinedAt: number;
+            };
+            expect(result.branches).toHaveLength(width);
+            expect(new Set(result.branches.map((branch) => branch.index)).size).toBe(width);
+            expect(
+              result.branches.every(
+                (branch) => branch.bytes === 1024 && branch.finishedAt >= branch.startedAt + 90,
+              ),
+            ).toBe(true);
+            const steps = await reader.steps.list({ runId, pagination: { limit: 1000 } });
+            expect(steps.data).toHaveLength(width);
+            expect(
+              steps.data.every((step) => step.status === 'completed' && step.attempt === 1),
+            ).toBe(true);
+            const starts = result.branches.map((branch) => branch.startedAt);
+            const calls = fleetCalls.slice(callOffset);
+            const eventCalls = calls.filter(
+              (call) => call.path.endsWith('/applyEvent') || call.path.endsWith('/applyEventBatch'),
+            );
+            const queueCalls = calls.filter((call) => call.path === '/v1/queue/send');
+            const observedDeliveries = benchDeliveries.slice(deliveryOffset);
+            const record = {
+              kind: 'real-celld-single-workflow',
+              width,
+              enabled,
+              cold: !completedModes.has(enabled),
+              totalMs,
+              firstBranchStartMs: Math.min(...starts) - requestedAt,
+              lastBranchStartMs: Math.max(...starts) - requestedAt,
+              firstToLastStartMs: Math.max(...starts) - Math.min(...starts),
+              firstStartToJoinMs: result.joinedAt - Math.min(...starts),
+              eventRpcs: eventCalls.length,
+              batchRpcs: eventCalls.filter((call) => call.path.endsWith('/applyEventBatch')).length,
+              eventRpcMsSum: eventCalls.reduce((sum, call) => sum + call.elapsedMs, 0),
+              queuePublicationRpcs: queueCalls.length,
+              firstQueuePublishMs: queueCalls.length ? queueCalls[0].startedAt - requestedAt : null,
+              firstQueueDeliveryMs: observedDeliveries.length
+                ? observedDeliveries[0].receivedAt - requestedAt
+                : null,
+              queueDeliveries: observedDeliveries.length,
+              queueRetries: observedDeliveries.filter((delivery) => delivery.attempt > 1).length,
+              stepCount: steps.data.length,
+            };
+            records.push(record);
+            console.log(`REAL_FANOUT_BENCH ${JSON.stringify(record)}`);
+            completedModes.add(enabled);
+          }
+        }
+        if (process.env.CELLD_FANOUT_BENCH_THROUGHPUT === '1') {
+          const throughputModes = new Set<boolean>();
+          for (const enabled of [false, true, true, false, false, true]) {
+            const appUrl = modeUrls.get(enabled)!;
+            const callOffset = fleetCalls.length;
+            const deliveryOffset = benchDeliveries.length;
+            const started = performance.now();
+            const runs = await Promise.all(
+              Array.from({ length: 4 }, async () => {
+                const response = await fetch(`${appUrl}/bench/fanout/64`, { method: 'POST' });
+                if (!response.ok)
+                  throw new Error(`throughput start ${response.status}: ${await response.text()}`);
+                return (await response.json()) as { runId: string };
+              }),
+            );
+            await waitFor(
+              async () => {
+                const statuses = await Promise.all(
+                  runs.map(async ({ runId }) => (await reader.runs.get(runId)).status),
+                );
+                if (statuses.includes('failed')) throw new Error('concurrent fan-out run failed');
+                return statuses.every((status) => status === 'completed') ? true : null;
+              },
+              180_000,
+              `four concurrent ${enabled ? 'batch' : 'single'} runs`,
+            );
+            const elapsedMs = performance.now() - started;
+            for (const { runId } of runs) {
+              const resultResponse = await fetch(`${appUrl}/bench/result/${runId}`);
+              if (!resultResponse.ok) throw new Error(`throughput result ${resultResponse.status}`);
+              const result = (await resultResponse.json()) as {
+                branches: Array<{ index: number; bytes: number }>;
+              };
+              if (
+                result.branches.length !== 64 ||
+                new Set(result.branches.map((branch) => branch.index)).size !== 64 ||
+                !result.branches.every((branch) => branch.bytes === 1024)
+              ) {
+                throw new Error(`throughput run ${runId} returned incorrect branches`);
+              }
+              const steps = await reader.steps.list({ runId, pagination: { limit: 1000 } });
+              if (
+                steps.data.length !== 64 ||
+                !steps.data.every((step) => step.status === 'completed' && step.attempt === 1)
+              ) {
+                throw new Error(`throughput run ${runId} had duplicate or incomplete steps`);
+              }
+            }
+            const calls = fleetCalls.slice(callOffset);
+            const observedDeliveries = benchDeliveries.slice(deliveryOffset);
+            const record = {
+              kind: 'real-celld-throughput',
+              enabled,
+              width: 64,
+              concurrentRuns: 4,
+              cold: !throughputModes.has(enabled),
+              elapsedMs,
+              runsPerSecond: 4_000 / elapsedMs,
+              eventRpcs: calls.filter(
+                (call) =>
+                  call.path.endsWith('/applyEvent') || call.path.endsWith('/applyEventBatch'),
+              ).length,
+              queuePublicationRpcs: calls.filter((call) => call.path === '/v1/queue/send').length,
+              queueDeliveries: observedDeliveries.length,
+              queueRetries: observedDeliveries.filter((delivery) => delivery.attempt > 1).length,
+            };
+            records.push(record);
+            console.log(`REAL_FANOUT_BENCH ${JSON.stringify(record)}`);
+            throughputModes.add(enabled);
+          }
+        }
+        if (process.env.CELLD_FANOUT_BENCH_RESULT) {
+          await writeFile(
+            process.env.CELLD_FANOUT_BENCH_RESULT,
+            `${records.map((record) => JSON.stringify(record)).join('\n')}\n`,
+          );
+        }
+      } finally {
+        for (const app of apps) await stopManaged(app);
+        for (const server of servers) {
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+          server.closeAllConnections();
+        }
+      }
+    },
+    900_000,
+  );
 
   async function waitForDurableHookPause(deploymentId: string, runId: string): Promise<void> {
     await waitFor(
