@@ -8,6 +8,8 @@ import { queueDelayDeadline } from '../validation.js';
 import { timingSafeEqual } from './auth.js';
 import { deliveryQueueClaim } from './queue-claims.js';
 import type { QueueRunStub, WorkerEnv } from './router.js';
+import { configuredDeploymentUrl, parseDeploymentUrls } from '../deployment-routing.js';
+import { parse } from '../vendor/shared/index.js';
 
 export type QueueDeliveryResult =
   | { kind: 'complete' }
@@ -16,7 +18,11 @@ export type QueueDeliveryResult =
 
 export type QueueDeliveryEnv = Pick<
   WorkerEnv,
-  'WORKFLOW_DB' | 'WORKFLOW_QUEUE_PAYLOADS' | 'WORLD_SECRET' | 'WORKFLOW_CALLBACK_SECRET'
+  | 'WORKFLOW_DB'
+  | 'WORKFLOW_QUEUE_PAYLOADS'
+  | 'WORLD_SECRET'
+  | 'WORKFLOW_CALLBACK_SECRET'
+  | 'WORKFLOW_DEPLOYMENT_URLS'
 >;
 
 const MAX_QUEUE_DELIVERY_RESPONSE_BYTES = 64 * 1024;
@@ -124,6 +130,25 @@ export async function deliverQueueMessage(
       }
     }
 
+    const deploymentUrls = parseDeploymentUrls(env.WORKFLOW_DEPLOYMENT_URLS);
+    let targetBaseUrl = envelope.targetBaseUrl;
+    if (deploymentUrls && envelope.runId) {
+      // The stored run is authoritative for existing deliveries. A resilient
+      // initial message can precede run_created, so it carries its own pinned ID.
+      const stored = await runStub(envelope.runId).getRun();
+      if (!stored.ok) throw new Error('world-celld: cannot route an expired run');
+      const parsedBody = parse<{ runInput?: { deploymentId?: unknown } }>(body!);
+      const initialId = parsedBody.runInput?.deploymentId;
+      const pinnedId = stored.value?.deploymentId ?? initialId;
+      if (typeof pinnedId !== 'string' || pinnedId.length === 0) {
+        throw new Error(`world-celld: no pinned deployment for run ${envelope.runId}`);
+      }
+      if (stored.value && initialId !== undefined && initialId !== pinnedId) {
+        throw new Error(`world-celld: queue run deployment hints disagree for ${envelope.runId}`);
+      }
+      targetBaseUrl = configuredDeploymentUrl(deploymentUrls, pinnedId);
+    }
+
     const headers: Record<string, string> = {
       'content-type': 'application/json',
       'x-vqs-queue-name': envelope.queueName,
@@ -134,10 +159,14 @@ export async function deliverQueueMessage(
       headers['x-workflow-callback-secret'] = env.WORKFLOW_CALLBACK_SECRET;
     }
     const callback = await fetch(
-      `${envelope.targetBaseUrl.replace(/\/$/, '')}/.well-known/workflow/v1/flow`,
+      `${targetBaseUrl.replace(/\/$/, '')}/.well-known/workflow/v1/flow`,
       { method: 'POST', headers, body, signal: AbortSignal.timeout(300_000) },
     );
-    if (callback.ok || PERMANENT_QUEUE_STATUSES.has(callback.status)) {
+    if (
+      callback.ok ||
+      (!deploymentUrls && PERMANENT_QUEUE_STATUSES.has(callback.status)) ||
+      (!envelope.runId && PERMANENT_QUEUE_STATUSES.has(callback.status))
+    ) {
       await callback.body?.cancel().catch(() => undefined);
       if (envelope.payloadKey) {
         await payloadStore!.delete(envelope.payloadKey);

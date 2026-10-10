@@ -49,6 +49,15 @@ in the primary Wrangler config and redeploy to enable a maximum workflow age
 measured from run creation. celld rejects `CELLD_VAR_*` node overrides.
 `.dev.vars` overrides apply only to `celld dev`, not production deployments.
 
+To keep in-flight runs on their original compiled Workflow build, set
+`vars.WORKFLOW_DEPLOYMENT_URLS` in the private primary worker config to a JSON
+object of deployment IDs and reachable HTTP(S) callback URLs. Configure the
+same map in the applications with `WORKFLOW_DEPLOYMENT_URLS` or `deploymentUrls`.
+The worker resolves already queued run messages from the persisted run ID, so
+the map must retain old destinations until their runs and queued deliveries
+finish. Keep each old compiled app available at its mapped URL. An unknown or
+unavailable destination is retried, including a callback 404.
+
 `7776000000` is 90 days. The policy includes pending and running workflows as
 well as terminal ones. Each cron occurrence admits at most
 `WORKFLOW_RETENTION_BATCH_SIZE` runs (default `128`); the existing per-run alarm

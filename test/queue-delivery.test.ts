@@ -39,6 +39,9 @@ function setup() {
     getQueueAdmission: vi
       .fn<QueueRunStub['getQueueAdmission']>()
       .mockResolvedValue({ ok: true } as const),
+    getRun: vi
+      .fn<QueueRunStub['getRun']>()
+      .mockResolvedValue({ ok: true, value: { deploymentId: 'celld-default' } }),
     unregisterQueuePayload: vi
       .fn<QueueRunStub['unregisterQueuePayload']>()
       .mockResolvedValue(undefined),
@@ -230,6 +233,68 @@ describe('internal Queue delivery', () => {
       'connection reset',
     );
     expect(claim.releaseInflight).toHaveBeenCalledWith(envelope.messageId);
+  });
+
+  describe('trusted deployment routing', () => {
+    const routes = JSON.stringify({
+      'celld-default': 'https://beta.internal',
+      stable: 'https://stable.internal',
+    });
+
+    it('overrides an already queued, offloaded callback with the stored run deployment', async () => {
+      const { env, run, callback, store } = setup();
+      env.WORKFLOW_DEPLOYMENT_URLS = routes;
+      expect(await deliverQueueMessage(env, 'secret', envelope, 1)).toEqual({ kind: 'complete' });
+      expect(run.getRun).toHaveBeenCalledOnce();
+      expect(callback.mock.calls[0][0]).toBe('https://beta.internal/.well-known/workflow/v1/flow');
+      expect(store.delete).toHaveBeenCalledWith(envelope.payloadKey);
+    });
+
+    it('routes a resilient first message before the run row exists', async () => {
+      const { env, run, callback } = setup();
+      env.WORKFLOW_DEPLOYMENT_URLS = routes;
+      run.getRun.mockResolvedValue({ ok: true, value: null });
+      const first = {
+        ...envelope,
+        idempotencyKey: undefined,
+        payloadKey: undefined,
+        body: JSON.stringify({ runId: envelope.runId, runInput: { deploymentId: 'stable' } }),
+      };
+      expect(await deliverQueueMessage(env, 'secret', first, 1)).toEqual({ kind: 'complete' });
+      expect(callback.mock.calls[0][0]).toBe(
+        'https://stable.internal/.well-known/workflow/v1/flow',
+      );
+    });
+
+    it('retains an offloaded payload and releases its claim when the old route is missing', async () => {
+      const { env, claim, callback, store } = setup();
+      env.WORKFLOW_DEPLOYMENT_URLS = JSON.stringify({ stable: 'https://stable.internal' });
+      await expect(deliverQueueMessage(env, 'secret', envelope, 1)).rejects.toThrow(
+        /no callback URL/,
+      );
+      expect(callback).not.toHaveBeenCalled();
+      expect(store.delete).not.toHaveBeenCalled();
+      expect(claim.releaseInflight).toHaveBeenCalledWith(envelope.messageId);
+    });
+
+    it('retries a mapped callback 404 without acknowledging or deleting the payload', async () => {
+      const { env, claim, callback, store } = setup();
+      env.WORKFLOW_DEPLOYMENT_URLS = routes;
+      callback.mockResolvedValue(new Response('missing app route', { status: 404 }));
+      expect(await deliverQueueMessage(env, 'secret', envelope, 1)).toEqual({ kind: 'retry' });
+      expect(store.delete).not.toHaveBeenCalled();
+      expect(claim.completeQueueMessage).not.toHaveBeenCalled();
+      expect(claim.releaseInflight).toHaveBeenCalledWith(envelope.messageId);
+    });
+
+    it('refuses a resilient payload that disagrees with the stored run', async () => {
+      const { env, callback, claim, store } = setup();
+      env.WORKFLOW_DEPLOYMENT_URLS = routes;
+      store.read.mockResolvedValue(JSON.stringify({ runInput: { deploymentId: 'stable' } }));
+      await expect(deliverQueueMessage(env, 'secret', envelope, 1)).rejects.toThrow(/disagree/);
+      expect(callback).not.toHaveBeenCalled();
+      expect(claim.releaseInflight).toHaveBeenCalled();
+    });
   });
 
   describe('inline run-bearing bodies', () => {

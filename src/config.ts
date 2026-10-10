@@ -5,6 +5,11 @@ import { MAX_STREAM_LONG_POLL_MS } from './stream-protocol.js';
 import type { WorkflowIndex } from './indexes.js';
 import { MAX_FLEET_RPC_TIMEOUT_MS } from './lifecycle.js';
 import { boundedIntegerOption, strictIntegerSetting } from './validation.js';
+import {
+  type DeploymentUrls,
+  parseDeploymentUrls,
+  validateDeploymentUrls,
+} from './deployment-routing.js';
 
 /** Public alias retained for custom in-process environments. */
 export type IndexNamespace = WorkflowIndex;
@@ -47,6 +52,8 @@ export interface CelldWorldConfig {
    * Default: process.env.WORKFLOW_BASE_URL || `http://localhost:${PORT ?? 3000}`
    */
   baseUrl?: string;
+  /** Immutable callback URLs for explicitly targeted deployments. Optional. */
+  deploymentUrls?: DeploymentUrls;
   /**
    * Keep terminal run payloads for this many milliseconds before replacing
    * them with metadata-only tombstones. Zero disables automatic cleanup.
@@ -67,6 +74,7 @@ export interface ResolvedCelldConfig {
   env?: CelldWorldEnv;
   deploymentId: string;
   baseUrl?: string;
+  deploymentUrls?: DeploymentUrls;
   runRetentionMs: number;
   streamLongPollMs: number;
   streamFlushIntervalMs: number;
@@ -118,6 +126,10 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
     env: config?.env,
     deploymentId: config?.deploymentId ?? process.env.CELLD_DEPLOYMENT_ID ?? 'celld-default',
     baseUrl: config?.baseUrl,
+    deploymentUrls:
+      config?.deploymentUrls === undefined
+        ? parseDeploymentUrls(process.env.WORKFLOW_DEPLOYMENT_URLS)
+        : validateDeploymentUrls(config.deploymentUrls),
     runRetentionMs,
     streamLongPollMs,
     streamFlushIntervalMs,

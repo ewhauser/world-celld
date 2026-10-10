@@ -41,6 +41,50 @@ interface RestartEvidence {
   startedAt: number;
 }
 
+async function workflowManifest(directory: string): Promise<{
+  steps: Record<string, Record<string, { stepId: string }>>;
+}> {
+  return JSON.parse(
+    await readFile(join(directory, 'node_modules/.nitro/workflow/manifest.json'), 'utf8'),
+  );
+}
+
+function dependencyStepIds(
+  data: Awaited<ReturnType<typeof workflowManifest>>,
+): Map<string, string> {
+  return new Map(
+    Object.entries(data.steps)
+      .filter(([file]) => file.includes('node_modules/'))
+      .flatMap(([, steps]) =>
+        Object.entries(steps).map(([name, { stepId }]) => [name, stepId] as const),
+      ),
+  );
+}
+
+async function startSmokeOrder(url: string, orderId: string): Promise<{ runId: string }> {
+  const response = await fetch(`${url}/orders/${encodeURIComponent(orderId)}`, {
+    method: 'POST',
+  });
+  if (!response.ok) throw new Error(`order start failed ${response.status}`);
+  return (await response.json()) as { runId: string };
+}
+
+async function approveSmokeHook(url: string, token: string): Promise<void> {
+  const response = await fetch(`${url}/approvals/${token}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ approved: true }),
+  });
+  if (!response.ok) throw new Error(`approval failed ${response.status}: ${await response.text()}`);
+}
+
+async function smokeRunStatus(url: string, runId: string | undefined): Promise<string> {
+  if (!runId) return 'not started';
+  return fetch(`${url}/runs/${runId}`)
+    .then(async (response) => `${response.status} ${await response.text()}`)
+    .catch((cause) => String(cause));
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -80,8 +124,9 @@ function startManaged(
   command: string,
   args: string[],
   env: NodeJS.ProcessEnv,
+  cwd?: string,
 ): ManagedProcess {
-  const child = spawn(command, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(command, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   const capture = (chunk: Buffer) => {
     output += chunk.toString('utf8');
@@ -308,6 +353,23 @@ class NativeCelldRuntime {
   logs(): string {
     return this.celld?.logs() ?? '';
   }
+
+  async deployPrimary(directory: string): Promise<void> {
+    await execFileAsync(
+      this.binary,
+      [
+        'deploy',
+        directory,
+        '--bucket',
+        `s3://${BUCKET}`,
+        '--endpoint',
+        this.endpoint,
+        '--region',
+        'us-east-1',
+      ],
+      { env: this.baseEnv, maxBuffer: 4 * 1024 * 1024 },
+    );
+  }
 }
 
 describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', () => {
@@ -513,6 +575,419 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
       ...options,
     });
   }
+
+  async function waitForDurableHookPause(deploymentId: string, runId: string): Promise<void> {
+    await waitFor(
+      async () => {
+        const { data } = await world({ deploymentId }).events.list({
+          runId,
+          pagination: { sortOrder: 'asc' },
+        });
+        const hookIndex = data.findIndex((event) => event.eventType === 'hook_created');
+        if (hookIndex < 0) return null;
+        const progressStep = data
+          .slice(hookIndex + 1)
+          .find((event) => event.eventType === 'step_created');
+        if (!progressStep) return null;
+        return data.some(
+          (event) =>
+            event.eventType === 'step_completed' &&
+            event.correlationId === progressStep.correlationId,
+        )
+          ? true
+          : null;
+      },
+      20_000,
+      `durable hook pause for ${runId}`,
+    );
+  }
+
+  it.skipIf(!process.env.CELLD_SMOKE_BASELINE_APP)(
+    'resumes an in-flight beta-compiled workflow on the stable app after celld restart',
+    async () => {
+      const baselineDirectory = process.env.CELLD_SMOKE_BASELINE_APP!;
+      const currentDirectory = process.env.CELLD_SMOKE_STABLE_APP!;
+      const oldIds = dependencyStepIds(await workflowManifest(baselineDirectory));
+      const newIds = dependencyStepIds(await workflowManifest(currentDirectory));
+      expect(Array.from(oldIds.keys()).toSorted()).toEqual(Array.from(newIds.keys()).toSorted());
+      expect(
+        Array.from(oldIds.keys())
+          .filter((name) => oldIds.get(name) !== newIds.get(name))
+          .toSorted(),
+      ).toEqual(
+        [
+          'Run#cancel',
+          'Run#completedAt',
+          'Run#createdAt',
+          'Run#exists',
+          'Run#getReadable',
+          'Run#getWritable',
+          'Run#returnValue',
+          'Run#startedAt',
+          'Run#status',
+          'Run#wakeUp',
+          'Run#workflowName',
+          'fetch',
+          'start',
+        ].toSorted(),
+      );
+      const appPort = await freePort();
+      const appUrl = `http://127.0.0.1:${appPort}`;
+      const appEnv = {
+        ...process.env,
+        WORKFLOW_TARGET_WORLD: '@ewhauser/world-celld',
+        CELLD_FLEET_URL: runtime!.url,
+        CELLD_WORLD_SECRET: SECRET,
+        WORKFLOW_BASE_URL: appUrl,
+        PORT: String(appPort),
+        NODE_ENV: 'production',
+      };
+      let app: ManagedProcess | undefined;
+      let stage = 'prepare';
+      const startApp = async (directory: string, name: string) => {
+        const managed = startManaged(
+          name,
+          process.execPath,
+          [join(directory, '.output/server/index.mjs')],
+          appEnv,
+          directory,
+        );
+        await waitFor(
+          async () => {
+            if (managed.child.exitCode !== null || managed.child.signalCode !== null) {
+              throw new Error(`${name} exited during startup\n${managed.logs()}`);
+            }
+            const response = await fetch(appUrl, { signal: AbortSignal.timeout(1_000) });
+            return response.ok ? true : null;
+          },
+          20_000,
+          `${name} readiness`,
+        );
+        return managed;
+      };
+
+      try {
+        stage = 'create observed run';
+        const observed = await world({ deploymentId: 'upgrade-observed' }).events.create(null, {
+          eventType: 'run_created',
+          eventData: {
+            deploymentId: 'upgrade-observed',
+            workflowName: 'upgrade-observed',
+            input: [],
+          },
+        });
+        stage = 'start beta app';
+        app = await startApp(baselineDirectory, 'beta demo');
+        stage = 'start beta order';
+        const startResponse = await fetch(`${appUrl}/orders/${observed.run.runId}`, {
+          method: 'POST',
+        });
+        if (!startResponse.ok) {
+          throw new Error(
+            `beta start failed ${startResponse.status}: ${await startResponse.text()}\n${app.logs()}`,
+          );
+        }
+        const { runId } = (await startResponse.json()) as { runId: string };
+        stage = 'read beta stream';
+        let streamResponse: Response;
+        try {
+          streamResponse = await fetch(`${appUrl}/runs/${runId}/stream`, {
+            signal: AbortSignal.timeout(10_000),
+          });
+        } catch (error) {
+          const status = await fetch(`${appUrl}/runs/${runId}`).then((response) => response.text());
+          const events = await world({ deploymentId: 'upgrade-observed' }).events.list({
+            runId,
+            pagination: { sortOrder: 'asc' },
+          });
+          throw new Error(
+            `beta stream failed to open: ${String(error)}\nstatus=${status}\nevents=${events.data.map((event) => event.eventType).join(',')}\n${app.logs()}`,
+            { cause: error },
+          );
+        }
+        if (!streamResponse.ok) {
+          throw new Error(
+            `beta stream failed ${streamResponse.status}: ${await streamResponse.text()}\n${app.logs()}`,
+          );
+        }
+        const reader = streamResponse.body!.getReader();
+        const decoder = new TextDecoder();
+        let output = '';
+        let token: string | undefined;
+        try {
+          while (!token) {
+            const chunk = await Promise.race([
+              reader.read(),
+              delay(12_000).then(() => {
+                throw new Error('timed out waiting for beta hook stream output');
+              }),
+            ]);
+            if (chunk.done) throw new Error(`beta workflow stream ended before hook: ${output}`);
+            output += decoder.decode(chunk.value, { stream: true });
+            token = output.match(/POST \/approvals\/(\S+)/)?.[1];
+          }
+        } catch (error) {
+          const [status, events] = await Promise.allSettled([
+            fetch(`${appUrl}/runs/${runId}`, { signal: AbortSignal.timeout(2_000) }).then(
+              (response) => response.text(),
+            ),
+            world({ deploymentId: 'upgrade-observed' }).events.list({
+              runId,
+              pagination: { sortOrder: 'asc' },
+            }),
+          ]);
+          throw new Error(
+            `beta workflow did not reach hook: ${String(error)}\nstatus=${status.status === 'fulfilled' ? status.value : String(status.reason)}\noutput=${output}\nevents=${events.status === 'fulfilled' ? events.value.data.map((event) => event.eventType).join(',') : String(events.reason)}\n${app.logs()}`,
+            { cause: error },
+          );
+        }
+        expect(output).toContain('before-hook: dependency steps replayed');
+        await waitForDurableHookPause('upgrade-observed', runId);
+        const oldEvents = await world({ deploymentId: 'upgrade-observed' }).events.list({
+          runId,
+          pagination: { sortOrder: 'asc' },
+        });
+        expect(
+          oldEvents.data.some(
+            (event) =>
+              event.eventType === 'step_created' &&
+              event.eventData.stepName === 'step//./workflows/order//probeDependencySteps',
+          ),
+        ).toBe(true);
+        await reader.cancel();
+        stage = 'restart celld';
+        await stopManaged(app);
+        app = undefined;
+
+        const restarted = await runtime!.restart(250, true);
+        expect(restarted.newPid).not.toBe(restarted.oldPid);
+        app = await startApp(currentDirectory, 'stable demo');
+        stage = 'approve on stable app';
+        const approveResponse = await fetch(`${appUrl}/approvals/${token}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ approved: true, comment: 'resume after upgrade' }),
+        });
+        if (!approveResponse.ok) {
+          throw new Error(
+            `stable approval failed ${approveResponse.status}: ${await approveResponse.text()}\n${app.logs()}`,
+          );
+        }
+        stage = 'await stable completion';
+        const final = await waitFor(
+          async () => {
+            const response = await fetch(`${appUrl}/runs/${runId}`);
+            if (!response.ok) throw new Error(`${response.status}: ${await response.text()}`);
+            const status = (await response.json()) as { status: string };
+            return status.status === 'completed' || status.status === 'failed' ? status : null;
+          },
+          30_000,
+          `beta run completion on stable app\n${app.logs()}`,
+        );
+        if (final.status !== 'completed')
+          throw new Error(`beta run ended ${final.status}\n${app.logs()}`);
+        const resumedEvents = await world({ deploymentId: 'upgrade-observed' }).events.list({
+          runId,
+          pagination: { sortOrder: 'asc' },
+        });
+        expect(
+          resumedEvents.data.filter(
+            (event) =>
+              event.eventType === 'step_created' &&
+              event.eventData.stepName === 'step//./workflows/order//probeDependencySteps',
+          ),
+        ).toHaveLength(2);
+        expect(resumedEvents.data.some((event) => event.eventType === 'run_completed')).toBe(true);
+      } catch (error) {
+        throw new Error(`upgrade smoke failed at ${stage}\n${app?.logs() ?? ''}`, { cause: error });
+      } finally {
+        await stopManaged(app);
+      }
+    },
+  );
+
+  it.skipIf(!process.env.CELLD_SMOKE_FETCH_BASELINE_APP)(
+    'keeps a beta fetch run on its compiled app while stable starts new runs after celld restart',
+    async () => {
+      const betaDirectory = process.env.CELLD_SMOKE_FETCH_BASELINE_APP!;
+      const stableDirectory = join(process.cwd(), 'examples/demo-app');
+      const betaFetchId = dependencyStepIds(await workflowManifest(betaDirectory)).get('fetch');
+      expect(betaFetchId).toContain('workflow@5.0.0-beta.58');
+
+      let fetchCount = 0;
+      const probe = http.createServer((_request, response) => {
+        fetchCount++;
+        response.writeHead(200, { 'content-type': 'text/plain' });
+        response.end('probe-ok');
+      });
+      await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+      const probePort = (probe.address() as AddressInfo).port;
+      const betaPort = await freePort();
+      const stablePort = await freePort();
+      let betaRestartPort = await freePort();
+      while (betaRestartPort === betaPort || betaRestartPort === stablePort) {
+        betaRestartPort = await freePort();
+      }
+      const betaUrl = `http://127.0.0.1:${betaPort}`;
+      const stableUrl = `http://127.0.0.1:${stablePort}`;
+      const betaRestartUrl = `http://127.0.0.1:${betaRestartPort}`;
+      let activeBetaUrl = betaUrl;
+      let oldRunId: string | undefined;
+      let newRunId: string | undefined;
+      let betaApp: ManagedProcess | undefined;
+      let stableApp: ManagedProcess | undefined;
+      const workerDirectory = join(temporaryRoot, 'worker');
+      const workerConfigPath = join(workerDirectory, 'wrangler.jsonc');
+      let originalWorkerConfig: string | undefined;
+      const startApp = async (directory: string, name: string, url: string, port: number) => {
+        const managed = startManaged(
+          name,
+          process.execPath,
+          [join(directory, '.output/server/index.mjs')],
+          {
+            ...process.env,
+            WORKFLOW_TARGET_WORLD: '@ewhauser/world-celld',
+            CELLD_FLEET_URL: runtime!.url,
+            CELLD_WORLD_SECRET: SECRET,
+            CELLD_DEPLOYMENT_ID: name === 'beta fetch app' ? 'celld-default' : 'stable-test',
+            WORKFLOW_BASE_URL: url,
+            ...(name === 'stable app'
+              ? {
+                  WORKFLOW_DEPLOYMENT_URLS: JSON.stringify({
+                    'celld-default': betaRestartUrl,
+                    'stable-test': stableUrl,
+                  }),
+                }
+              : {}),
+            PORT: String(port),
+            NODE_ENV: 'production',
+          },
+          directory,
+        );
+        await waitFor(
+          async () => {
+            if (managed.child.exitCode !== null || managed.child.signalCode !== null) {
+              throw new Error(`${name} exited during startup\n${managed.logs()}`);
+            }
+            const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
+            return response.ok ? true : null;
+          },
+          20_000,
+          `${name} readiness`,
+        );
+        return managed;
+      };
+      const approvalToken = async (url: string, runId: string) => {
+        const response = await fetch(`${url}/runs/${runId}/stream`, {
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!response.ok || !response.body) throw new Error(`stream failed ${response.status}`);
+        const reader = response.body.getReader();
+        let output = '';
+        try {
+          while (true) {
+            const chunk = await Promise.race([
+              reader.read(),
+              delay(12_000).then(() => {
+                throw new Error(`approval token not streamed: ${output}`);
+              }),
+            ]);
+            if (chunk.done) throw new Error(`stream ended before approval token: ${output}`);
+            output += new TextDecoder().decode(chunk.value);
+            const token = output.match(/POST \/approvals\/(\S+)/)?.[1];
+            if (token) return token;
+          }
+        } finally {
+          await reader.cancel();
+        }
+      };
+      const completed = async (url: string, runId: string) =>
+        waitFor(
+          async () => {
+            const response = await fetch(`${url}/runs/${runId}`);
+            if (!response.ok) throw new Error(`run status failed ${response.status}`);
+            const data = (await response.json()) as { status: string };
+            if (data.status === 'failed') throw new Error(`run ${runId} failed`);
+            return data.status === 'completed' ? true : null;
+          },
+          30_000,
+          `run ${runId} completion`,
+        );
+
+      try {
+        betaApp = await startApp(betaDirectory, 'beta fetch app', betaUrl, betaPort);
+        const oldRun = await startSmokeOrder(betaUrl, `127.0.0.1:${probePort}`);
+        oldRunId = oldRun.runId;
+        const oldToken = await approvalToken(betaUrl, oldRun.runId);
+        await waitForDurableHookPause('celld-default', oldRun.runId);
+        expect(fetchCount).toBe(1);
+        await stopManaged(betaApp);
+        betaApp = undefined;
+        await runtime!.restart(250, true);
+        originalWorkerConfig = await readFile(workerConfigPath, 'utf8');
+        const emptyMap = '"WORKFLOW_DEPLOYMENT_URLS": ""';
+        if (!originalWorkerConfig.includes(emptyMap))
+          throw new Error('worker route setting changed');
+        const routeMap = JSON.stringify({
+          'celld-default': betaRestartUrl,
+          'stable-test': stableUrl,
+        });
+        await writeFile(
+          workerConfigPath,
+          originalWorkerConfig.replace(
+            emptyMap,
+            `"WORKFLOW_DEPLOYMENT_URLS": ${JSON.stringify(routeMap)}`,
+          ),
+        );
+        await runtime!.deployPrimary(workerDirectory);
+        betaApp = await startApp(betaDirectory, 'beta fetch app', betaRestartUrl, betaRestartPort);
+        activeBetaUrl = betaRestartUrl;
+        stableApp = await startApp(stableDirectory, 'stable app', stableUrl, stablePort);
+
+        const newRun = await startSmokeOrder(stableUrl, 'stable-concurrent');
+        newRunId = newRun.runId;
+        const newToken = await approvalToken(stableUrl, newRun.runId);
+        await approveSmokeHook(stableUrl, oldToken);
+        await approveSmokeHook(stableUrl, newToken);
+        await Promise.all([
+          completed(betaRestartUrl, oldRun.runId),
+          completed(stableUrl, newRun.runId),
+        ]);
+        expect(fetchCount).toBe(1);
+        const oldEvents = await world({ deploymentId: 'celld-default' }).events.list({
+          runId: oldRun.runId,
+          pagination: { sortOrder: 'asc' },
+        });
+        expect(
+          oldEvents.data.filter(
+            (event) =>
+              event.eventType === 'step_created' && event.eventData.stepName === betaFetchId,
+          ),
+        ).toHaveLength(1);
+      } catch (error) {
+        const oldEvents = oldRunId
+          ? await world({ deploymentId: 'celld-default' })
+              .events.list({ runId: oldRunId, pagination: { sortOrder: 'asc' } })
+              .then(({ data }) => data.map((event) => event.eventType).join(','))
+              .catch((cause) => String(cause))
+          : 'not started';
+        throw new Error(
+          `coexistence smoke failed\nurls: beta=${betaUrl} restarted=${betaRestartUrl} stable=${stableUrl}\nold ${oldRunId}: ${await smokeRunStatus(activeBetaUrl, oldRunId)}\nold events: ${oldEvents}\nnew ${newRunId}: ${await smokeRunStatus(stableUrl, newRunId)}\nbeta:\n${betaApp?.logs() ?? ''}\nstable:\n${stableApp?.logs() ?? ''}`,
+          { cause: error },
+        );
+      } finally {
+        await stopManaged(betaApp);
+        await stopManaged(stableApp);
+        if (originalWorkerConfig !== undefined) {
+          await writeFile(workerConfigPath, originalWorkerConfig);
+          await runtime!.deployPrimary(workerDirectory);
+        }
+        await new Promise<void>((resolve, reject) =>
+          probe.close((error) => (error ? reject(error) : resolve())),
+        );
+      }
+    },
+  );
 
   it.each([
     ['wrong-secret', { version: 1 }, 1, 'Unauthorized'],
