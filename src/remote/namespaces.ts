@@ -32,6 +32,7 @@ interface MethodSpec {
 const RUNS: MethodSpec = {
   methods: [
     'applyEvent',
+    'applyEventBatch',
     'getLifecycleStatus',
     'getRun',
     'getStep',
@@ -48,6 +49,7 @@ const RUNS: MethodSpec = {
   ],
   mutating: new Set([
     'applyEvent',
+    'applyEventBatch',
     'scheduleCleanup',
     'cleanupNow',
     'rearmCleanup',
