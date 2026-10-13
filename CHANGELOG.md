@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.1 (2026-10-13)
+
+## What's Changed
+* chore: qualify stable Workflow 5 packages for world-celld by @ewhauser in https://github.com/ewhauser/world-celld/pull/93
+* fix: repair hook index records stranded by an interrupted creation by @ewhauser in https://github.com/ewhauser/world-celld/pull/96
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.9.0...v0.9.1
+
 ## 0.9.0 (2026-10-06)
 
 ## What's Changed
