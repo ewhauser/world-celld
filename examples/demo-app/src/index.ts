@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { getHookByToken, getRun, resumeHook, start } from 'workflow/api';
 import { processOrder } from '../workflows/order.js';
+import { fanout } from '../workflows/fanout.js';
 
 const app = new Hono()
   .get('/', (c) =>
@@ -17,6 +18,16 @@ const app = new Hono()
   .post('/orders/:orderId', async (c) => {
     const run = await start(processOrder, [c.req.param('orderId')]);
     return c.json({ runId: run.runId });
+  })
+  .post('/bench/fanout/:width', async (c) => {
+    const width = Number(c.req.param('width'));
+    if (![8, 64, 128].includes(width)) return c.json({ error: 'unsupported width' }, 400);
+    const run = await start(fanout, [width]);
+    return c.json({ runId: run.runId });
+  })
+  .get('/bench/result/:runId', async (c) => {
+    const result = await getRun(c.req.param('runId')).returnValue;
+    return c.json(result);
   })
   .get('/runs/:runId', async (c) => {
     const run = getRun(c.req.param('runId'));

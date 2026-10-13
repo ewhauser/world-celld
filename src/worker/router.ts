@@ -12,7 +12,11 @@
  * compact binary stream protocol. Only whitelisted routes/methods dispatch.
  */
 import { SPEC_VERSION_CURRENT, type WorkflowRun } from '@workflow/world';
-import { type ApplyEventSuccess, parseApplyEventRequest } from '../apply-event.js';
+import {
+  type ApplyEventSuccess,
+  parseApplyEventRequest,
+  parseApplyEventBatchRequest,
+} from '../apply-event.js';
 import { rpcParse, rpcStringify } from '../codec.js';
 import type { RunReadOutcome } from '../retention.js';
 import { listRunsPage } from '../run-list.js';
@@ -218,6 +222,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
     env: 'WORKFLOW_DB',
     methods: new Set([
       'applyEvent',
+      'applyEventBatch',
       'getLifecycleStatus',
       'getRun',
       'getStep',
@@ -876,12 +881,15 @@ export function createRouter(env: WorkerEnv) {
       return errorResponse(400, 'BadRequest', 'malformed rpc body');
     }
 
-    if (bindingKey === 'runs' && method === 'applyEvent') {
+    if (bindingKey === 'runs' && (method === 'applyEvent' || method === 'applyEventBatch')) {
       if (args.length !== 1) {
         return errorResponse(400, 'BadRequest', 'applyEvent expects exactly one request argument');
       }
       try {
-        const applyRequest = parseApplyEventRequest(args[0]);
+        const applyRequest =
+          method === 'applyEvent'
+            ? parseApplyEventRequest(args[0])
+            : parseApplyEventBatchRequest(args[0]);
         if (applyRequest.runId !== name) {
           return errorResponse(
             400,
