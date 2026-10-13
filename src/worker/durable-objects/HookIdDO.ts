@@ -1,12 +1,17 @@
+import type { Hook } from '@workflow/world';
 import type { HookTokenOwner } from '../../config.js';
+import { stringify } from '../../vendor/shared/index.js';
 import { DurableObject } from '../do-base.js';
 import {
+  confirmRepublished,
   indexKey,
   ownerFromSerializedHook,
+  publishCommittedClaim,
   resolveExpiredHookClaim,
   runIsActive,
   sameOwner,
   type HookIndexEnv,
+  warnRepublished,
 } from './hook-index-shared.js';
 import {
   HOOK_CLAIM_LEASE_MS,
@@ -54,7 +59,14 @@ export class HookIdDO extends DurableObject<HookIndexEnv> {
   }
 
   async get(hookId: string): Promise<string | null> {
-    const raw = await this.ctx.storage.get<string>(recordKey(hookId));
+    // A claim with no record can belong to a committed hook whose client
+    // stopped before finalizing; publish it rather than report it missing.
+    const raw =
+      (await this.ctx.storage.get<string>(recordKey(hookId))) ??
+      (await publishCommittedClaim(this.ctx.storage, this.env, {
+        record: recordKey(hookId),
+        claim: claimKey(hookId),
+      }));
     if (!raw) return null;
     const owner = ownerFromSerializedHook(raw);
     return (await runIsActive(this.env, owner.runId)) ? raw : null;
@@ -238,15 +250,16 @@ export class HookIdDO extends DurableObject<HookIndexEnv> {
     const observed = await this.ctx.storage.get<HookClaim>(
       page.map(([, item]) => claimKey(item.hookId)),
     );
-    const committed = new Map<string, boolean>();
+    const committed = new Map<string, Hook | null>();
     await Promise.all(
       page.map(async ([, item]) => {
         const claim = observed.get(claimKey(item.hookId));
         if (!claim || claim.claimId !== item.claimId || claim.expiresAt > now) return;
         const hook = await resolveExpiredHookClaim(this.env, claim.owner, claim.claimId);
-        committed.set(claimKey(item.hookId), hook !== null);
+        committed.set(claimKey(item.hookId), hook);
       }),
     );
+    const published: Array<{ hookId: string; owner: HookTokenOwner }> = [];
     await this.ctx.storage.transaction(async (txn) => {
       const claims = await txn.get<HookClaim>(page.map(([, item]) => claimKey(item.hookId)));
       const deletes: string[] = [];
@@ -257,8 +270,14 @@ export class HookIdDO extends DurableObject<HookIndexEnv> {
         if (claim?.claimId !== item.claimId || claim.expiresAt > now) {
           deletes.push(deadline);
         } else if (claim.claimId === snapshot?.claimId && claim.expiresAt === snapshot.expiresAt) {
-          if (committed.get(key)) await this.renewClaim(txn, item.hookId, claim, now);
-          else deletes.push(deadline, key);
+          const hook = committed.get(key);
+          if (hook) {
+            // The hook committed but its client never finalized: publish its
+            // record instead of renewing the claim for the life of the run.
+            await txn.put(recordKey(item.hookId), stringify(hook));
+            published.push({ hookId: item.hookId, owner: claim.owner });
+          }
+          deletes.push(deadline, key);
         }
       }
       for (let offset = 0; offset < deletes.length; offset += LIFECYCLE_COMPACTION_BATCH) {
@@ -273,5 +292,9 @@ export class HookIdDO extends DurableObject<HookIndexEnv> {
       if (nextAt === undefined) await txn.deleteAlarm();
       else await txn.setAlarm(Math.max(now + 1, nextAt));
     });
+    for (const { hookId, owner } of published) {
+      warnRepublished(owner);
+      await confirmRepublished(this.ctx.storage, this.env, recordKey(hookId), owner);
+    }
   }
 }

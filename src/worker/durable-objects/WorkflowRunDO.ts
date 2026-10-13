@@ -449,6 +449,30 @@ export class WorkflowRunDO extends DurableObject {
     });
   }
 
+  /**
+   * Read-only twin of resolveExpiredHookClaim for index repair: the committed
+   * hook of a live run, or null. It fences nothing, so a shard may ask while
+   * the hook's creation is still in flight.
+   */
+  async getCommittedHook(request: { hookId: string; token?: string }): Promise<Hook | null> {
+    if (
+      typeof request?.hookId !== 'string' ||
+      request.hookId.length === 0 ||
+      (request.token !== undefined && typeof request.token !== 'string')
+    ) {
+      throw new TypeError('world-celld committed hook lookup is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const { tombstone } = await this.retentionState(txn);
+      if (tombstone) return null;
+      const run = await txn.get<WorkflowRun>('run');
+      if (!run || isTerminalWorkflowRunStatus(run.status)) return null;
+      const hook = await txn.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
+      if (!hook || (request.token !== undefined && hook.token !== request.token)) return null;
+      return hook;
+    });
+  }
+
   /** Single authoritative lifecycle answer used after derivative compaction. */
   async getLifecycleStatus(): Promise<RunLifecycleStatus> {
     return await this.ctx.storage.transaction(async (txn) => {
