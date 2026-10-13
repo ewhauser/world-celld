@@ -1448,11 +1448,8 @@ describe('full stack: vendored storage over the wire', () => {
     await expect(storage.events.create(runId, request)).rejects.toThrow(
       /injected hook id publication failure/,
     );
-    await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId, hookId });
-    await expect(storage.hooks.get(hookId)).rejects.toSatisfy((error) =>
-      HookNotFoundError.is(error),
-    );
-
+    // No lookup runs in between: a lookup would itself publish the missing
+    // record, and this test covers the replay path.
     await expect(storage.events.create(runId, request)).resolves.toMatchObject({
       hook: { runId, hookId, token },
     });
@@ -1521,11 +1518,7 @@ describe('full stack: vendored storage over the wire', () => {
       eventData: { token },
     });
     expect(contender.event?.eventType).toBe('hook_conflict');
-    await expect(normalStorage.hooks.getByToken(token)).rejects.toSatisfy((error) =>
-      HookNotFoundError.is(error),
-    );
-
-    await normalStorage.events.create(ownerRunId, ownerRequest);
+    // The owner never replays: the lookup publishes its committed hook.
     await expect(normalStorage.hooks.getByToken(token)).resolves.toMatchObject({
       runId: ownerRunId,
       hookId: ownerHookId,

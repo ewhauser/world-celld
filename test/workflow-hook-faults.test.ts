@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createWorkflowIndex, hookIdShardName, hookTokenShardName } from '../src/indexes.js';
 import { HOOK_CLAIM_LEASE_MS, LIFECYCLE_COMPACTION_RETRY_MS } from '../src/lifecycle.js';
 import { createStorage } from '../src/storage.js';
+import { stringify } from '../src/vendor/shared/index.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 import { HookIdDO } from '../src/worker/durable-objects/HookIdDO.js';
 import { HookTokenDO } from '../src/worker/durable-objects/HookTokenDO.js';
@@ -110,45 +111,195 @@ describe('workflow hook publication fault recovery', () => {
     },
   );
 
-  it('renews committed unpublished claims through repeated alarm compaction and restart', async () => {
+  async function commitWithoutIndexes() {
     const owner = { runId, hookId };
     const admission = await indexes.reserveHook(token, owner);
     if (!admission.admitted) throw new Error('expected original reservation');
     const run = fleet.cell('runs', runId).instance as WorkflowRunDO;
+    // The client stops after hook_created commits and before either index write.
     await run.applyEvent({
       runId,
       data: request,
       tokenHolder: null,
       hookClaimId: admission.reservation.claimId,
     });
-    for (let iteration = 0; iteration < 3; iteration++) {
-      fleet.advance(HOOK_CLAIM_LEASE_MS);
-      fleet.restartCell('hook-tokens', hookTokenShardName(token));
-      fleet.restartCell('hook-ids', hookIdShardName(hookId));
-      await fleet.fireDueAlarms();
-      expect(
-        fleet.cell('hook-tokens', hookTokenShardName(token)).storage.data.get(`claim:${token}`),
-      ).toMatchObject({
-        owner,
-        claimId: admission.reservation.tokenClaimId,
-        expiresAt: fleet.now + HOOK_CLAIM_LEASE_MS,
-      });
-      expect(
-        fleet.cell('hook-ids', hookIdShardName(hookId)).storage.data.get(`claim:${hookId}`),
-      ).toMatchObject({
-        owner,
-        claimId: admission.reservation.hookIdClaimId,
-        expiresAt: fleet.now + HOOK_CLAIM_LEASE_MS,
-      });
+    return { owner, admission, run };
+  }
+
+  function shardKeys(domain: 'token' | 'id'): string[] {
+    const cell =
+      domain === 'token'
+        ? fleet.cell('hook-tokens', hookTokenShardName(token))
+        : fleet.cell('hook-ids', hookIdShardName(hookId));
+    return [...cell.storage.data.keys()];
+  }
+
+  it('publishes committed unpublished claims during alarm compaction instead of renewing them', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { owner } = await commitWithoutIndexes();
+    fleet.advance(HOOK_CLAIM_LEASE_MS);
+    fleet.restartCell('hook-tokens', hookTokenShardName(token));
+    fleet.restartCell('hook-ids', hookIdShardName(hookId));
+    await fleet.fireDueAlarms();
+    for (const domain of ['token', 'id'] as const) {
+      const keys = shardKeys(domain);
+      expect(keys.filter((key) => key.startsWith('claim'))).toEqual([]);
+      expect(keys).toContain(domain === 'token' ? `hook:${token}` : `hookid:${hookId}`);
     }
+    expect(fleet.cell('hook-tokens', hookTokenShardName(token)).storage.alarmAt).toBeNull();
+    expect(fleet.cell('hook-ids', hookIdShardName(hookId)).storage.alarmAt).toBeNull();
     const competitor = await createCompetitor();
     expect(
       await indexes.reserveHook(token, { runId: competitor, hookId: 'competitor-hook' }),
     ).toMatchObject({ admitted: false, holder: owner });
-    await expect(storage.events.create(runId, request)).resolves.toMatchObject({
-      hook: { runId, hookId, token },
-    });
+    await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId, hookId });
+    await expect(storage.hooks.get(hookId)).resolves.toMatchObject({ runId, token });
+    expect(warn).toHaveBeenCalled();
+    for (const [message] of warn.mock.calls) {
+      expect(String(message)).toContain(runId);
+      expect(String(message)).toContain(hookId);
+      expect(String(message)).not.toContain(token);
+    }
   });
+
+  it.each(['live', 'expired'] as const)(
+    'serves a committed hook whose index writes were lost behind a %s claim',
+    async (lease) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      await commitWithoutIndexes();
+      if (lease === 'expired') fleet.advance(HOOK_CLAIM_LEASE_MS);
+      await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({
+        runId,
+        hookId,
+        token,
+      });
+      await expect(storage.hooks.get(hookId)).resolves.toMatchObject({ runId, hookId, token });
+      for (const domain of ['token', 'id'] as const) {
+        expect(shardKeys(domain).filter((key) => key.startsWith('claim'))).toEqual([]);
+      }
+      expect(warn).toHaveBeenCalledTimes(2);
+      for (const [message] of warn.mock.calls) {
+        expect(String(message)).not.toContain(token);
+      }
+    },
+  );
+
+  it('resumes a stranded hook by token after a competing creation conflicts', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    await commitWithoutIndexes();
+    const competitor = await createCompetitor();
+    const conflict = await storage.events.create(competitor, {
+      eventType: 'hook_created',
+      correlationId: 'competitor-hook',
+      eventData: { token },
+    });
+    expect(conflict.event).toMatchObject({
+      eventType: 'hook_conflict',
+      eventData: { conflictingRunId: runId },
+    });
+    const hook = await storage.hooks.getByToken(token);
+    expect(hook).toMatchObject({ runId, hookId });
+    await expect(
+      storage.events.create(runId, {
+        eventType: 'hook_received',
+        correlationId: hook.hookId,
+        eventData: { payload: 'resumed' },
+      }),
+    ).resolves.toMatchObject({ event: { eventType: 'hook_received' } });
+  });
+
+  it('does not fence a creation that is still in flight when a lookup sees its claim', async () => {
+    const owner = { runId, hookId };
+    const admission = await indexes.reserveHook(token, owner);
+    if (!admission.admitted) throw new Error('expected original reservation');
+    await expect(storage.hooks.getByToken(token)).rejects.toSatisfy((error) =>
+      HookNotFoundError.is(error),
+    );
+    await expect(storage.hooks.get(hookId)).rejects.toSatisfy((error) =>
+      HookNotFoundError.is(error),
+    );
+    const run = fleet.cell('runs', runId).instance as WorkflowRunDO;
+    const outcome = await run.applyEvent({
+      runId,
+      data: request,
+      tokenHolder: null,
+      hookClaimId: admission.reservation.claimId,
+    });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok || !outcome.hookToIndex) throw new Error('expected hook to index');
+    await indexes.finalizeHookIndexes(
+      token,
+      hookId,
+      stringify(outcome.hookToIndex),
+      owner,
+      admission.reservation,
+    );
+    await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId, hookId });
+  });
+
+  it.each(['terminal', 'disposed'] as const)(
+    'does not publish a stranded claim whose owner hook is %s',
+    async (lifecycle) => {
+      const { run } = await commitWithoutIndexes();
+      const finish =
+        lifecycle === 'terminal'
+          ? { eventType: 'run_completed' as const, eventData: { output: [] } }
+          : { eventType: 'hook_disposed' as const, correlationId: hookId };
+      await run.applyEvent({ runId, data: finish });
+      await expect(storage.hooks.getByToken(token)).rejects.toSatisfy((error) =>
+        HookNotFoundError.is(error),
+      );
+      await expect(storage.hooks.get(hookId)).rejects.toSatisfy((error) =>
+        HookNotFoundError.is(error),
+      );
+      expect(shardKeys('token')).not.toContain(`hook:${token}`);
+      expect(shardKeys('id')).not.toContain(`hookid:${hookId}`);
+    },
+  );
+
+  it.each(['lookup', 'compaction'] as const)(
+    'withdraws a %s repair when the owner hook is disposed while it is written',
+    async (path) => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { run } = await commitWithoutIndexes();
+      // The disposal commits after the shard observed the hook, and its own
+      // index release is lost, so only the repair's recheck can undo it.
+      const dispose = () =>
+        run.applyEvent({
+          runId,
+          data: { eventType: 'hook_disposed' as const, correlationId: hookId },
+        });
+      let lookup: Promise<unknown> | undefined;
+      if (path === 'lookup') {
+        const original = run.getCommittedHook.bind(run);
+        vi.spyOn(run, 'getCommittedHook').mockImplementationOnce(async (query) => {
+          const hook = await original(query);
+          await dispose();
+          return hook;
+        });
+        lookup = storage.hooks.getByToken(token);
+        await lookup.catch(() => {});
+      } else {
+        const original = run.resolveExpiredHookClaim.bind(run);
+        let disposed = false;
+        vi.spyOn(run, 'resolveExpiredHookClaim').mockImplementation(async (resolution) => {
+          const hook = await original(resolution);
+          if (!disposed) {
+            disposed = true;
+            await dispose();
+          }
+          return hook;
+        });
+        fleet.advance(HOOK_CLAIM_LEASE_MS);
+        await fleet.fireDueAlarms();
+      }
+      expect(shardKeys('token')).not.toContain(`hook:${token}`);
+      await expect(lookup ?? storage.hooks.getByToken(token)).rejects.toSatisfy((error) =>
+        HookNotFoundError.is(error),
+      );
+      expect(warn.mock.calls.some(([message]) => /withdr/i.test(String(message)))).toBe(true);
+    },
+  );
 
   it.each(['paired', 'id-only'] as const)(
     'fences a delayed authoritative creation before reclaiming an expired %s reservation',
@@ -281,15 +432,8 @@ describe('workflow hook publication fault recovery', () => {
         'run_created',
         'hook_created',
       ]);
-      await expect(storage.hooks.get(hookId)).rejects.toSatisfy((error) =>
-        HookNotFoundError.is(error),
-      );
-      const indexedToken = await storage.hooks.getByToken(token).catch((error) => {
-        if (!HookNotFoundError.is(error)) throw error;
-        return null;
-      });
-      expect(indexedToken?.runId).toBe(domain === 'token' ? undefined : runId);
-      expect(indexedToken?.hookId).toBe(domain === 'token' ? undefined : hookId);
+      // No lookup runs in between: a lookup would itself publish the missing
+      // record, and this test covers the replay path.
 
       fleet.restartCell('runs', runId);
       fleet.restartCell('hook-tokens', tokenName);
