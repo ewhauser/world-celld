@@ -602,10 +602,14 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     );
   }
 
-  it.skipIf(!process.env.CELLD_SMOKE_BASELINE_APP)(
-    'resumes an in-flight beta-compiled workflow on the stable app after celld restart',
-    async () => {
-      const baselineDirectory = process.env.CELLD_SMOKE_BASELINE_APP!;
+  it
+    .skipIf(!process.env.CELLD_SMOKE_BASELINE_APP || !process.env.CELLD_SMOKE_PREVIOUS_STABLE_APP)
+    .each([
+      ['beta-compiled', process.env.CELLD_SMOKE_BASELINE_APP!],
+      ['5.0.1-compiled', process.env.CELLD_SMOKE_PREVIOUS_STABLE_APP!],
+    ])(
+    'resumes an in-flight %s workflow on the upgraded app after celld restart',
+    async (_name, baselineDirectory) => {
       const currentDirectory = process.env.CELLD_SMOKE_STABLE_APP!;
       const oldIds = dependencyStepIds(await workflowManifest(baselineDirectory));
       const newIds = dependencyStepIds(await workflowManifest(currentDirectory));

@@ -93,23 +93,31 @@ pnpm --dir examples/demo-app build
 # runtimes. The shipped demo source is left untouched. Pin the older release
 # commit rather than relying on a moving branch or tag.
 baseline_app=${CELLD_SMOKE_BASELINE_APP:-}
+previous_stable_app=${CELLD_SMOKE_PREVIOUS_STABLE_APP:-}
 stable_app=${CELLD_SMOKE_STABLE_APP:-}
 fetch_baseline_app=${CELLD_SMOKE_FETCH_BASELINE_APP:-}
-if [[ -z "$baseline_app" || -z "$stable_app" || -z "$fetch_baseline_app" ]]; then
+if [[ -z "$baseline_app" || -z "$previous_stable_app" || -z "$stable_app" || -z "$fetch_baseline_app" ]]; then
   baseline_ref=0aacc8bc25ceef44249eb2491baf54b96f136e73
+  previous_stable_ref=b41abf26e774e6980500c02c1030cda89067aee6
   if ! git cat-file -e "$baseline_ref^{commit}" 2>/dev/null; then
     git fetch --depth=1 origin "$baseline_ref"
   fi
+  if ! git cat-file -e "$previous_stable_ref^{commit}" 2>/dev/null; then
+    git fetch --depth=1 origin "$previous_stable_ref"
+  fi
   baseline_root="$runtime_root/baseline"
+  previous_stable_root="$runtime_root/previous-stable"
   stable_root="$runtime_root/stable"
   fetch_root="$runtime_root/baseline-fetch"
   mkdir -p "$baseline_root"
+  mkdir -p "$previous_stable_root"
   mkdir -p "$stable_root"
   mkdir -p "$fetch_root"
   git archive "$baseline_ref" | tar -x -C "$baseline_root"
+  git archive "$previous_stable_ref" | tar -x -C "$previous_stable_root"
   git archive HEAD | tar -x -C "$stable_root"
   git archive "$baseline_ref" | tar -x -C "$fetch_root"
-  for fixture_root in "$baseline_root" "$stable_root"; do
+  for fixture_root in "$baseline_root" "$previous_stable_root" "$stable_root"; do
     cp test/fixtures/upgrade-order.ts "$fixture_root/examples/demo-app/workflows/order.ts"
     (
       cd "$fixture_root"
@@ -126,6 +134,7 @@ if [[ -z "$baseline_app" || -z "$stable_app" || -z "$fetch_baseline_app" ]]; the
     pnpm --dir examples/demo-app build
   )
   baseline_app="$baseline_root/examples/demo-app"
+  previous_stable_app="$previous_stable_root/examples/demo-app"
   stable_app="$stable_root/examples/demo-app"
   fetch_baseline_app="$fetch_root/examples/demo-app"
 fi
@@ -135,6 +144,7 @@ CELLD_SMOKE_MINIO_BIN="$minio_binary" \
 CELLD_SMOKE_MC_BIN="$mc_binary" \
 CELLD_SMOKE_TEMP_ROOT="$runtime_root/harness" \
 CELLD_SMOKE_BASELINE_APP="$baseline_app" \
+CELLD_SMOKE_PREVIOUS_STABLE_APP="$previous_stable_app" \
 CELLD_SMOKE_STABLE_APP="$stable_app" \
 CELLD_SMOKE_FETCH_BASELINE_APP="$fetch_baseline_app" \
   pnpm vitest run --config vitest.celld-smoke.config.ts "$@"
