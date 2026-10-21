@@ -7,7 +7,7 @@
  * deliveries on real time. Publications remain available in `queueMessages`
  * for local inspection.
  */
-export { FakeFleet, FakeStorage } from './fake-cell.js';
+export { type CellClass, FakeFleet, type FakeCellStub, FakeStorage } from './fake-cell.js';
 export { startHarness, type Harness, type HarnessOptions } from './http-harness.js';
 
 import { startHarness, type Harness, type HarnessOptions } from './http-harness.js';

@@ -392,15 +392,21 @@ class FakeTransaction {
   }
 }
 
-type CellClass = new (
-  ctx: unknown,
-  env: unknown,
-) => {
+/**
+ * A cell class the fleet can host. The fleet passes a partial fake
+ * `DurableObjectState` and its shared cell env, so any env type is accepted.
+ */
+export type CellClass = new (ctx: DurableObjectState, env: never) => object;
+
+interface CellInstance {
   alarm?(info?: { retryCount?: number }): Promise<void>;
-};
+}
+
+/** Stub type returned by a binding when the caller does not name one. */
+export type FakeCellStub = CellInstance;
 
 interface CellSlot {
-  instance: InstanceType<CellClass>;
+  instance: CellInstance;
   storage: FakeStorage;
   pendingWaits: Promise<unknown>[];
   alarmRetryCount: number;
@@ -428,12 +434,14 @@ export class FakeFleet {
     this.now = startTime;
   }
 
-  namespace(bindingKey: string) {
+  /** Binding for `bindingKey`; `TStub` names the cell's RPC surface. */
+  namespace<TStub = FakeCellStub>(bindingKey: string) {
     return {
       idFromName(name: string) {
         return { toString: () => name };
       },
-      get: (id: { toString(): string }) => this.cell(bindingKey, id.toString()).instance,
+      get: (id: { toString(): string }) =>
+        this.cell(bindingKey, id.toString()).instance as unknown as TStub,
     };
   }
 
@@ -442,7 +450,7 @@ export class FakeFleet {
     name: string,
     storage: FakeStorage,
     pendingWaits: Promise<unknown>[],
-  ): InstanceType<CellClass> {
+  ): CellInstance {
     const CellCtor = this.classes[bindingKey];
     if (!CellCtor) throw new Error(`no cell class registered for binding: ${bindingKey}`);
     const ctx = {
@@ -455,7 +463,8 @@ export class FakeFleet {
         return cb();
       },
     };
-    return new CellCtor(ctx, this.cellEnv);
+    // The fake implements only the DurableObjectState members cells use.
+    return new CellCtor(ctx as unknown as DurableObjectState, this.cellEnv as never);
   }
 
   /** Whether a cell has been activated, without activating it. */
@@ -482,7 +491,7 @@ export class FakeFleet {
   }
 
   /** Recreate one in-memory DO instance while preserving its durable storage. */
-  restartCell(bindingKey: string, name: string): InstanceType<CellClass> {
+  restartCell(bindingKey: string, name: string): CellInstance {
     const slot = this.cell(bindingKey, name);
     slot.instance = this.instantiate(bindingKey, name, slot.storage, slot.pendingWaits);
     return slot.instance;

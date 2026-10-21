@@ -29,8 +29,8 @@ describe('workflow hook publication fault recovery', () => {
       {
         runs: WorkflowRunDO,
         'run-catalog': RunCatalogDO,
-        'hook-tokens': HookTokenDO as never,
-        'hook-ids': HookIdDO as never,
+        'hook-tokens': HookTokenDO,
+        'hook-ids': HookIdDO,
       },
       env,
     );

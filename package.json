@@ -72,7 +72,7 @@
     "test:perf:minio": "bash test/perf/minio/run.sh",
     "test:perf:minio:matrix": "node scripts/run-perf-matrix.mjs",
     "test:perf:minio:failover": "bash test/perf/minio/run-multi.sh",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "check:worker-bundle": "node scripts/check-worker-bundle.mjs",
     "pack:check": "node scripts/check-package.mjs",
     "pack:release": "node scripts/pack-release.mjs",

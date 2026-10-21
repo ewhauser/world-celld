@@ -199,8 +199,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
 
         const updated = result.run!;
         expect(updated.status).toBe('failed');
-        expect(updated.error?.message).toBe('Something went wrong');
-        expect(updated.error?.code).toBe('ERR_001');
+        expect(updated.error).toMatchObject({ message: 'Something went wrong', code: 'ERR_001' });
         expect(updated.completedAt).toBeInstanceOf(Date);
       });
     });
@@ -857,8 +856,10 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
       });
 
       expect(result.run?.status).toBe('failed');
-      expect(result.run?.error?.message).toBe('plain string failure');
-      expect(result.run?.error?.code).toBe('MAX_DELIVERIES_EXCEEDED');
+      expect(result.run?.error).toMatchObject({
+        message: 'plain string failure',
+        code: 'MAX_DELIVERIES_EXCEEDED',
+      });
     });
 
     it('should preserve string errors on step_failed', async () => {
@@ -879,8 +880,10 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
         eventData: { error: { message: 'string step failure', stack: 'at somewhere' } },
       });
 
-      expect(result.step?.error?.message).toBe('string step failure');
-      expect(result.step?.error?.stack).toBe('at somewhere');
+      expect(result.step?.error).toMatchObject({
+        message: 'string step failure',
+        stack: 'at somewhere',
+      });
     });
   });
 

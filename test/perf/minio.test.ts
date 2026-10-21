@@ -107,7 +107,7 @@ interface PerfResult {
   schemaVersion: 2;
   recordedAt: string;
   backend: { name: 'minio'; version: string; celldVersion: string };
-  workload: Record<string, number>;
+  workload: Record<string, number | boolean>;
   correctness: Record<string, number | boolean>;
   performance: {
     enqueueDurationMs: number;
