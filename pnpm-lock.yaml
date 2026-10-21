@@ -79,7 +79,7 @@ importers:
         version: link:../..
       hono:
         specifier: ^4.13.2
-        version: 4.13.7
+        version: 4.13.11
       workflow:
         specifier: 5.1.0
         version: 5.1.0(@aws-sdk/credential-provider-web-identity@3.972.49)(@nestjs/common@11.1.28(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@10.2.2))(@nestjs/core@11.1.28(@nestjs/common@11.1.28(reflect-metadata@0.2.2)(rxjs@7.8.2)(supports-color@10.2.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))(@swc/cli@0.8.1(@swc/core@1.15.3)(chokidar@5.0.0)(supports-color@10.2.2))(@swc/core@1.15.3)(react@19.2.8)(supports-color@10.2.2)(typescript@7.0.2)(ws@8.21.3)
@@ -2241,8 +2241,8 @@ packages:
     resolution: {integrity: sha512-GqXJqY/xJkJmuloTrnV1ZEXG3fqte+VjkUqoRNZXcrUidiUOP4fMSIHHY4tsqZBK++kVyWmt/AAfSUuy57/eSA==}
     engines: {node: '>=16.9.0'}
 
-  hono@4.13.7:
-    resolution: {integrity: sha512-c8/gF9ac8Y78/agExVocyLevgR+JlpNB444Py0FSX8pJoPdYUfUzRcXtYEYGwt6l19qIlVZPN5Mfsw9jFShmQQ==}
+  hono@4.13.11:
+    resolution: {integrity: sha512-/SMX/RQNJn7oNmFwH6DtwDqcrzZU2otm1FD6OJe2cWF6cfy/F8hq0XVBv7xW3FTJshRQwuBnXHDq2kNsdZnshg==}
     engines: {node: '>=16.9.0'}
 
   hookable@6.1.1:
@@ -5532,7 +5532,7 @@ snapshots:
 
   hono@4.12.34: {}
 
-  hono@4.13.7: {}
+  hono@4.13.11: {}
 
   hookable@6.1.1: {}
 
