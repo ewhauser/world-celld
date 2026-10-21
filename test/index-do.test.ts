@@ -10,6 +10,9 @@ import {
   hookTokenShardName,
   runCatalogShardName,
   stableIndexHash,
+  type HookIdShardStub,
+  type HookTokenShardStub,
+  type RunCatalogShardStub,
   type WorkflowIndex,
 } from '../src/indexes.js';
 import { globalRunIndexKey, workflowRunIndexKey } from '../src/retention.js';
@@ -134,17 +137,17 @@ describe('sharded workflow indexes', () => {
     fleet = new FakeFleet(
       {
         'run-catalog': RunCatalogDO,
-        runs: TestRunLifecycleDO as never,
-        'hook-tokens': HookTokenDO as never,
-        'hook-ids': HookIdDO as never,
+        runs: TestRunLifecycleDO,
+        'hook-tokens': HookTokenDO,
+        'hook-ids': HookIdDO,
       },
       cellEnv,
     );
     cellEnv.clock = () => fleet.now;
     const bindings = {
-      runCatalog: fleet.namespace('run-catalog'),
-      hookTokens: fleet.namespace('hook-tokens'),
-      hookIds: fleet.namespace('hook-ids'),
+      runCatalog: fleet.namespace<RunCatalogShardStub>('run-catalog'),
+      hookTokens: fleet.namespace<HookTokenShardStub>('hook-tokens'),
+      hookIds: fleet.namespace<HookIdShardStub>('hook-ids'),
     };
     Object.assign(cellEnv, {
       WORKFLOW_RUN_CATALOG: bindings.runCatalog,

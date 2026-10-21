@@ -93,7 +93,7 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
   it('health endpoint identifies the deployed world', async () => {
     const res = await fetch(`${transport.fleetUrl}/v1/health`);
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await res.json<{ name: string }>();
     expect(body.name).toBe('world-celld');
   });
 
@@ -117,8 +117,9 @@ describe.skipIf(!FLEET_URL || !SECRET)('celld fleet integration', () => {
     expect(Math.abs(run.createdAt.getTime() - Date.now())).toBeLessThan(60_000);
     expect('input' in run && run.input !== undefined).toBe(true);
     if (!('input' in run) || !run.input) throw new Error('expected run input');
-    expect(run.input[0]).toBeInstanceOf(Uint8Array);
-    expect(Array.from(run.input[0] as Uint8Array)).toEqual([0, 1, 2, 253, 254, 255]);
+    const storedInput = run.input as unknown[];
+    expect(storedInput[0]).toBeInstanceOf(Uint8Array);
+    expect(Array.from(storedInput[0] as Uint8Array)).toEqual([0, 1, 2, 253, 254, 255]);
   });
 
   it('expires terminal payloads across run, stream, index, and queue object storage', async () => {

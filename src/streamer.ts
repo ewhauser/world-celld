@@ -37,6 +37,7 @@ export interface CelldStreamerConfig {
 
 export interface CelldStreamer extends Omit<Streamer, 'streams'> {
   streams: Streamer['streams'] & {
+    writeMulti: NonNullable<Streamer['streams']['writeMulti']>;
     fail(runId: string, name: string, error: StreamErrorData | string): Promise<void>;
   };
   writeToStream(

@@ -269,7 +269,7 @@ describe('workflow fault state correctness', () => {
               correlationId: 'fault-step',
               eventData: { result: new Uint8Array([1]) },
             });
-            retryErrors.push(completed.step.error);
+            retryErrors.push(completed.step?.error);
           }
           expect(retryErrors).toEqual(eventType === 'step_retrying' ? [error, error] : []);
         }

@@ -34,7 +34,7 @@ describe('Streamer (StreamDO RPC integration)', () => {
   describe('writeToStream()', () => {
     it('exposes writeMulti and treats an empty runtime batch as a no-op', async () => {
       expect(typeof streamer.streams.writeMulti).toBe('function');
-      await streamer.streams.writeMulti!('wrun_empty', 'empty-stream', []);
+      await streamer.streams.writeMulti('wrun_empty', 'empty-stream', []);
       expect(await streamer.listStreamsByRunId('wrun_empty')).toEqual([]);
     });
 

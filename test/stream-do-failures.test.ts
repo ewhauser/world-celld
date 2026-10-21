@@ -18,7 +18,7 @@ const CHUNK_SIZE_KEY = 'chunk-size:000000000000';
  * use: seed the metadata a stream created before segment rows carries.
  */
 function setup(name = 'stream:failure', options: { existingPerChunkStream?: boolean } = {}) {
-  const fleet = new FakeFleet({ streams: StreamDO as never });
+  const fleet = new FakeFleet({ streams: StreamDO });
   const get = () => fleet.namespace('streams').get({ toString: () => name }) as StreamDO;
   const storage = fleet.cell('streams', name).storage;
   if (options.existingPerChunkStream ?? true) {

@@ -218,7 +218,8 @@ describe('terminal workflow retention', () => {
       runRetentionMs: 1_000,
     });
     const runId = await createCompletedRun(world, 'queue-admission');
-    const run = () => harness.fleet.cell('runs', runId).instance as WorkflowRunDO;
+    const { fleet } = harness;
+    const run = () => fleet.cell('runs', runId).instance as WorkflowRunDO;
     await expect(run().getQueueAdmission()).resolves.toEqual({ ok: true });
     await finishRun(world, runId);
     await expect(run().getQueueAdmission()).resolves.toEqual({ ok: true });
@@ -588,10 +589,11 @@ describe('terminal workflow retention', () => {
     expect(waitCounts).toEqual([300, 300, 300, 300, 172, 44, 0]);
     expect(runStorage.data.has('terminal:cleanup')).toBe(false);
     expect(runStorage.alarmAt).toBeNull();
+    const { fleet } = harness;
     expect(
       Array.from({ length: 150 }, (_, hookIndex) => {
         const token = `token-${String(hookIndex).padStart(3, '0')}`;
-        return harness.fleet
+        return fleet
           .cell('hook-tokens', hookTokenShardName(token))
           .storage.data.has(hookTokenRecordKey(token));
       }),

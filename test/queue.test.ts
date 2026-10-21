@@ -197,7 +197,9 @@ describe('Queue (celld native Queue integration)', () => {
     );
 
     it('rejects a malformed queue payload before resolving a cell', async () => {
-      await expect(queue.queue('__wkf_workflow_test', {})).rejects.toMatchObject({ status: 422 });
+      await expect(queue.queue('__wkf_workflow_test', {} as never)).rejects.toMatchObject({
+        status: 422,
+      });
       expect(recordedEnqueues).toHaveLength(0);
     });
 
@@ -398,7 +400,7 @@ describe('Queue (celld native Queue integration)', () => {
       );
 
       expect(response.status).toBe(204);
-      const [message] = handler.mock.calls[0];
+      const message = handler.mock.calls[0]?.[0] as { runInput: { input: Uint8Array } };
       expect(message.runInput.input).toBeInstanceOf(Uint8Array);
       expect(Array.from(message.runInput.input)).toEqual([9, 8, 7]);
     });
@@ -474,7 +476,7 @@ describe('Queue (celld native Queue integration)', () => {
 
       expect(response.status).toBe(503);
       expect(response.headers.get('Retry-After')).toBe('30');
-      const body = await response.json();
+      const body = await response.json<{ timeoutSeconds: number }>();
       expect(body.timeoutSeconds).toBe(30);
     });
 
@@ -519,7 +521,7 @@ describe('Queue (celld native Queue integration)', () => {
       const response = await queueHandler(vqsRequest(WORKFLOW_PAYLOAD));
 
       expect(response.status).toBe(410);
-      const body = await response.json();
+      const body = await response.json<{ permanent: boolean }>();
       expect(body.permanent).toBe(true);
     });
 
@@ -531,7 +533,7 @@ describe('Queue (celld native Queue integration)', () => {
 
       expect(response.status).toBe(500);
       expect(response.headers.get('Retry-After')).toBeDefined();
-      const errorBody = await response.json();
+      const errorBody = await response.json<{ error: string }>();
       expect(errorBody.error).toContain('Handler error');
     });
 

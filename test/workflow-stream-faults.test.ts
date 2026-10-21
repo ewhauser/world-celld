@@ -17,7 +17,7 @@ const NAME = 'workflow-output';
 const CELL_NAME = `stream:${NAME}`;
 
 function setup() {
-  const fleet = new FakeFleet({ streams: StreamDO as never });
+  const fleet = new FakeFleet({ streams: StreamDO });
   const env = { WORKFLOW_STREAMS: fleet.namespace('streams') as never };
   const streamer = createStreamer({ env });
   const get = () => fleet.cell('streams', CELL_NAME).instance as StreamDO;
