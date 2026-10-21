@@ -7,14 +7,15 @@ import { WorkflowRunDO } from '../src/worker/durable-objects/WorkflowRunDO.js';
 describe('WorkflowRunDO event ordering regression', () => {
   it('preserves commit order after the object is evicted and recreated', async () => {
     const storage = new FakeStorage();
+    // The fake implements only the DurableObjectState members the cell uses.
     const ctx = {
       storage,
       id: { toString: () => 'wrun_eviction_order', name: 'wrun_eviction_order' },
       waitUntil: () => undefined,
       blockConcurrencyWhile: async <T>(callback: () => Promise<T>) => callback(),
-    };
+    } as unknown as DurableObjectState;
 
-    const firstInstance = new WorkflowRunDO(ctx as DurableObjectState, {});
+    const firstInstance = new WorkflowRunDO(ctx, {});
     const created = await firstInstance.applyEvent({
       runId: 'wrun_eviction_order',
       data: {
@@ -29,7 +30,7 @@ describe('WorkflowRunDO event ordering regression', () => {
     expect(created.ok).toBe(true);
 
     // A fresh class instance over the same durable storage models eviction.
-    const secondInstance = new WorkflowRunDO(ctx as DurableObjectState, {});
+    const secondInstance = new WorkflowRunDO(ctx, {});
     const started = await secondInstance.applyEvent({
       runId: 'wrun_eviction_order',
       data: { eventType: 'run_started' },

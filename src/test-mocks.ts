@@ -180,6 +180,31 @@ class MockWorkflowRunDOStub {
     return result;
   }
 
+  async resolveExpiredHookClaim(request: {
+    hookId: string;
+    claimId: string;
+    token?: string;
+  }): Promise<Hook | null> {
+    const result = this.applyChain.then(async () => {
+      const run = await this.store.get<WorkflowRun>('run');
+      if (run && isTerminalWorkflowRunStatus(run.status)) return null;
+      const hook = await this.store.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
+      if (hook && (request.token === undefined || hook.token === request.token)) return hook;
+      const cancellation = { hookId: request.hookId, token: request.token, canceledAt: Date.now() };
+      await this.store.put(
+        hookClaimCancellationKey(`${request.claimId}:${request.claimId}`),
+        cancellation,
+      );
+      await this.store.put(hookClaimCancellationKey(`-:${request.claimId}`), cancellation);
+      return null;
+    });
+    this.applyChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
   async getRun(): Promise<RunReadOutcome<WorkflowRun | null>> {
     const run = await this.store.get<WorkflowRun>('run');
     return { ok: true, value: run ?? null };

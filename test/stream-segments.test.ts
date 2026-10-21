@@ -11,7 +11,7 @@ const RUN_ID = 'wrun_segments';
 
 /** A stream created in segment layout, as a writer that creates segment streams leaves it. */
 function segmentStream(name = 'stream:segments') {
-  const fleet = new FakeFleet({ streams: StreamDO as never });
+  const fleet = new FakeFleet({ streams: StreamDO });
   const cell = fleet.cell('streams', name);
   cell.storage.data.set('meta', { count: 0, state: 'open', layout: 2 });
   const stream = fleet.namespace('streams').get({ toString: () => name }) as StreamDO;
@@ -178,7 +178,7 @@ describe('StreamDO segment layout', () => {
   });
 
   it('creates new streams in segment layout', async () => {
-    const fleet = new FakeFleet({ streams: StreamDO as never });
+    const fleet = new FakeFleet({ streams: StreamDO });
     const stream = fleet.namespace('streams').get({ toString: () => 'stream:new' }) as StreamDO;
     await stream.writeChunks(RUN_ID, [chunk(0), chunk(1)]);
     const storage = fleet.cell('streams', 'stream:new').storage;
@@ -203,7 +203,7 @@ describe('StreamDO segment layout', () => {
   });
 
   it('keeps writing per-chunk rows for a stream that already uses them', async () => {
-    const fleet = new FakeFleet({ streams: StreamDO as never });
+    const fleet = new FakeFleet({ streams: StreamDO });
     fleet.cell('streams', 'stream:rows').storage.data.set('meta', { count: 0, state: 'open' });
     const stream = fleet.namespace('streams').get({ toString: () => 'stream:rows' }) as StreamDO;
     await stream.writeChunks(RUN_ID, [chunk(0), chunk(1)]);

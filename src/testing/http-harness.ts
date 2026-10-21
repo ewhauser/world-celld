@@ -13,7 +13,7 @@ import { WorkflowRunDO } from '../worker/durable-objects/WorkflowRunDO.js';
 import { createQueuePayloadStore } from '../worker/queue-payload-store.js';
 import { deliverQueueMessage, type QueueDeliveryResult } from '../worker/queue-delivery.js';
 import type { NativeQueueEnvelope } from '../queue-protocol.js';
-import { FakeFleet } from './fake-cell.js';
+import { type CellClass, FakeFleet } from './fake-cell.js';
 
 export interface QueuedMessage {
   body: string;
@@ -39,7 +39,7 @@ export interface HarnessOptions {
   /** Use FakeFleet's manually advanced clock instead of wall-clock time. */
   virtualClock?: boolean;
   /** Additional cell classes by binding key. */
-  extraClasses?: Record<string, new (ctx: unknown, env: unknown) => object>;
+  extraClasses?: Record<string, CellClass>;
   /** env passed to cell constructors (celld `vars`). */
   cellEnv?: Record<string, unknown>;
 }
@@ -69,11 +69,11 @@ export async function startHarness(options: HarnessOptions = {}): Promise<Harnes
   };
   const fleet = new FakeFleet(
     {
-      runs: WorkflowRunDO as never,
-      streams: StreamDO as never,
-      'run-catalog': RunCatalogDO as never,
-      'hook-tokens': HookTokenDO as never,
-      'hook-ids': HookIdDO as never,
+      runs: WorkflowRunDO,
+      streams: StreamDO,
+      'run-catalog': RunCatalogDO,
+      'hook-tokens': HookTokenDO,
+      'hook-ids': HookIdDO,
       ...options.extraClasses,
     },
     cellEnv,

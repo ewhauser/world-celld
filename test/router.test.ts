@@ -94,7 +94,7 @@ describe('router auth and shape', () => {
   it('serves /v1/health unauthenticated', async () => {
     const res = await fetch(`${harness.url}/v1/health`);
     expect(res.status).toBe(200);
-    const body = await res.json();
+    const body = await res.json<{ ok: boolean; name: string; specVersion: number }>();
     expect(body.ok).toBe(true);
     expect(body.name).toBe('world-celld');
     expect(body.specVersion).toBeTypeOf('number');
@@ -326,7 +326,7 @@ describe('router auth and shape', () => {
     const router = createRouter({
       WORKFLOW_DB: namespace,
       WORLD_SECRET: SECRET,
-    } as WorkerEnv);
+    } as Partial<WorkerEnv> as WorkerEnv);
     const response = await router(
       new Request('http://world.test/v1/rpc/runs/wrun_x/getRun', {
         method: 'POST',
@@ -417,7 +417,7 @@ describe('router auth and shape', () => {
     const router = createRouter({
       WORKFLOW_STREAMS: namespace,
       WORLD_SECRET: SECRET,
-    } as WorkerEnv);
+    } as Partial<WorkerEnv> as WorkerEnv);
     const authorization = { authorization: `Bearer ${SECRET}` };
     const validQuery = `runId=wrun_x&startIndex=0&maxChunks=1&maxBytes=${MAX_STREAM_CHUNK_BYTES}&waitMs=0`;
 
@@ -508,7 +508,7 @@ describe('router auth and shape', () => {
     const router = createRouter({
       WORKFLOW_STREAMS: namespace,
       WORLD_SECRET: SECRET,
-    } as WorkerEnv);
+    } as Partial<WorkerEnv> as WorkerEnv);
     const request = new Request('http://world.test/v1/streams/stream%3Ax/chunks?runId=wrun_x', {
       method: 'POST',
       headers: {
@@ -670,7 +670,7 @@ describe('native Queue bridge', () => {
       WORKFLOW_DB: harness.fleet.namespace('runs'),
       WORKFLOW_QUEUE: { send },
       WORLD_SECRET: SECRET,
-    } as WorkerEnv);
+    } as Partial<WorkerEnv> as WorkerEnv);
     const first = {
       version: 1 as const,
       messageId: 'msg_router_dedup_first',
@@ -740,7 +740,7 @@ describe('native Queue bridge', () => {
       WORKFLOW_QUEUE: { send },
       WORKFLOW_QUEUE_PAYLOADS: store,
       WORLD_SECRET: SECRET,
-    } as WorkerEnv);
+    } as Partial<WorkerEnv> as WorkerEnv);
     const envelope = {
       version: 1 as const,
       messageId: 'msg_router_retention_race',
@@ -981,7 +981,7 @@ describe('full stack: vendored storage over the wire', () => {
     expect(run.updatedAt).toBeInstanceOf(Date);
     expect('input' in run).toBe(true);
     if (!('input' in run)) throw new Error('expected run input');
-    expect(run.input?.[0]).toBeInstanceOf(Uint8Array);
+    expect((run.input as unknown[] | undefined)?.[0]).toBeInstanceOf(Uint8Array);
 
     const listed = await storage.runs.list({ workflowName: 'wire-workflow' });
     expect(listed.data.some((r) => r.runId === runId)).toBe(true);
@@ -1182,7 +1182,7 @@ describe('full stack: vendored storage over the wire', () => {
     for (const name of allRunCatalogShardNames()) {
       const catalogStorage = harness.fleet.cell('run-catalog', name).storage;
       const originalList = catalogStorage.list.bind(catalogStorage);
-      catalogStorage.list = async <T>(options) => {
+      catalogStorage.list = async <T>(options?: DurableObjectListOptions) => {
         catalogLists++;
         return originalList<T>(options);
       };
@@ -1812,7 +1812,7 @@ describe('full stack: vendored storage over the wire', () => {
       Uint8Array.of(0, index, 255),
     );
 
-    await streamer.streams.writeMulti!(runId, name, chunks);
+    await streamer.streams.writeMulti(runId, name, chunks);
 
     expect(calls).toHaveLength(2);
     expect(calls[0].url).toContain('/v1/rpc/streams/');
@@ -1839,7 +1839,7 @@ describe('full stack: vendored storage over the wire', () => {
 
     calls.length = 0;
     streamStorage.resetOperationCounts();
-    await streamer.streams.writeMulti!(runId, name, chunks);
+    await streamer.streams.writeMulti(runId, name, chunks);
 
     expect(calls).toHaveLength(1);
     expect(calls[0].url).toContain('/v1/streams/');

@@ -13,7 +13,7 @@ import { StreamDO } from '../src/worker/durable-objects/StreamDO.js';
 const RUN_ID = 'wrun_stream_do';
 
 function setup(name = 'stream:test', options: { existingPerChunkStream?: boolean } = {}) {
-  const fleet = new FakeFleet({ streams: StreamDO as never });
+  const fleet = new FakeFleet({ streams: StreamDO });
   const get = () => fleet.namespace('streams').get({ toString: () => name }) as StreamDO;
   // Per-chunk rows are kept only by streams created before segment rows.
   if (options.existingPerChunkStream) {

@@ -38,7 +38,7 @@ function setupProducer(scope: 'cell' | 'run', suffix: string) {
     WORKFLOW_QUEUE: { send },
     WORKFLOW_QUEUE_PAYLOADS: store,
     WORLD_SECRET: SECRET,
-  } as WorkerEnv;
+  } as Partial<WorkerEnv> as WorkerEnv;
   Object.assign(cellEnv, env, { clock: () => fleet.now });
   const runId = `wrun_queue_fault_${scope}_${suffix}`;
   const run = fleet.cell('runs', runId);

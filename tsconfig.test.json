@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // Tests run on Node 22, which provides ES2024 APIs such as Promise.withResolvers.
+    "lib": ["ES2024"],
+    "noEmit": true,
+    "declaration": false,
+    "declarationMap": false,
+    "rootDir": "."
+  },
+  "include": ["test"],
+  // Fixtures are copied into another checkout's demo app and compiled there.
+  "exclude": ["node_modules", "dist", "test/fixtures"]
+}

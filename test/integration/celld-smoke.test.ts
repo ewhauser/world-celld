@@ -1,10 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessByStdio, execFile, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 import { RunExpiredError } from '@workflow/errors';
 import { SPEC_VERSION_CURRENT } from '@workflow/world';
@@ -30,7 +31,7 @@ interface CapturedDelivery {
 }
 
 interface ManagedProcess {
-  child: ChildProcessWithoutNullStreams;
+  child: ChildProcessByStdio<null, Readable, Readable>;
   logs: () => string;
   name: string;
 }
@@ -129,7 +130,8 @@ function startManaged(
   const child = spawn(command, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
   const capture = (chunk: Buffer) => {
-    output += chunk.toString('utf8');
+    // Buffer stringifies as UTF-8.
+    output += String(chunk);
     if (output.length > MAX_PROCESS_LOG_BYTES) output = output.slice(-MAX_PROCESS_LOG_BYTES);
   };
   child.stdout.on('data', capture);
