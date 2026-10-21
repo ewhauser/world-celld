@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.9.2 (2026-10-21)
+
+## What's Changed
+* Upgrade eligible Workflow packages with restart compatibility coverage by @ewhauser in https://github.com/ewhauser/world-celld/pull/99
+* test: type-check the test suite in pnpm typecheck by @ewhauser in https://github.com/ewhauser/world-celld/pull/101
+* chore(deps): bump hono from 4.13.7 to 4.13.11 by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/100
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.9.1...v0.9.2
+
 ## 0.9.1 (2026-10-13)
 
 ## What's Changed
