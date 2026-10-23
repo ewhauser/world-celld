@@ -11,6 +11,9 @@ const deploymentId = 'upgrade-fixture';
 const workflowName = 'v090-inflight';
 const baseUrl = 'http://127.0.0.1';
 const previousQueueMode = process.env.CELLD_QUEUE_MODE;
+// Opaque serialized bytes must survive a World upgrade, including non-UTF-8
+// payloads from a runtime with a different devalue release.
+const oldSerializedBytes = Uint8Array.from([0, 255, 128, 92, 34]);
 
 type CellState = {
   storage: { data: Map<string, unknown>; alarmAt: number | null };
@@ -52,12 +55,12 @@ it.each([
     await oldWorld.events.create(runId, {
       eventType: 'step_completed',
       correlationId: 'old-step',
-      eventData: { result: ['old-output'] },
+      eventData: { result: oldSerializedBytes },
     });
     await oldWorld.events.create(runId, {
       eventType: 'hook_created',
       correlationId: 'old-hook',
-      eventData: { token: 'old-hook-token' },
+      eventData: { token: 'old-hook-token', metadata: oldSerializedBytes },
     });
     await oldWorld.writeToStream('old-stream', runId, 'before-upgrade');
     const queued = await oldWorld.queue(
@@ -89,7 +92,10 @@ it.each([
 
     const world = createCelldWorld({ fleetUrl: after.url, secret, baseUrl, deploymentId });
     expect((await world.runs.get(runId)).status).toBe('running');
-    expect((await world.steps.get(runId, 'old-step')).status).toBe('completed');
+    const step = await world.steps.get(runId, 'old-step');
+    expect(step.status).toBe('completed');
+    expect(step.output).toEqual(oldSerializedBytes);
+    expect((await world.hooks.getByToken('old-hook-token')).metadata).toEqual(oldSerializedBytes);
     expect((await world.getStreamChunks('old-stream', runId, {})).data).toHaveLength(1);
     const repeatedQueue = await world.queue(
       '__wkf_workflow_upgrade_fixture',

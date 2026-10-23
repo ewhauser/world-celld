@@ -62,6 +62,17 @@ function dependencyStepIds(
   );
 }
 
+function nestedCheckpointStepIds(manifest: Awaited<ReturnType<typeof workflowManifest>>): string[] {
+  return Object.entries(manifest.steps)
+    .filter(([file]) => !file.includes('node_modules/'))
+    .flatMap(([, steps]) =>
+      Object.values(steps)
+        .map(({ stepId }) => stepId)
+        .filter((stepId) => stepId.includes('checkpoint')),
+    )
+    .toSorted();
+}
+
 async function startSmokeOrder(url: string, orderId: string): Promise<{ runId: string }> {
   const response = await fetch(`${url}/orders/${encodeURIComponent(orderId)}`, {
     method: 'POST',
@@ -812,13 +823,38 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     },
   );
 
-  it.skipIf(!process.env.CELLD_SMOKE_FETCH_BASELINE_APP)(
-    'keeps a beta fetch run on its compiled app while stable starts new runs after celld restart',
-    async () => {
-      const betaDirectory = process.env.CELLD_SMOKE_FETCH_BASELINE_APP!;
-      const stableDirectory = join(process.cwd(), 'examples/demo-app');
-      const betaFetchId = dependencyStepIds(await workflowManifest(betaDirectory)).get('fetch');
-      expect(betaFetchId).toContain('workflow@5.0.0-beta.58');
+  it
+    .skipIf(
+      !process.env.CELLD_SMOKE_FETCH_BASELINE_APP ||
+        !process.env.CELLD_SMOKE_NESTED_PREVIOUS_APP ||
+        !process.env.CELLD_SMOKE_NESTED_CURRENT_APP,
+    )
+    .each([
+      {
+        name: 'beta fetch',
+        oldDirectory: process.env.CELLD_SMOKE_FETCH_BASELINE_APP!,
+        stableDirectory: join(process.cwd(), 'examples/demo-app'),
+        expectedFetchVersion: 'workflow@5.0.0-beta.58',
+      },
+      {
+        name: '5.1 nested fetch',
+        oldDirectory: process.env.CELLD_SMOKE_NESTED_PREVIOUS_APP!,
+        stableDirectory: process.env.CELLD_SMOKE_NESTED_CURRENT_APP!,
+        expectedFetchVersion: 'workflow@5.1.0',
+      },
+    ])(
+    'keeps an in-flight $name run on its compiled app across celld restart',
+    async ({ name, oldDirectory, stableDirectory, expectedFetchVersion }) => {
+      const oldManifest = await workflowManifest(oldDirectory);
+      const oldFetchId = dependencyStepIds(oldManifest).get('fetch');
+      expect(oldFetchId).toContain(expectedFetchVersion);
+      const oldNestedStepIds = nestedCheckpointStepIds(oldManifest);
+      const currentNestedStepIds = nestedCheckpointStepIds(await workflowManifest(stableDirectory));
+      const expectedNestedCount = name === '5.1 nested fetch' ? 2 : 0;
+      expect(oldNestedStepIds).toHaveLength(expectedNestedCount);
+      expect(currentNestedStepIds).toHaveLength(expectedNestedCount);
+      expect(new Set(oldNestedStepIds).size).toBe(expectedNestedCount);
+      expect(new Set(currentNestedStepIds).size).toBe(expectedNestedCount);
 
       let fetchCount = 0;
       const probe = http.createServer((_request, response) => {
@@ -845,9 +881,9 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
       const workerDirectory = join(temporaryRoot, 'worker');
       const workerConfigPath = join(workerDirectory, 'wrangler.jsonc');
       let originalWorkerConfig: string | undefined;
-      const startApp = async (directory: string, name: string, url: string, port: number) => {
+      const startApp = async (directory: string, appName: string, url: string, port: number) => {
         const managed = startManaged(
-          name,
+          appName,
           process.execPath,
           [join(directory, '.output/server/index.mjs')],
           {
@@ -855,9 +891,9 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
             WORKFLOW_TARGET_WORLD: '@ewhauser/world-celld',
             CELLD_FLEET_URL: runtime!.url,
             CELLD_WORLD_SECRET: SECRET,
-            CELLD_DEPLOYMENT_ID: name === 'beta fetch app' ? 'celld-default' : 'stable-test',
+            CELLD_DEPLOYMENT_ID: appName === 'stable app' ? 'stable-test' : 'celld-default',
             WORKFLOW_BASE_URL: url,
-            ...(name === 'stable app'
+            ...(appName === 'stable app'
               ? {
                   WORKFLOW_DEPLOYMENT_URLS: JSON.stringify({
                     'celld-default': betaRestartUrl,
@@ -873,13 +909,13 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
         await waitFor(
           async () => {
             if (managed.child.exitCode !== null || managed.child.signalCode !== null) {
-              throw new Error(`${name} exited during startup\n${managed.logs()}`);
+              throw new Error(`${appName} exited during startup\n${managed.logs()}`);
             }
             const response = await fetch(url, { signal: AbortSignal.timeout(1_000) });
             return response.ok ? true : null;
           },
           20_000,
-          `${name} readiness`,
+          `${appName} readiness`,
         );
         return managed;
       };
@@ -921,7 +957,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
         );
 
       try {
-        betaApp = await startApp(betaDirectory, 'beta fetch app', betaUrl, betaPort);
+        betaApp = await startApp(oldDirectory, 'old app', betaUrl, betaPort);
         const oldRun = await startSmokeOrder(betaUrl, `127.0.0.1:${probePort}`);
         oldRunId = oldRun.runId;
         const oldToken = await approvalToken(betaUrl, oldRun.runId);
@@ -946,11 +982,14 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
           ),
         );
         await runtime!.deployPrimary(workerDirectory);
-        betaApp = await startApp(betaDirectory, 'beta fetch app', betaRestartUrl, betaRestartPort);
+        betaApp = await startApp(oldDirectory, 'old app', betaRestartUrl, betaRestartPort);
         activeBetaUrl = betaRestartUrl;
         stableApp = await startApp(stableDirectory, 'stable app', stableUrl, stablePort);
 
-        const newRun = await startSmokeOrder(stableUrl, 'stable-concurrent');
+        const newRun = await startSmokeOrder(
+          stableUrl,
+          name === '5.1 nested fetch' ? `127.0.0.1:${probePort}` : 'stable-concurrent',
+        );
         newRunId = newRun.runId;
         const newToken = await approvalToken(stableUrl, newRun.runId);
         await approveSmokeHook(stableUrl, oldToken);
@@ -959,7 +998,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
           completed(betaRestartUrl, oldRun.runId),
           completed(stableUrl, newRun.runId),
         ]);
-        expect(fetchCount).toBe(1);
+        expect(fetchCount).toBe(name === '5.1 nested fetch' ? 2 : 1);
         const oldEvents = await world({ deploymentId: 'celld-default' }).events.list({
           runId: oldRun.runId,
           pagination: { sortOrder: 'asc' },
@@ -967,9 +1006,16 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
         expect(
           oldEvents.data.filter(
             (event) =>
-              event.eventType === 'step_created' && event.eventData.stepName === betaFetchId,
+              event.eventType === 'step_created' && event.eventData.stepName === oldFetchId,
           ),
         ).toHaveLength(1);
+        for (const stepId of oldNestedStepIds) {
+          expect(
+            oldEvents.data.filter(
+              (event) => event.eventType === 'step_created' && event.eventData.stepName === stepId,
+            ),
+          ).toHaveLength(1);
+        }
       } catch (error) {
         const oldEvents = oldRunId
           ? await world({ deploymentId: 'celld-default' })
