@@ -96,27 +96,39 @@ baseline_app=${CELLD_SMOKE_BASELINE_APP:-}
 previous_stable_app=${CELLD_SMOKE_PREVIOUS_STABLE_APP:-}
 stable_app=${CELLD_SMOKE_STABLE_APP:-}
 fetch_baseline_app=${CELLD_SMOKE_FETCH_BASELINE_APP:-}
-if [[ -z "$baseline_app" || -z "$previous_stable_app" || -z "$stable_app" || -z "$fetch_baseline_app" ]]; then
+nested_previous_app=${CELLD_SMOKE_NESTED_PREVIOUS_APP:-}
+nested_current_app=${CELLD_SMOKE_NESTED_CURRENT_APP:-}
+if [[ -z "$baseline_app" || -z "$previous_stable_app" || -z "$stable_app" || -z "$fetch_baseline_app" || -z "$nested_previous_app" || -z "$nested_current_app" ]]; then
   baseline_ref=0aacc8bc25ceef44249eb2491baf54b96f136e73
   previous_stable_ref=b41abf26e774e6980500c02c1030cda89067aee6
+  nested_previous_ref=1879e901021823a33852f41ac94bd35a590eb9bf
   if ! git cat-file -e "$baseline_ref^{commit}" 2>/dev/null; then
     git fetch --depth=1 origin "$baseline_ref"
   fi
   if ! git cat-file -e "$previous_stable_ref^{commit}" 2>/dev/null; then
     git fetch --depth=1 origin "$previous_stable_ref"
   fi
+  if ! git cat-file -e "$nested_previous_ref^{commit}" 2>/dev/null; then
+    git fetch --depth=1 origin "$nested_previous_ref"
+  fi
   baseline_root="$runtime_root/baseline"
   previous_stable_root="$runtime_root/previous-stable"
   stable_root="$runtime_root/stable"
   fetch_root="$runtime_root/baseline-fetch"
+  nested_previous_root="$runtime_root/previous-nested"
+  nested_current_root="$runtime_root/current-nested"
   mkdir -p "$baseline_root"
   mkdir -p "$previous_stable_root"
   mkdir -p "$stable_root"
   mkdir -p "$fetch_root"
+  mkdir -p "$nested_previous_root"
+  mkdir -p "$nested_current_root"
   git archive "$baseline_ref" | tar -x -C "$baseline_root"
   git archive "$previous_stable_ref" | tar -x -C "$previous_stable_root"
   git archive HEAD | tar -x -C "$stable_root"
   git archive "$baseline_ref" | tar -x -C "$fetch_root"
+  git archive "$nested_previous_ref" | tar -x -C "$nested_previous_root"
+  git archive HEAD | tar -x -C "$nested_current_root"
   for fixture_root in "$baseline_root" "$previous_stable_root" "$stable_root"; do
     cp test/fixtures/upgrade-order.ts "$fixture_root/examples/demo-app/workflows/order.ts"
     (
@@ -133,10 +145,21 @@ if [[ -z "$baseline_app" || -z "$previous_stable_app" || -z "$stable_app" || -z 
     pnpm build
     pnpm --dir examples/demo-app build
   )
+  for fixture_root in "$nested_previous_root" "$nested_current_root"; do
+    cp test/fixtures/upgrade-nested-fetch-order.ts "$fixture_root/examples/demo-app/workflows/order.ts"
+    (
+      cd "$fixture_root"
+      pnpm install --frozen-lockfile
+      pnpm build
+      pnpm --dir examples/demo-app build
+    )
+  done
   baseline_app="$baseline_root/examples/demo-app"
   previous_stable_app="$previous_stable_root/examples/demo-app"
   stable_app="$stable_root/examples/demo-app"
   fetch_baseline_app="$fetch_root/examples/demo-app"
+  nested_previous_app="$nested_previous_root/examples/demo-app"
+  nested_current_app="$nested_current_root/examples/demo-app"
 fi
 
 CELLD_SMOKE_CELLD_BIN="$celld_binary" \
@@ -147,4 +170,6 @@ CELLD_SMOKE_BASELINE_APP="$baseline_app" \
 CELLD_SMOKE_PREVIOUS_STABLE_APP="$previous_stable_app" \
 CELLD_SMOKE_STABLE_APP="$stable_app" \
 CELLD_SMOKE_FETCH_BASELINE_APP="$fetch_baseline_app" \
+CELLD_SMOKE_NESTED_PREVIOUS_APP="$nested_previous_app" \
+CELLD_SMOKE_NESTED_CURRENT_APP="$nested_current_app" \
   pnpm vitest run --config vitest.celld-smoke.config.ts "$@"
