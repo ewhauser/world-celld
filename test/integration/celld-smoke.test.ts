@@ -827,6 +827,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     .skipIf(
       !process.env.CELLD_SMOKE_FETCH_BASELINE_APP ||
         !process.env.CELLD_SMOKE_NESTED_PREVIOUS_APP ||
+        !process.env.CELLD_SMOKE_NESTED_LAST_APP ||
         !process.env.CELLD_SMOKE_NESTED_CURRENT_APP,
     )
     .each([
@@ -842,6 +843,12 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
         stableDirectory: process.env.CELLD_SMOKE_NESTED_CURRENT_APP!,
         expectedFetchVersion: 'workflow@5.1.0',
       },
+      {
+        name: '5.2.2 nested fetch',
+        oldDirectory: process.env.CELLD_SMOKE_NESTED_LAST_APP!,
+        stableDirectory: process.env.CELLD_SMOKE_NESTED_CURRENT_APP!,
+        expectedFetchVersion: 'workflow@5.2.2',
+      },
     ])(
     'keeps an in-flight $name run on its compiled app across celld restart',
     async ({ name, oldDirectory, stableDirectory, expectedFetchVersion }) => {
@@ -850,7 +857,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
       expect(oldFetchId).toContain(expectedFetchVersion);
       const oldNestedStepIds = nestedCheckpointStepIds(oldManifest);
       const currentNestedStepIds = nestedCheckpointStepIds(await workflowManifest(stableDirectory));
-      const expectedNestedCount = name === '5.1 nested fetch' ? 2 : 0;
+      const expectedNestedCount = name.includes('nested fetch') ? 2 : 0;
       expect(oldNestedStepIds).toHaveLength(expectedNestedCount);
       expect(currentNestedStepIds).toHaveLength(expectedNestedCount);
       expect(new Set(oldNestedStepIds).size).toBe(expectedNestedCount);
@@ -988,7 +995,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
 
         const newRun = await startSmokeOrder(
           stableUrl,
-          name === '5.1 nested fetch' ? `127.0.0.1:${probePort}` : 'stable-concurrent',
+          name.includes('nested fetch') ? `127.0.0.1:${probePort}` : 'stable-concurrent',
         );
         newRunId = newRun.runId;
         const newToken = await approvalToken(stableUrl, newRun.runId);
@@ -998,7 +1005,7 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
           completed(betaRestartUrl, oldRun.runId),
           completed(stableUrl, newRun.runId),
         ]);
-        expect(fetchCount).toBe(name === '5.1 nested fetch' ? 2 : 1);
+        expect(fetchCount).toBe(name.includes('nested fetch') ? 2 : 1);
         const oldEvents = await world({ deploymentId: 'celld-default' }).events.list({
           runId: oldRun.runId,
           pagination: { sortOrder: 'asc' },
