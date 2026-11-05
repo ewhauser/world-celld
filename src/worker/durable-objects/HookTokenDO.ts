@@ -153,6 +153,10 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         if (indexed !== undefined && !(await this.freeExpiredRetention(txn, token, values, now))) {
           return { claimed: false as const, holder: ownerFromSerializedHook(indexed) };
         }
+        // The victim released the token while a takeover was pending. Settle
+        // the takeover before claiming, or its roll-forward would later
+        // overwrite this claim's record and leave two live owners.
+        if (values.has(takeoverKey(token))) return 'settle' as const;
         let existing = values.get(claim) as HookClaim | undefined;
         if (existing && existing.expiresAt <= now) {
           if (existing.claimId !== expired?.claimId || existing.expiresAt !== expired.expiresAt) {
@@ -186,6 +190,10 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         }
         return { claimed: true as const, claimId: existing.claimId };
       });
+      if (result === 'settle') {
+        await this.settleTakeover(token);
+        continue;
+      }
       if (result) return result;
     }
   }

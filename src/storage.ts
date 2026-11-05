@@ -704,10 +704,18 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             failure.code === 'HOOK_CLAIM_CANCELLED' &&
             ++admissions < MAX_FORCED_HOOK_ADMISSIONS
           ) {
+            // Queue behind the forcer that fenced us rather than fencing it
+            // back at once; a fresh wait budget keeps forcers from ping-ponging.
+            waits = 0;
             continue;
           }
           if (failure.code === 'HOOK_FORCE_CLAIMED') {
-            await env.WORKFLOW_INDEX.settleHookTakeover?.(failure.token!, failure.claimedBy);
+            // Finishing the re-pointing is best effort: the shard alarm settles
+            // the intent anyway, and the caller must still get
+            // HookForceClaimedError so resumeHook() follows the token.
+            await env.WORKFLOW_INDEX.settleHookTakeover?.(failure.token!, failure.claimedBy).catch(
+              () => undefined,
+            );
           }
           throwOutcomeError(failure, effectiveRunId, data);
         }
