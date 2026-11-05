@@ -150,6 +150,14 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     // so the queue message carries runInput and run_started can bootstrap the
     // run when run_created has not landed yet.
     specVersion: SPEC_VERSION_CURRENT,
+    capabilities: {
+      hookRetention: { active: true },
+      // An injected index without the takeover operations cannot honor force.
+      hookForceClaim:
+        typeof env.WORKFLOW_INDEX.forceReserveHook === 'function' &&
+        typeof env.WORKFLOW_INDEX.completeHookTakeover === 'function' &&
+        typeof env.WORKFLOW_INDEX.settleHookTakeover === 'function',
+    },
   };
 }
 

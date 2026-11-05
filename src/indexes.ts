@@ -1,5 +1,5 @@
 import type { RunListPage, RunListRequest } from './run-list.js';
-import type { WorkflowRun } from '@workflow/world';
+import type { HookClaimedFrom, WorkflowRun } from '@workflow/world';
 import type { HookTokenOwner } from './config.js';
 import type {
   ExpireRunIndexesRequest,
@@ -51,15 +51,34 @@ export type HookClaimResult =
   | { claimed: true; claimId: string }
   | { claimed: false; holder: HookTokenOwner };
 
+export type HookForceRefusedReason = 'victim-spec-version';
+
+export type HookForceClaimResult =
+  | { claimed: true; claimId: string; takeover?: true; claimedFrom?: HookClaimedFrom }
+  | {
+      claimed: false;
+      holder: HookTokenOwner;
+      forceRefusedReason?: HookForceRefusedReason;
+      /** Another creation is mid-flight; retry, or preempt it. */
+      pending?: true;
+    };
+
 export interface HookReservation {
   claimId: string;
   tokenClaimId?: string;
   hookIdClaimId?: string;
+  /** The token claim is a forced takeover intent, settled rather than released. */
+  takeover?: true;
 }
 
 export type HookReservationResult =
-  | { admitted: true; reservation: HookReservation }
-  | { admitted: false; holder: HookTokenOwner };
+  | { admitted: true; reservation: HookReservation; claimedFrom?: HookClaimedFrom }
+  | {
+      admitted: false;
+      holder: HookTokenOwner;
+      forceRefusedReason?: HookForceRefusedReason;
+      pending?: true;
+    };
 
 export interface HookTokenShardStub {
   get(token: string): Promise<string | null>;
@@ -73,7 +92,18 @@ export interface HookTokenShardStub {
   releaseClaim(token: string, owner: HookTokenOwner, claimId: string): Promise<void>;
   releaseBatch(
     hooks: Array<{ token: string; owner: HookTokenOwner }>,
+    options?: { runEnded?: boolean },
   ): Promise<{ deleted: number }>;
+  forceReserve(
+    token: string,
+    owner: HookTokenOwner,
+    proposedClaimId: string,
+    preempt?: boolean,
+  ): Promise<HookForceClaimResult>;
+  settleTakeover(
+    token: string,
+    match?: { claimer: HookTokenOwner; claimId?: string },
+  ): Promise<{ owner: HookTokenOwner | null }>;
 }
 
 export interface HookIdShardStub {
@@ -122,6 +152,22 @@ export interface WorkflowIndex {
   getHookByToken(token: string): Promise<string | null>;
   getHookById(hookId: string): Promise<string | null>;
   reserveHook(token: string, owner: HookTokenOwner): Promise<HookReservationResult>;
+  /** `experimental_force`: take the token over from a live holder instead of conflicting. */
+  forceReserveHook?(
+    token: string,
+    owner: HookTokenOwner,
+    options?: { preempt?: boolean },
+  ): Promise<HookReservationResult>;
+  /** Publish a forced creation that committed: dispose the victim, then re-point the token. */
+  completeHookTakeover?(
+    token: string,
+    hookId: string,
+    serializedHook: string,
+    owner: HookTokenOwner,
+    reservation: HookReservation,
+  ): Promise<void>;
+  /** Finish or abandon a pending takeover of `token`, optionally only `claimer`'s. */
+  settleHookTakeover?(token: string, claimer?: HookTokenOwner): Promise<void>;
   finalizeHookIndexes(
     token: string,
     hookId: string,
@@ -226,7 +272,11 @@ async function inBatches<T>(
   return deleted;
 }
 
-export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIndex {
+type HookTakeoverOperations = 'forceReserveHook' | 'completeHookTakeover' | 'settleHookTakeover';
+
+export function createWorkflowIndex(
+  bindings: WorkflowIndexBindings,
+): WorkflowIndex & Required<Pick<WorkflowIndex, HookTakeoverOperations>> {
   const releaseHooks = async (request: ReleaseHookIndexesRequest): Promise<number> => {
     const tokenGroups = groupByShard(request.hooks, (hook) => hookTokenShardName(hook.token));
     const idGroups = groupByShard(request.hooks, (hook) => hookIdShardName(hook.hookId));
@@ -239,7 +289,10 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
             token: hook.token,
             owner: { runId: request.runId, hookId: hook.hookId },
           })),
-          (batch) => target.releaseBatch(batch),
+          (batch) =>
+            request.runEnded
+              ? target.releaseBatch(batch, { runEnded: true })
+              : target.releaseBatch(batch),
         ),
       );
     }
@@ -256,6 +309,62 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
       );
     }
     return (await Promise.all(releases)).reduce((total, count) => total + count, 0);
+  };
+
+  const reserveHook = async (
+    token: string,
+    owner: HookTokenOwner,
+    force?: { preempt?: boolean },
+  ): Promise<HookReservationResult> => {
+    const proposedClaimId = crypto.randomUUID();
+    const tokenTarget = stub(bindings.hookTokens, hookTokenShardName(token));
+    const tokenClaim: HookForceClaimResult = force
+      ? await tokenTarget.forceReserve(token, owner, proposedClaimId, force.preempt === true)
+      : await tokenTarget.reserve(token, owner, proposedClaimId);
+    if (!tokenClaim.claimed && !sameOwner(tokenClaim.holder, owner)) {
+      return {
+        admitted: false,
+        holder: tokenClaim.holder,
+        ...(tokenClaim.forceRefusedReason
+          ? { forceRefusedReason: tokenClaim.forceRefusedReason }
+          : {}),
+        ...(tokenClaim.pending ? { pending: true as const } : {}),
+      };
+    }
+
+    const tokenClaimId = tokenClaim.claimed ? tokenClaim.claimId : undefined;
+    const takeover = tokenClaim.claimed && tokenClaim.takeover ? tokenClaim : undefined;
+    const releaseTokenClaim = async () => {
+      if (takeover)
+        await tokenTarget.settleTakeover(token, { claimer: owner, claimId: tokenClaimId });
+      else if (tokenClaimId) await tokenTarget.releaseClaim(token, owner, tokenClaimId);
+    };
+    const hookIdTarget = stub(bindings.hookIds, hookIdShardName(owner.hookId));
+    const sharedClaimId = tokenClaimId ?? proposedClaimId;
+    let hookIdClaim: HookClaimResult;
+    try {
+      hookIdClaim = await hookIdTarget.reserve(owner.hookId, owner, sharedClaimId);
+    } catch (error) {
+      await Promise.allSettled([
+        releaseTokenClaim(),
+        hookIdTarget.releaseClaim(owner.hookId, owner, sharedClaimId),
+      ]);
+      throw error;
+    }
+    if (!hookIdClaim.claimed) {
+      await releaseTokenClaim();
+      return { admitted: false, holder: hookIdClaim.holder };
+    }
+
+    const reservation: HookReservation = {
+      claimId: `${tokenClaimId ?? '-'}:${hookIdClaim.claimId}`,
+      tokenClaimId,
+      hookIdClaimId: hookIdClaim.claimId,
+      ...(takeover ? { takeover: true as const } : {}),
+    };
+    return takeover
+      ? { admitted: true, reservation, claimedFrom: takeover.claimedFrom }
+      : { admitted: true, reservation };
   };
 
   return {
@@ -311,38 +420,32 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
       return stub(bindings.hookIds, hookIdShardName(hookId)).get(hookId);
     },
 
-    async reserveHook(token, owner) {
-      const proposedClaimId = crypto.randomUUID();
-      const tokenTarget = stub(bindings.hookTokens, hookTokenShardName(token));
-      const tokenClaim = await tokenTarget.reserve(token, owner, proposedClaimId);
-      if (!tokenClaim.claimed && !sameOwner(tokenClaim.holder, owner)) {
-        return { admitted: false, holder: tokenClaim.holder };
-      }
+    reserveHook(token, owner) {
+      return reserveHook(token, owner);
+    },
 
-      const tokenClaimId = tokenClaim.claimed ? tokenClaim.claimId : undefined;
-      const hookIdTarget = stub(bindings.hookIds, hookIdShardName(owner.hookId));
-      const sharedClaimId = tokenClaimId ?? proposedClaimId;
-      let hookIdClaim: HookClaimResult;
-      try {
-        hookIdClaim = await hookIdTarget.reserve(owner.hookId, owner, sharedClaimId);
-      } catch (error) {
-        await Promise.allSettled([
-          ...(tokenClaimId ? [tokenTarget.releaseClaim(token, owner, tokenClaimId)] : []),
-          hookIdTarget.releaseClaim(owner.hookId, owner, sharedClaimId),
-        ]);
-        throw error;
-      }
-      if (!hookIdClaim.claimed) {
-        if (tokenClaimId) await tokenTarget.releaseClaim(token, owner, tokenClaimId);
-        return { admitted: false, holder: hookIdClaim.holder };
-      }
+    forceReserveHook(token, owner, options) {
+      return reserveHook(token, owner, { preempt: options?.preempt });
+    },
 
-      const reservation: HookReservation = {
-        claimId: `${tokenClaimId ?? '-'}:${hookIdClaim.claimId}`,
-        tokenClaimId,
-        hookIdClaimId: hookIdClaim.claimId,
-      };
-      return { admitted: true, reservation };
+    async completeHookTakeover(token, hookId, serializedHook, owner, reservation) {
+      const hookIdTarget = stub(bindings.hookIds, hookIdShardName(hookId));
+      const settled = await stub(bindings.hookTokens, hookTokenShardName(token)).settleTakeover(
+        token,
+        { claimer: owner, claimId: reservation.tokenClaimId },
+      );
+      if (settled.owner && sameOwner(settled.owner, owner)) {
+        await hookIdTarget.publish(hookId, serializedHook, owner, reservation.hookIdClaimId);
+      } else if (reservation.hookIdClaimId) {
+        await hookIdTarget.releaseClaim(hookId, owner, reservation.hookIdClaimId);
+      }
+    },
+
+    async settleHookTakeover(token, claimer) {
+      await stub(bindings.hookTokens, hookTokenShardName(token)).settleTakeover(
+        token,
+        claimer ? { claimer } : undefined,
+      );
     },
 
     async finalizeHookIndexes(token, hookId, serializedHook, owner, reservation) {
@@ -362,8 +465,15 @@ export function createWorkflowIndex(bindings: WorkflowIndexBindings): WorkflowIn
     },
 
     async releaseHookReservation(token, owner, reservation) {
-      const releases: Array<Promise<void>> = [];
-      if (reservation.tokenClaimId) {
+      const releases: Array<Promise<unknown>> = [];
+      if (reservation.takeover) {
+        releases.push(
+          stub(bindings.hookTokens, hookTokenShardName(token)).settleTakeover(token, {
+            claimer: owner,
+            claimId: reservation.tokenClaimId,
+          }),
+        );
+      } else if (reservation.tokenClaimId) {
         releases.push(
           stub(bindings.hookTokens, hookTokenShardName(token)).releaseClaim(
             token,

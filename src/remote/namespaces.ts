@@ -181,6 +181,21 @@ export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
         callFleetRoute(transport, '/v1/index/hooks/reserve', [token, owner], {
           idempotent: true,
         }),
+      forceReserveHook: (token, owner, options) =>
+        callFleetRoute(transport, '/v1/index/hooks/force-reserve', [token, owner, options], {
+          idempotent: true,
+        }),
+      completeHookTakeover: (token, hookId, serializedHook, owner, reservation) =>
+        callFleetRoute(
+          transport,
+          '/v1/index/hooks/complete-takeover',
+          [token, hookId, serializedHook, owner, reservation],
+          { idempotent: true },
+        ),
+      settleHookTakeover: (token, claimer) =>
+        callFleetRoute(transport, '/v1/index/hooks/settle-takeover', [token, claimer], {
+          idempotent: true,
+        }),
       finalizeHookIndexes: (token, hookId, serializedHook, owner, reservation) =>
         callFleetRoute(
           transport,

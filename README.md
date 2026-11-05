@@ -24,8 +24,20 @@ Event slots are allocated in the same transaction that stores each event, so
 reads see a dense log and failed writes leave no gaps. No background sealing or
 `noop` events are needed.
 
-World v8 adds forced hook claims. This adapter does not advertise the optional
-`hookForceClaim` capability, so `experimental_force` is unavailable.
+The adapter advertises the optional `hookForceClaim` and `hookRetention`
+capabilities. `createHook({ experimental_force: true })` takes a token over from
+the run holding it: that run journals `hook_disposed` naming the claimer, and a
+delivery that had already resolved it fails with `HookForceClaimedError`, which
+`resumeHook()` follows to the new owner. A token held by a run below spec v8 is
+not taken; the creation gets a `hook_conflict` marked `victim-spec-version`.
+With `experimental_minRetention`, a hook's token stays reserved after its run
+ends until `tokenRetentionUntil`. `hooks.getByToken` still returns that hook,
+but it cannot be resumed, and a forced creation takes it over silently.
+Disposing the hook releases the token at once. The protocol is described in
+[docs/index-sharding.md](docs/index-sharding.md#forced-hook-claims-and-token-retention).
+Forced claims need a worker that has the `/v1/index/hooks/force-reserve`,
+`complete-takeover` and `settle-takeover` routes, so deploy the worker before
+the application.
 
 Run listing accepts either a single status or an array of statuses (OR matching).
 An empty status array matches no runs.

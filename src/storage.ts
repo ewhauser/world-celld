@@ -1,5 +1,6 @@
 import {
   EntityConflictError,
+  HookForceClaimedError,
   HookNotFoundError,
   RunExpiredError,
   RunNotSupportedError,
@@ -17,6 +18,7 @@ import type {
   GetStepParams,
   GetWorkflowRunParams,
   Hook,
+  HookClaimedFrom,
   ListEventsParams,
   ListHooksParams,
   ListWorkflowRunStepsParams,
@@ -118,6 +120,26 @@ export interface CloudflareStorageConfig {
   runRetentionMs?: number;
 }
 
+interface HookAdmission {
+  owner: HookTokenOwner;
+  reservation: HookReservation;
+  token: string;
+}
+
+/** Forced creations fenced by a concurrent forcer are re-admitted this many times. */
+const MAX_FORCED_HOOK_ADMISSIONS = 4;
+/**
+ * A forced creation waits this many times for another creation of the same
+ * token to finish, then fences it. Waiting lets concurrent forcers queue
+ * behind each other instead of fencing each other in turn.
+ */
+const MAX_FORCED_HOOK_WAITS = 6;
+const FORCED_HOOK_WAIT_MS = 10;
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
 function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
   return { runId: hook.runId, hookId: hook.hookId };
 }
@@ -126,6 +148,7 @@ const APPLY_EVENT_ERROR_CODES = new Set<string>([
   'RUN_NOT_FOUND',
   'STEP_NOT_FOUND',
   'HOOK_NOT_FOUND',
+  'HOOK_FORCE_CLAIMED',
   'WAIT_NOT_FOUND',
   'ENTITY_CONFLICT',
   'HOOK_CLAIM_CANCELLED',
@@ -145,6 +168,8 @@ interface ApplyEventWireFailure {
   runSpecVersion?: number;
   worldSpecVersion?: number;
   details?: unknown;
+  token?: string;
+  claimedBy?: HookTokenOwner;
 }
 
 type ParsedApplyEventOutcome =
@@ -227,6 +252,18 @@ function parseApplyEventOutcome(value: unknown): ParsedApplyEventOutcome {
     validateOptionalNumber(value, 'retryAfterSeconds', false);
     validateOptionalNumber(value, 'runSpecVersion', true);
     validateOptionalNumber(value, 'worldSpecVersion', true);
+    if (
+      value.code === 'HOOK_FORCE_CLAIMED' &&
+      (typeof value.token !== 'string' ||
+        value.token.length === 0 ||
+        !isRecord(value.claimedBy) ||
+        typeof value.claimedBy.runId !== 'string' ||
+        value.claimedBy.runId.length === 0 ||
+        typeof value.claimedBy.hookId !== 'string' ||
+        value.claimedBy.hookId.length === 0)
+    ) {
+      malformedApplyEventOutcome('HOOK_FORCE_CLAIMED must name the token and its claimer');
+    }
 
     const outcome = value as unknown as ApplyEventWireFailure;
     return APPLY_EVENT_ERROR_CODES.has(outcome.code)
@@ -397,6 +434,14 @@ function throwOutcomeError(
       throw new WorkflowWorldError(outcome.message, { status: 404, code: outcome.code });
     case 'HOOK_NOT_FOUND':
       throw withCode(new HookNotFoundError(data.correlationId ?? runId));
+    case 'HOOK_FORCE_CLAIMED':
+      throw withCode(
+        new HookForceClaimedError(
+          outcome.token!,
+          outcome.claimedBy!.runId,
+          outcome.claimedBy!.hookId,
+        ),
+      );
     case 'WAIT_NOT_FOUND':
       throw new WorkflowWorldError(outcome.message, { status: 404, code: outcome.code });
     case 'ENTITY_CONFLICT':
@@ -551,72 +596,100 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         }
 
         const stub = getRunDO(effectiveRunId);
+        const force =
+          data.eventType === 'hook_created' &&
+          data.eventData.force === true &&
+          env.WORKFLOW_INDEX.forceReserveHook !== undefined;
 
-        let tokenHolder: ApplyEventRequest['tokenHolder'];
-        let hookAdmission:
-          | { owner: HookTokenOwner; reservation: HookReservation; token: string }
-          | undefined;
-        if (data.eventType === 'hook_created') {
-          const owner = {
-            runId: effectiveRunId,
-            hookId: data.correlationId,
-          };
-          const admission = await env.WORKFLOW_INDEX.reserveHook(data.eventData.token, owner);
-          if (admission.admitted) {
-            tokenHolder = null;
-            hookAdmission = {
-              owner,
-              reservation: admission.reservation,
-              token: data.eventData.token,
-            };
-          } else {
-            tokenHolder = admission.holder;
-          }
-        }
-
-        // Guards, event append, and entity mutation run in ONE DO storage
-        // transaction (see apply-event.ts). The event is schema-validated
-        // before anything is persisted.
-        // A thrown RPC is commit-ambiguous. Resolve it inside the authoritative
-        // RunDO: that transaction either observes the committed hook or fences
-        // this exact reservation before its token/ID claims are released.
+        let hookAdmission: HookAdmission | undefined;
         let parsedOutcome: ParsedApplyEventOutcome;
-        try {
-          const wireOutcome: unknown = await stub.applyEvent({
-            runId: effectiveRunId,
-            data,
-            params,
-            tokenHolder,
-            hookClaimId: hookAdmission?.reservation.claimId,
-            cleanup,
-          });
-          parsedOutcome = parseApplyEventOutcome(wireOutcome);
-        } catch (error) {
-          if (hookAdmission) {
-            let resolution: { committed: boolean };
-            try {
-              resolution = await stub.resolveHookTokenClaim({
-                hookId: hookAdmission.owner.hookId,
-                token: hookAdmission.token,
-                claimId: hookAdmission.reservation.claimId,
-              });
-            } catch {
-              // Resolution is itself ambiguous, so fail closed and leave both
-              // claims for an exact same-reservation retry.
-              throw error;
+        let waits = 0;
+        let admissions = 0;
+        for (;;) {
+          let tokenHolder: ApplyEventRequest['tokenHolder'];
+          let claimedFrom: HookClaimedFrom | undefined;
+          let forceRefusedReason: ApplyEventRequest['forceRefusedReason'];
+          hookAdmission = undefined;
+          if (data.eventType === 'hook_created') {
+            const owner = {
+              runId: effectiveRunId,
+              hookId: data.correlationId,
+            };
+            const admission = force
+              ? await env.WORKFLOW_INDEX.forceReserveHook!(data.eventData.token, owner, {
+                  preempt: waits >= MAX_FORCED_HOOK_WAITS,
+                })
+              : await env.WORKFLOW_INDEX.reserveHook(data.eventData.token, owner);
+            if (!admission.admitted && admission.pending) {
+              await delay(FORCED_HOOK_WAIT_MS * 2 ** Math.min(waits++, 4));
+              continue;
             }
-            if (!resolution.committed) {
-              await env.WORKFLOW_INDEX.releaseHookReservation(
+            if (admission.admitted) {
+              tokenHolder = null;
+              claimedFrom = admission.claimedFrom;
+              hookAdmission = {
+                owner,
+                reservation: admission.reservation,
+                token: data.eventData.token,
+              };
+            } else {
+              tokenHolder = admission.holder;
+              forceRefusedReason = admission.forceRefusedReason;
+            }
+          }
+
+          // Guards, event append, and entity mutation run in ONE DO storage
+          // transaction (see apply-event.ts). The event is schema-validated
+          // before anything is persisted.
+          // A thrown RPC is commit-ambiguous. Resolve it inside the authoritative
+          // RunDO: that transaction either observes the committed hook or fences
+          // this exact reservation before its token/ID claims are released.
+          try {
+            const wireOutcome: unknown = await stub.applyEvent({
+              runId: effectiveRunId,
+              data,
+              params,
+              tokenHolder,
+              hookClaimId: hookAdmission?.reservation.claimId,
+              ...(claimedFrom ? { claimedFrom } : {}),
+              ...(forceRefusedReason ? { forceRefusedReason } : {}),
+              cleanup,
+            });
+            parsedOutcome = parseApplyEventOutcome(wireOutcome);
+          } catch (error) {
+            if (hookAdmission?.reservation.takeover) {
+              // Settling decides in the claimer's own cell: roll forward a
+              // journaled creation, or fence it and drop the intent. If it
+              // fails too, the shard's alarm settles the intent.
+              await env.WORKFLOW_INDEX.settleHookTakeover?.(
                 hookAdmission.token,
                 hookAdmission.owner,
-                hookAdmission.reservation,
-              );
+              ).catch(() => undefined);
+            } else if (hookAdmission) {
+              let resolution: { committed: boolean };
+              try {
+                resolution = await stub.resolveHookTokenClaim({
+                  hookId: hookAdmission.owner.hookId,
+                  token: hookAdmission.token,
+                  claimId: hookAdmission.reservation.claimId,
+                });
+              } catch {
+                // Resolution is itself ambiguous, so fail closed and leave both
+                // claims for an exact same-reservation retry.
+                throw error;
+              }
+              if (!resolution.committed) {
+                await env.WORKFLOW_INDEX.releaseHookReservation(
+                  hookAdmission.token,
+                  hookAdmission.owner,
+                  hookAdmission.reservation,
+                );
+              }
             }
+            throw error;
           }
-          throw error;
-        }
 
-        if (parsedOutcome.kind !== 'success') {
+          if (parsedOutcome.kind === 'success') break;
           if (hookAdmission) {
             await env.WORKFLOW_INDEX.releaseHookReservation(
               hookAdmission.token,
@@ -624,7 +697,19 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               hookAdmission.reservation,
             );
           }
-          throwOutcomeError(parsedOutcome.outcome, effectiveRunId, data);
+          const failure = parsedOutcome.outcome;
+          // Another forced creation fenced this one; admission sees it next time.
+          if (
+            force &&
+            failure.code === 'HOOK_CLAIM_CANCELLED' &&
+            ++admissions < MAX_FORCED_HOOK_ADMISSIONS
+          ) {
+            continue;
+          }
+          if (failure.code === 'HOOK_FORCE_CLAIMED') {
+            await env.WORKFLOW_INDEX.settleHookTakeover?.(failure.token!, failure.claimedBy);
+          }
+          throwOutcomeError(failure, effectiveRunId, data);
         }
         const outcome = parsedOutcome.outcome;
 
@@ -643,7 +728,15 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             outcome.indexPublicationExpiresAt,
           );
         }
-        if (outcome.hookToIndex) {
+        if (outcome.hookToIndex && hookAdmission?.reservation.takeover) {
+          await env.WORKFLOW_INDEX.completeHookTakeover!(
+            outcome.hookToIndex.token,
+            outcome.hookToIndex.hookId,
+            stringify(outcome.hookToIndex),
+            hookOwner(outcome.hookToIndex),
+            hookAdmission.reservation,
+          );
+        } else if (outcome.hookToIndex) {
           const serialized = stringify(outcome.hookToIndex);
           await env.WORKFLOW_INDEX.finalizeHookIndexes(
             outcome.hookToIndex.token,

@@ -1,6 +1,7 @@
 import { DurableObject } from '../do-base.js';
 import {
   createWorkflowIndex,
+  hookIdShardName,
   type HookIdShardStub,
   type HookTokenShardStub,
   type RunCatalogShardStub,
@@ -10,6 +11,7 @@ import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
 import { isTerminalWorkflowRunStatus, slotToEventId, WorkflowRunSchema } from '@workflow/world';
 import {
   applyEvent,
+  applyForcedHookDisposal,
   finalizeEventPage,
   hookClaimCancellationKey,
   type ApplyEventOutcome,
@@ -21,6 +23,7 @@ import {
   listByCreationTime,
   listByPrefix,
   parseApplyEventRequest,
+  resolveForcedHookClaim,
   STEP_CREATED_KEY_PREFIX,
   STEP_KEY_PREFIX,
   WAIT_KEY_PREFIX,
@@ -36,6 +39,7 @@ import {
   type ExpireStreamResult,
   type FinalizeRunStreamsResult,
   expiredRead,
+  type ForceClaimVictim,
   HOOK_MARKER_PREFIX,
   type HookIndexReference,
   hookMarkerKey,
@@ -120,6 +124,10 @@ const RUN_QUEUE_CLAIM_PREFIX = 'queue-claim:';
  */
 export const RUN_QUEUE_CLAIM_SCOPE_KEY = 'queue-claim-scope';
 type TerminalRun = Extract<WorkflowRun, { status: 'completed' | 'failed' | 'cancelled' }>;
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
 
 function validateCleanupRequest(request: unknown, allowDisabled: boolean): ScheduleCleanupRequest {
   if (!isRecord(request)) {
@@ -470,6 +478,94 @@ export class WorkflowRunDO extends DurableObject {
       const hook = await txn.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
       if (!hook || (request.token !== undefined && hook.token !== request.token)) return null;
       return hook;
+    });
+  }
+
+  /** What a forced takeover needs to know about the run that holds the token. */
+  async describeForceClaimVictim(): Promise<ForceClaimVictim> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      const values = await txn.get<RunTombstone | CleanupRecord | WorkflowRun>([
+        TOMBSTONE_KEY,
+        CLEANUP_RECORD_KEY,
+        'run',
+      ]);
+      if (this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>)) {
+        return { lifecycle: 'expired' };
+      }
+      const run = values.get('run') as WorkflowRun | undefined;
+      if (!run) return { lifecycle: 'missing' };
+      return {
+        lifecycle: isTerminalWorkflowRunStatus(run.status) ? 'terminal' : 'active',
+        workflowName: run.workflowName,
+        deploymentId: run.deploymentId,
+        specVersion: run.specVersion,
+      };
+    });
+  }
+
+  /** Journal another run's takeover of one of this run's hooks; idempotent. */
+  async forceDisposeHook(request: {
+    hookId: string;
+    token: string;
+    claimedBy: { runId: string; hookId: string };
+  }): Promise<{ journaled: boolean }> {
+    if (
+      !isRecord(request) ||
+      !isNonEmptyString(request.hookId) ||
+      !isNonEmptyString(request.token) ||
+      !isRecord(request.claimedBy) ||
+      !isNonEmptyString(request.claimedBy.runId) ||
+      !isNonEmptyString(request.claimedBy.hookId)
+    ) {
+      throw new TypeError('world-celld forced hook disposal is invalid');
+    }
+    const runId = this.ctx.id.name ?? this.ctx.id.toString();
+    const result = await this.ctx.storage.transaction(async (txn) => {
+      const retention = await this.retentionState(txn, this.now(), { withEventSequence: true });
+      if (retention.tombstone) return { journaled: false };
+      let eventSequence = retention.eventSequence;
+      const disposal = await applyForcedHookDisposal(storeFrom(txn), request, {
+        runId,
+        nextEventId: () => slotToEventId(++eventSequence),
+        now: new Date(this.now()),
+      });
+      if (eventSequence !== retention.eventSequence) {
+        await txn.put(EVENT_SEQUENCE_KEY, eventSequence);
+      }
+      return disposal;
+    });
+    const hookIds = this.namespace<HookIdShardStub>('WORKFLOW_HOOK_IDS');
+    await hookIds
+      .get(hookIds.idFromName(hookIdShardName(request.hookId)))
+      .releaseBatch([{ hookId: request.hookId, owner: { runId, hookId: request.hookId } }]);
+    return result;
+  }
+
+  /**
+   * Decide a pending forced takeover by this run: journaled, or fenced so the
+   * exact reservation can never commit.
+   */
+  async resolveForcedHookClaim(request: {
+    hookId: string;
+    token: string;
+    claimId: string;
+    victim: { runId: string; hookId: string };
+  }): Promise<{ journaled: boolean; hook: Hook | null }> {
+    if (
+      !isRecord(request) ||
+      !isNonEmptyString(request.hookId) ||
+      !isNonEmptyString(request.token) ||
+      !isNonEmptyString(request.claimId) ||
+      !isRecord(request.victim) ||
+      !isNonEmptyString(request.victim.runId) ||
+      !isNonEmptyString(request.victim.hookId)
+    ) {
+      throw new TypeError('world-celld forced hook claim resolution is invalid');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const { tombstone } = await this.retentionState(txn);
+      if (tombstone) return { journaled: false, hook: null };
+      return await resolveForcedHookClaim(storeFrom(txn), request, this.now());
     });
   }
 
@@ -936,6 +1032,7 @@ export class WorkflowRunDO extends DurableObject {
       await this.workflowIndex().releaseHookIndexes({
         runId: cleanup.runId,
         hooks: Array.from(references.values()),
+        runEnded: true,
       });
     }
 
@@ -982,6 +1079,7 @@ export class WorkflowRunDO extends DurableObject {
     await this.workflowIndex().releaseHookIndexes({
       runId: cleanup.runId,
       hooks: page.map((hook) => ({ hookId: hook.hookId, token: hook.token })),
+      runEnded: true,
     });
 
     await this.ctx.storage.transaction(async (txn) => {
@@ -1018,6 +1116,7 @@ export class WorkflowRunDO extends DurableObject {
     await this.workflowIndex().releaseHookIndexes({
       runId: cleanup.runId,
       hooks: page.map(([, reference]) => reference),
+      runEnded: true,
     });
 
     await this.ctx.storage.transaction(async (txn) => {

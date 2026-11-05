@@ -173,6 +173,57 @@ idempotent publications:
 - terminal and expiry fences hide hook records immediately even while bounded
   physical cleanup pages remain.
 
+## Forced hook claims and token retention
+
+A forced `hook_created` whose token has a live owner (the victim) does not
+conflict. The token shard writes a takeover intent naming the claimer, the
+victim and a claim ID, while the token record keeps naming the victim. The
+order of the steps after that is the protocol:
+
+1. The claimer's RunDO journals `hook_created{force, forceClaimedFrom}` and the
+   claimer's hook with `claimedFrom`, under the intent's claim ID. If anyone
+   settled the intent first, that claim ID is fenced in the claimer's RunDO and
+   the creation is refused with `HOOK_CLAIM_CANCELLED`. The client then admits
+   it again, and it takes the token from whoever holds it now.
+2. Settling the intent asks the claimer's RunDO whether that creation is
+   journaled against this victim. If it is not, the claim ID is fenced and the
+   intent is dropped, leaving the victim in place. If it is, the victim's RunDO
+   removes the hook and writes `hook_disposed{forceClaimedBy}` and a
+   force-claim marker in one transaction. A later `hook_received` for that hook
+   sees the marker and is refused.
+3. Only then does one token-shard transaction point the record at the
+   claimer's hook and delete the intent. The victim's hook-ID record is
+   released.
+
+Why this is safe:
+
+- The victim is never disposed for a creation that did not commit, because step
+  2 disposes it only after the claimer's log shows the creation.
+- The token never resolves to nothing. Until step 3 it resolves to the victim.
+  A delivery that reaches the disposed victim settles the intent, which
+  finishes step 3, and then fails with `HookForceClaimedError` naming the
+  claimer. `resumeHook()` retries there.
+- Every step is idempotent and keyed by the claim ID, so the creating client,
+  a refused delivery, a competing forcer and the shard alarm can all settle
+  the same intent. The alarm settles an abandoned intent after
+  `HOOK_TAKEOVER_SETTLE_MS`.
+- Concurrent forcers queue. A forcer that finds another creation of the token
+  in flight waits briefly, then fences it. So the forcers take the token one
+  after another, and each one is disposed by the next.
+
+A running victim below spec v8 cannot read `forceClaimedBy`, so the claimer
+gets `hook_conflict{forceRefusedReason: 'victim-spec-version'}`. A finished run
+that holds a token only under retention gets no row; the claimer's
+`claimedFrom` names it without the wake fields. A finished run whose token is
+not retained does not block the token.
+
+Retention is in the token shard. When a run ends, terminal cleanup releases
+its hooks with `runEnded`. A record whose `tokenRetentionUntil` is still ahead
+is kept, with a retained marker and a deadline that the alarm compacts. Until
+then the token blocks unforced creation and still resolves by token. The run
+is terminal, so `hook_received` is refused. Disposal and run expiry release
+the token at once.
+
 Focused tests cover deterministic distribution, UTF-8 byte-ordered merged
 forward/reverse pagination, same-token contention, hook-ID collisions, token
 reuse, exact-claim cancellation, delayed-finalization fences, catalog

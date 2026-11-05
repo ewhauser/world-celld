@@ -1,6 +1,8 @@
-import type { Hook } from '@workflow/world';
+import type { Hook, HookClaimedFrom } from '@workflow/world';
+import { SPEC_VERSION_LEGACY, SPEC_VERSION_SUPPORTS_HOOK_FORCE_CLAIM } from '@workflow/world';
 import type { HookTokenOwner } from '../../config.js';
-import { stringify } from '../../vendor/shared/index.js';
+import type { HookForceClaimResult } from '../../indexes.js';
+import { parse, stringify } from '../../vendor/shared/index.js';
 import { DurableObject } from '../do-base.js';
 import {
   confirmRepublished,
@@ -8,13 +10,17 @@ import {
   ownerFromSerializedHook,
   publishCommittedClaim,
   resolveExpiredHookClaim,
+  retentionAhead,
+  runCell,
   runIsActive,
   sameOwner,
+  tokenRetentionUntil,
   type HookIndexEnv,
   warnRepublished,
 } from './hook-index-shared.js';
 import {
   HOOK_CLAIM_LEASE_MS,
+  HOOK_TAKEOVER_SETTLE_MS,
   LIFECYCLE_COMPACTION_BATCH,
   LIFECYCLE_COMPACTION_RETRY_MS,
 } from '../../lifecycle.js';
@@ -27,13 +33,46 @@ interface HookClaim {
   deadlineKey: string;
 }
 
+/** A token kept past its run's end under `tokenRetentionUntil`. */
+interface RetainedToken {
+  owner: HookTokenOwner;
+  until: number;
+  deadlineKey: string;
+}
+
+/**
+ * A forced creation taking the token from `victim`. The record keeps naming
+ * the victim until the claimer's hook_created is journaled and the victim is
+ * disposed; only then is it re-pointed.
+ */
+interface HookTakeover {
+  claimer: HookTokenOwner;
+  claimId: string;
+  victim: HookTokenOwner;
+  victimRunning: boolean;
+  claimedFrom: HookClaimedFrom;
+  expiresAt: number;
+  deadlineKey: string;
+}
+
 const MAX_RELEASE_BATCH = 64;
 const CLAIM_DEADLINE_PREFIX = 'claim-deadline:';
+const RETAINED_DEADLINE_PREFIX = 'retained-deadline:';
+const TAKEOVER_DEADLINE_PREFIX = 'takeover-deadline:';
+const DEADLINE_PREFIXES = [
+  CLAIM_DEADLINE_PREFIX,
+  RETAINED_DEADLINE_PREFIX,
+  TAKEOVER_DEADLINE_PREFIX,
+] as const;
 
 interface ClaimDeadline {
   token: string;
   claimId: string;
   expiresAt: number;
+}
+
+interface TokenDeadline {
+  token: string;
 }
 
 function pad(ms: number): string {
@@ -48,9 +87,23 @@ function claimKey(token: string): string {
   return indexKey('claim', token);
 }
 
-function claimDeadlineKey(token: string, expiresAt: number): string {
-  return `${CLAIM_DEADLINE_PREFIX}${pad(expiresAt)}:${encodeURIComponent(token)}`;
+function retainedKey(token: string): string {
+  return indexKey('retained', token);
 }
+
+function takeoverKey(token: string): string {
+  return indexKey('takeover', token);
+}
+
+function deadlineKey(prefix: string, token: string, at: number): string {
+  return `${prefix}${pad(at)}:${encodeURIComponent(token)}`;
+}
+
+function deadlineAt(prefix: string, key: string): number {
+  return Number(key.slice(prefix.length, prefix.length + 13));
+}
+
+type TokenValue = string | HookClaim | RetainedToken | HookTakeover;
 
 /** Token-ownership shard. A token hashes to exactly one shard and transaction domain. */
 export class HookTokenDO extends DurableObject<HookIndexEnv> {
@@ -70,6 +123,7 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         token,
       ));
     if (!raw) return null;
+    if (retentionAhead(parse<Hook>(raw), this.now())) return raw;
     const owner = ownerFromSerializedHook(raw);
     return (await runIsActive(this.env, owner.runId)) ? raw : null;
   }
@@ -88,13 +142,18 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
       const result = await this.ctx.storage.transaction(async (txn) => {
         const record = recordKey(token);
         const claim = claimKey(token);
-        const values = await txn.get<string | HookClaim>([record, claim]);
+        const values = await txn.get<TokenValue>([
+          record,
+          claim,
+          retainedKey(token),
+          takeoverKey(token),
+        ]);
+        const now = this.now();
         const indexed = values.get(record) as string | undefined;
-        if (indexed !== undefined) {
+        if (indexed !== undefined && !(await this.freeExpiredRetention(txn, token, values, now))) {
           return { claimed: false as const, holder: ownerFromSerializedHook(indexed) };
         }
         let existing = values.get(claim) as HookClaim | undefined;
-        const now = this.now();
         if (existing && existing.expiresAt <= now) {
           if (existing.claimId !== expired?.claimId || existing.expiresAt !== expired.expiresAt) {
             return null;
@@ -113,15 +172,15 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         }
         if (existing === undefined) {
           const expiresAt = now + HOOK_CLAIM_LEASE_MS;
-          const deadlineKey = claimDeadlineKey(token, expiresAt);
+          const deadline = deadlineKey(CLAIM_DEADLINE_PREFIX, token, expiresAt);
           await txn.put(claim, {
             owner,
             claimId: proposedClaimId,
             reservedAt: now,
             expiresAt,
-            deadlineKey,
+            deadlineKey: deadline,
           } satisfies HookClaim);
-          await txn.put<ClaimDeadline>(deadlineKey, { token, claimId: proposedClaimId, expiresAt });
+          await txn.put<ClaimDeadline>(deadline, { token, claimId: proposedClaimId, expiresAt });
           await this.armAtMost(txn, expiresAt);
           return { claimed: true as const, claimId: proposedClaimId };
         }
@@ -131,13 +190,164 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     }
   }
 
+  /**
+   * Reserve for `experimental_force`. A live holder is not a conflict: the
+   * token is taken over through a durable intent that `settleTakeover`
+   * finishes once the claimer's hook_created is journaled. Another hook's
+   * creation still in flight is answered `pending` so the caller waits for
+   * it; with `preempt` it is fenced instead, so it cannot commit behind us.
+   */
+  async forceReserve(
+    token: string,
+    owner: HookTokenOwner,
+    proposedClaimId: string,
+    preempt = false,
+  ): Promise<HookForceClaimResult> {
+    for (;;) {
+      const values = await this.ctx.storage.get<TokenValue>([
+        recordKey(token),
+        claimKey(token),
+        takeoverKey(token),
+      ]);
+      const pending = values.get(takeoverKey(token)) as HookTakeover | undefined;
+      if (pending) {
+        if (sameOwner(pending.claimer, owner)) {
+          return {
+            claimed: true,
+            claimId: pending.claimId,
+            takeover: true,
+            claimedFrom: pending.claimedFrom,
+          };
+        }
+        if (!preempt && pending.expiresAt > this.now()) {
+          return { claimed: false, holder: pending.claimer, pending: true };
+        }
+        await this.settleTakeover(token);
+        continue;
+      }
+
+      const indexed = values.get(recordKey(token)) as string | undefined;
+      if (indexed === undefined) {
+        const claim = values.get(claimKey(token)) as HookClaim | undefined;
+        if (claim && !sameOwner(claim.owner, owner)) {
+          if (!preempt && claim.expiresAt > this.now()) {
+            return { claimed: false, holder: claim.owner, pending: true };
+          }
+          await this.preemptClaim(token, claim);
+          continue;
+        }
+        const result = await this.reserve(token, owner, proposedClaimId);
+        if (result.claimed || sameOwner(result.holder, owner)) return result;
+        continue;
+      }
+
+      const victimHook = parse<Hook>(indexed);
+      const victim = { runId: victimHook.runId, hookId: victimHook.hookId };
+      if (sameOwner(victim, owner)) return { claimed: false, holder: owner };
+      const described = await runCell(this.env, victim.runId).describeForceClaimVictim();
+      const victimRunning = described.lifecycle === 'active';
+      if (
+        victimRunning &&
+        (described.specVersion ?? SPEC_VERSION_LEGACY) < SPEC_VERSION_SUPPORTS_HOOK_FORCE_CLAIM
+      ) {
+        return { claimed: false, holder: victim, forceRefusedReason: 'victim-spec-version' };
+      }
+      // A finished run's token is only taken over while retention holds it;
+      // otherwise it is simply free.
+      const takeOver = victimRunning || retentionAhead(victimHook, this.now());
+      const claimedFrom: HookClaimedFrom =
+        described.lifecycle === 'active'
+          ? {
+              ...victim,
+              workflowName: described.workflowName,
+              deploymentId: described.deploymentId,
+              runSpecVersion: described.specVersion,
+            }
+          : victim;
+      const intent = await this.ctx.storage.transaction(async (txn) => {
+        const current = await txn.get<TokenValue>([
+          recordKey(token),
+          retainedKey(token),
+          takeoverKey(token),
+        ]);
+        if (current.get(recordKey(token)) !== indexed || current.has(takeoverKey(token))) {
+          return null;
+        }
+        if (!takeOver) {
+          const retained = current.get(retainedKey(token)) as RetainedToken | undefined;
+          await txn.delete([
+            recordKey(token),
+            ...(retained ? [retainedKey(token), retained.deadlineKey] : []),
+          ]);
+          return null;
+        }
+        const expiresAt = this.now() + HOOK_TAKEOVER_SETTLE_MS;
+        const takeover: HookTakeover = {
+          claimer: owner,
+          claimId: proposedClaimId,
+          victim,
+          victimRunning,
+          claimedFrom,
+          expiresAt,
+          deadlineKey: deadlineKey(TAKEOVER_DEADLINE_PREFIX, token, expiresAt),
+        };
+        await txn.put(takeoverKey(token), takeover);
+        await txn.put<TokenDeadline>(takeover.deadlineKey, { token });
+        await this.armAtMost(txn, expiresAt);
+        return takeover;
+      });
+      if (intent) {
+        return { claimed: true, claimId: intent.claimId, takeover: true, claimedFrom };
+      }
+    }
+  }
+
+  /**
+   * Decide the pending takeover of `token` from the claimer's log: roll it
+   * forward if its hook_created is journaled, otherwise fence the claimer and
+   * drop the intent. Returns who holds the token afterwards.
+   */
+  async settleTakeover(
+    token: string,
+    match?: { claimer: HookTokenOwner; claimId?: string },
+  ): Promise<{ owner: HookTokenOwner | null }> {
+    const intent = await this.ctx.storage.get<HookTakeover>(takeoverKey(token));
+    if (
+      intent &&
+      (!match ||
+        (sameOwner(intent.claimer, match.claimer) &&
+          (match.claimId === undefined || match.claimId === intent.claimId)))
+    ) {
+      const resolution = await runCell(this.env, intent.claimer.runId).resolveForcedHookClaim({
+        hookId: intent.claimer.hookId,
+        token,
+        claimId: intent.claimId,
+        victim: intent.victim,
+      });
+      if (resolution.journaled) {
+        await this.rollForward(token, intent, resolution.hook);
+      } else {
+        await this.ctx.storage.transaction(async (txn) => {
+          const current = await txn.get<HookTakeover>(takeoverKey(token));
+          if (current?.claimId === intent.claimId) {
+            await txn.delete([takeoverKey(token), intent.deadlineKey]);
+          }
+        });
+      }
+    }
+    const raw = await this.ctx.storage.get<string>(recordKey(token));
+    return { owner: raw === undefined ? null : ownerFromSerializedHook(raw) };
+  }
+
   async finalize(
     token: string,
     serializedHook: string,
     owner: HookTokenOwner,
     claimId?: string,
   ): Promise<{ stored: boolean }> {
-    if (!(await runIsActive(this.env, owner.runId))) {
+    const active = await runIsActive(this.env, owner.runId);
+    const retainedUntil = tokenRetentionUntil(parse<Hook>(serializedHook));
+    if (!active && !(retainedUntil !== undefined && retainedUntil > this.now())) {
       await this.releaseBatch([{ token, owner }]);
       return { stored: false };
     }
@@ -167,6 +377,9 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
       }
       await txn.put(record, serializedHook);
       if (existingClaim !== undefined) await txn.delete([claim, existingClaim.deadlineKey]);
+      if (!active && retainedUntil !== undefined) {
+        await this.retain(txn, token, owner, retainedUntil);
+      }
       return { stored: true };
     });
   }
@@ -183,12 +396,18 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
 
   async releaseBatch(
     hooks: Array<{ token: string; owner: HookTokenOwner }>,
+    options?: { runEnded?: boolean },
   ): Promise<{ deleted: number }> {
     if (hooks.length > MAX_RELEASE_BATCH) throw new Error('Hook token release batch is too large');
     if (hooks.length === 0) return { deleted: 0 };
     return await this.ctx.storage.transaction(async (txn) => {
-      const keys = hooks.flatMap(({ token }) => [recordKey(token), claimKey(token)]);
-      const values = await txn.get<string | HookClaim>(keys);
+      const keys = hooks.flatMap(({ token }) => [
+        recordKey(token),
+        claimKey(token),
+        retainedKey(token),
+      ]);
+      const values = await txn.get<TokenValue>(keys);
+      const now = this.now();
       const deletes: string[] = [];
       const deadlineDeletes: string[] = [];
       for (const { token, owner } of hooks) {
@@ -196,8 +415,15 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         const claim = claimKey(token);
         const indexed = values.get(record) as string | undefined;
         const existingClaim = values.get(claim) as HookClaim | undefined;
+        const retained = values.get(retainedKey(token)) as RetainedToken | undefined;
         if (indexed !== undefined && sameOwner(ownerFromSerializedHook(indexed), owner)) {
-          deletes.push(record);
+          const until = tokenRetentionUntil(parse<Hook>(indexed));
+          if (options?.runEnded && until !== undefined && until > now) {
+            if (!retained) await this.retain(txn, token, owner, until);
+          } else {
+            deletes.push(record);
+            if (retained) deadlineDeletes.push(retainedKey(token), retained.deadlineKey);
+          }
         }
         if (existingClaim !== undefined && sameOwner(existingClaim.owner, owner)) {
           deletes.push(claim);
@@ -212,7 +438,10 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
 
   async alarm(): Promise<void> {
     try {
-      await this.compactClaims();
+      const moreClaims = await this.compactClaims();
+      const moreRetained = await this.compactRetained();
+      const moreTakeovers = await this.compactTakeovers();
+      await this.rearm(moreClaims || moreRetained || moreTakeovers);
     } catch {
       await this.ctx.storage.setAlarm(this.now() + LIFECYCLE_COMPACTION_RETRY_MS);
     }
@@ -223,6 +452,106 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     if (current === null || at < current) await storage.setAlarm(at);
   }
 
+  private async rearm(more: boolean): Promise<void> {
+    const now = this.now();
+    if (more) {
+      await this.ctx.storage.setAlarm(now + 1);
+      return;
+    }
+    let next: number | undefined;
+    for (const prefix of DEADLINE_PREFIXES) {
+      const first = await this.ctx.storage.list({ prefix, limit: 1 });
+      const key = first.keys().next().value;
+      if (key !== undefined) next = Math.min(next ?? Infinity, deadlineAt(prefix, key));
+    }
+    if (next === undefined) await this.ctx.storage.deleteAlarm();
+    else await this.ctx.storage.setAlarm(Math.max(now + 1, next));
+  }
+
+  private async retain(
+    txn: DurableObjectTransaction,
+    token: string,
+    owner: HookTokenOwner,
+    until: number,
+  ): Promise<void> {
+    const deadline = deadlineKey(RETAINED_DEADLINE_PREFIX, token, until);
+    await txn.put<RetainedToken>(retainedKey(token), { owner, until, deadlineKey: deadline });
+    await txn.put<TokenDeadline>(deadline, { token });
+    await this.armAtMost(txn, until);
+  }
+
+  /** Drop a finished run's record once its retention passed; false while it still holds. */
+  private async freeExpiredRetention(
+    txn: DurableObjectTransaction,
+    token: string,
+    values: Map<string, TokenValue>,
+    now: number,
+  ): Promise<boolean> {
+    const indexed = values.get(recordKey(token)) as string | undefined;
+    const retained = values.get(retainedKey(token)) as RetainedToken | undefined;
+    if (
+      indexed === undefined ||
+      !retained ||
+      retained.until > now ||
+      values.has(takeoverKey(token)) ||
+      !sameOwner(ownerFromSerializedHook(indexed), retained.owner)
+    ) {
+      return false;
+    }
+    await txn.delete([recordKey(token), retainedKey(token), retained.deadlineKey]);
+    return true;
+  }
+
+  /** Fence another hook's in-flight creation, publishing it instead if it already committed. */
+  private async preemptClaim(token: string, observed: HookClaim): Promise<void> {
+    const hook = await resolveExpiredHookClaim(this.env, observed.owner, observed.claimId, token);
+    const published = await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<HookClaim>(claimKey(token));
+      if (current?.claimId !== observed.claimId) return false;
+      if (hook) await txn.put(recordKey(token), stringify(hook));
+      await txn.delete([claimKey(token), current.deadlineKey]);
+      return hook !== null;
+    });
+    if (published) {
+      warnRepublished(observed.owner);
+      await confirmRepublished(this.ctx.storage, this.env, recordKey(token), observed.owner, token);
+    }
+  }
+
+  /**
+   * The claimer's hook_created is journaled: dispose the victim (its
+   * hook_disposed row and delivery fence commit together), then re-point the
+   * record. Every step is idempotent, so any settler may repeat it.
+   */
+  private async rollForward(token: string, intent: HookTakeover, hook: Hook | null): Promise<void> {
+    if (intent.victimRunning) {
+      await runCell(this.env, intent.victim.runId).forceDisposeHook({
+        hookId: intent.victim.hookId,
+        token,
+        claimedBy: intent.claimer,
+      });
+    }
+    const written = await this.ctx.storage.transaction(async (txn) => {
+      const current = await txn.get<TokenValue>([takeoverKey(token), retainedKey(token)]);
+      if (
+        (current.get(takeoverKey(token)) as HookTakeover | undefined)?.claimId !== intent.claimId
+      ) {
+        return false;
+      }
+      const retained = current.get(retainedKey(token)) as RetainedToken | undefined;
+      const deletes = [takeoverKey(token), intent.deadlineKey];
+      if (retained) deletes.push(retainedKey(token), retained.deadlineKey);
+      // The claimer disposed its hook or ended since journaling: nobody holds the token.
+      if (hook) await txn.put(recordKey(token), stringify(hook));
+      else deletes.push(recordKey(token));
+      await txn.delete(deletes);
+      return hook !== null;
+    });
+    if (written) {
+      await confirmRepublished(this.ctx.storage, this.env, recordKey(token), intent.claimer, token);
+    }
+  }
+
   private async renewClaim(
     txn: DurableObjectTransaction,
     token: string,
@@ -230,21 +559,27 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     now: number,
   ): Promise<void> {
     const expiresAt = now + HOOK_CLAIM_LEASE_MS;
-    const deadlineKey = claimDeadlineKey(token, expiresAt);
+    const deadline = deadlineKey(CLAIM_DEADLINE_PREFIX, token, expiresAt);
     await txn.delete(claim.deadlineKey);
-    await txn.put(claimKey(token), { ...claim, expiresAt, deadlineKey });
-    await txn.put<ClaimDeadline>(deadlineKey, { token, claimId: claim.claimId, expiresAt });
+    await txn.put(claimKey(token), { ...claim, expiresAt, deadlineKey: deadline });
+    await txn.put<ClaimDeadline>(deadline, { token, claimId: claim.claimId, expiresAt });
     await this.armAtMost(txn, expiresAt);
   }
 
-  private async compactClaims(): Promise<void> {
-    const now = this.now();
-    const due = await this.ctx.storage.list<ClaimDeadline>({
-      prefix: CLAIM_DEADLINE_PREFIX,
-      end: `${CLAIM_DEADLINE_PREFIX}${pad(now + 1)}`,
+  private async dueDeadlines<T>(prefix: string, now: number): Promise<Array<[string, T]>> {
+    const due = await this.ctx.storage.list<T>({
+      prefix,
+      end: `${prefix}${pad(now + 1)}`,
       limit: LIFECYCLE_COMPACTION_BATCH + 1,
     });
-    const page = Array.from(due).slice(0, LIFECYCLE_COMPACTION_BATCH);
+    return Array.from(due);
+  }
+
+  /** Returns true when more due claims remain than one batch holds. */
+  private async compactClaims(): Promise<boolean> {
+    const now = this.now();
+    const due = await this.dueDeadlines<ClaimDeadline>(CLAIM_DEADLINE_PREFIX, now);
+    const page = due.slice(0, LIFECYCLE_COMPACTION_BATCH);
     const observed = await this.ctx.storage.get<HookClaim>(
       page.map(([, item]) => claimKey(item.token)),
     );
@@ -286,18 +621,45 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
       for (let offset = 0; offset < deletes.length; offset += LIFECYCLE_COMPACTION_BATCH) {
         await txn.delete(deletes.slice(offset, offset + LIFECYCLE_COMPACTION_BATCH));
       }
-      if (due.size > LIFECYCLE_COMPACTION_BATCH) {
-        await txn.setAlarm(now + 1);
-        return;
-      }
-      const next = await txn.list<ClaimDeadline>({ prefix: CLAIM_DEADLINE_PREFIX, limit: 1 });
-      const nextAt = next.values().next().value?.expiresAt;
-      if (nextAt === undefined) await txn.deleteAlarm();
-      else await txn.setAlarm(Math.max(now + 1, nextAt));
     });
     for (const { token, owner } of published) {
       warnRepublished(owner);
       await confirmRepublished(this.ctx.storage, this.env, recordKey(token), owner, token);
     }
+    return due.length > LIFECYCLE_COMPACTION_BATCH;
+  }
+
+  private async compactRetained(): Promise<boolean> {
+    const now = this.now();
+    const due = await this.dueDeadlines<TokenDeadline>(RETAINED_DEADLINE_PREFIX, now);
+    const page = due.slice(0, LIFECYCLE_COMPACTION_BATCH);
+    await this.ctx.storage.transaction(async (txn) => {
+      for (const [deadline, { token }] of page) {
+        const values = await txn.get<TokenValue>([
+          recordKey(token),
+          retainedKey(token),
+          takeoverKey(token),
+        ]);
+        const retained = values.get(retainedKey(token)) as RetainedToken | undefined;
+        if (retained?.deadlineKey === deadline) {
+          await this.freeExpiredRetention(txn, token, values, now);
+        }
+        // A takeover pending on this token clears the marker when it settles.
+        await txn.delete(deadline);
+      }
+    });
+    return due.length > LIFECYCLE_COMPACTION_BATCH;
+  }
+
+  private async compactTakeovers(): Promise<boolean> {
+    const now = this.now();
+    const due = await this.dueDeadlines<TokenDeadline>(TAKEOVER_DEADLINE_PREFIX, now);
+    const page = due.slice(0, LIFECYCLE_COMPACTION_BATCH);
+    for (const [deadline, { token }] of page) {
+      const intent = await this.ctx.storage.get<HookTakeover>(takeoverKey(token));
+      if (intent?.deadlineKey === deadline) await this.settleTakeover(token);
+      else await this.ctx.storage.delete(deadline);
+    }
+    return due.length > LIFECYCLE_COMPACTION_BATCH;
   }
 }
