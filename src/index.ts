@@ -151,7 +151,9 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     // run when run_created has not landed yet.
     specVersion: SPEC_VERSION_CURRENT,
     capabilities: {
-      hookRetention: { active: true },
+      // Retention lives in the index's token shards; an injected index must
+      // opt in, since releasing a run's hooks would otherwise drop them.
+      hookRetention: { active: env.WORKFLOW_INDEX.retainsHookTokens === true },
       // An injected index without the takeover operations cannot honor force.
       hookForceClaim:
         typeof env.WORKFLOW_INDEX.forceReserveHook === 'function' &&

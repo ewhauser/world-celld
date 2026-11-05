@@ -140,6 +140,30 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+/**
+ * A forced creation's RPC failed without saying whether it committed.
+ * Settling decides that in the claimer's own cell: a journaled creation is
+ * rolled forward, an unjournaled one is fenced and its intent dropped. The
+ * hook-ID claim then follows the token: published while the claimer holds
+ * it, released otherwise. If settling fails, both claims are left for the
+ * shard alarms to resolve.
+ */
+async function settleAmbiguousTakeover(
+  index: IndexNamespace,
+  admission: HookAdmission,
+): Promise<void> {
+  const { token, owner, reservation } = admission;
+  const settled = await index.settleHookTakeover!(token, owner);
+  if (settled.owner?.runId === owner.runId && settled.owner.hookId === owner.hookId) {
+    const serialized = await index.getHookByToken(token);
+    if (serialized) {
+      await index.completeHookTakeover!(token, owner.hookId, serialized, owner, reservation);
+    }
+  } else {
+    await index.releaseHookReservation(token, owner, reservation);
+  }
+}
+
 function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
   return { runId: hook.runId, hookId: hook.hookId };
 }
@@ -658,13 +682,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             parsedOutcome = parseApplyEventOutcome(wireOutcome);
           } catch (error) {
             if (hookAdmission?.reservation.takeover) {
-              // Settling decides in the claimer's own cell: roll forward a
-              // journaled creation, or fence it and drop the intent. If it
-              // fails too, the shard's alarm settles the intent.
-              await env.WORKFLOW_INDEX.settleHookTakeover?.(
-                hookAdmission.token,
-                hookAdmission.owner,
-              ).catch(() => undefined);
+              await settleAmbiguousTakeover(env.WORKFLOW_INDEX, hookAdmission).catch(
+                () => undefined,
+              );
             } else if (hookAdmission) {
               let resolution: { committed: boolean };
               try {

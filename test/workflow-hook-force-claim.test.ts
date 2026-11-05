@@ -1,8 +1,8 @@
-import { HookForceClaimedError, HookNotFoundError } from '@workflow/errors';
+import { EntityConflictError, HookForceClaimedError, HookNotFoundError } from '@workflow/errors';
 import type { Event } from '@workflow/world';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCelldWorld } from '../src/index.js';
-import { createWorkflowIndex, hookTokenShardName } from '../src/indexes.js';
+import { createWorkflowIndex, hookIdShardName, hookTokenShardName } from '../src/indexes.js';
 import { HOOK_TAKEOVER_SETTLE_MS } from '../src/lifecycle.js';
 import { createStorage } from '../src/storage.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
@@ -399,6 +399,11 @@ describe('forced hook claims and hook token retention', () => {
         'connection reset',
       );
       expect(tokenShard().storage.data.has(`takeover:${token}`)).toBe(false);
+      // The hook-ID claim follows at once: published if the creation
+      // committed, released if it was fenced.
+      const hookIds = fleet.cell('hook-ids', hookIdShardName('claimer-hook')).storage.data;
+      expect(hookIds.has('claim:claimer-hook')).toBe(false);
+      expect(hookIds.has('hookid:claimer-hook')).toBe(commit === 'after');
       const owner = commit === 'after' ? claimer : victim;
       expect(await ofType(victim, 'hook_disposed')).toHaveLength(commit === 'after' ? 1 : 0);
       await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId: owner });
@@ -406,8 +411,13 @@ describe('forced hook claims and hook token retention', () => {
         target: { runId: owner },
       });
 
-      const retried = await createHook(claimer, 'claimer-hook', { force: true });
-      expect(retried.hook).toMatchObject({ runId: claimer, hookId: 'claimer-hook' });
+      // The runtime retries. A committed creation is now fully published, so
+      // the retry is a duplicate (EntityConflictError, which the runtime
+      // treats as already created); a fenced one is admitted afresh.
+      const retried = await createHook(claimer, 'claimer-hook', { force: true }).catch(
+        (error: unknown) => error,
+      );
+      expect(EntityConflictError.is(retried)).toBe(commit === 'after');
       expect(await ofType(claimer, 'hook_created')).toHaveLength(1);
       expect(await ofType(victim, 'hook_disposed')).toHaveLength(1);
       await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId: claimer });
@@ -523,6 +533,57 @@ describe('forced hook claims and hook token retention', () => {
     fleet.advance(1);
     await fleet.fireDueAlarms();
     expect([...tokenShard().storage.data.keys()].filter((key) => key.includes(token))).toEqual([]);
+  });
+
+  it('settles the other due takeovers on a shard when one claimer cell is unreachable', async () => {
+    let sibling = '';
+    for (let i = 0; hookTokenShardName(sibling) !== hookTokenShardName(token); i++) {
+      sibling = `${token}-sibling-${i}`;
+    }
+    const tokens = [token, sibling];
+    const claimers = [];
+    for (const [i, hookToken] of tokens.entries()) {
+      const victim = await startRun(`wrun_parallel_victim_${i}`);
+      await storage.events.create(victim, {
+        eventType: 'hook_created',
+        correlationId: `victim-hook-${i}`,
+        eventData: { token: hookToken },
+      });
+      const claimer = await startRun(`wrun_parallel_claimer_${i}`);
+      const admission = await indexes.forceReserveHook(hookToken, {
+        runId: claimer,
+        hookId: `claimer-hook-${i}`,
+      });
+      if (!admission.admitted) throw new Error('expected a takeover');
+      claimers.push(claimer);
+      // The first takeover's deadline sorts ahead of the second's.
+      fleet.advance(1);
+    }
+    vi.spyOn(runCell(claimers[0]), 'resolveForcedHookClaim').mockRejectedValue(
+      new Error('cell unavailable'),
+    );
+
+    fleet.advance(HOOK_TAKEOVER_SETTLE_MS);
+    await fleet.fireDueAlarms();
+    expect(tokenShard().storage.data.has(`takeover:${token}`)).toBe(true);
+    expect(tokenShard().storage.data.has(`takeover:${sibling}`)).toBe(false);
+  });
+
+  it('advertises hookRetention only for an index that retains tokens', () => {
+    const world = (index: typeof indexes) =>
+      createCelldWorld({
+        env: {
+          WORKFLOW_DB: fleet.namespace('runs') as never,
+          WORKFLOW_INDEX: index,
+          WORKFLOW_QUEUE: {} as never,
+          WORKFLOW_STREAMS: {} as never,
+        },
+        deploymentId: 'force-claim',
+      }).capabilities?.hookRetention;
+    expect(world(indexes)).toEqual({ active: true });
+    expect(world({ ...indexes, retainsHookTokens: undefined } as never)).toEqual({
+      active: false,
+    });
   });
 
   /** A pending takeover of a token whose victim then disposes its hook. */

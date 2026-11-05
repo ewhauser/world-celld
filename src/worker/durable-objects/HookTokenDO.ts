@@ -671,11 +671,20 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     const now = this.now();
     const due = await this.dueDeadlines<TokenDeadline>(TAKEOVER_DEADLINE_PREFIX, now);
     const page = due.slice(0, LIFECYCLE_COMPACTION_BATCH);
-    for (const [deadline, { token }] of page) {
-      const intent = await this.ctx.storage.get<HookTakeover>(takeoverKey(token));
-      if (intent?.deadlineKey === deadline) await this.settleTakeover(token);
-      else await this.ctx.storage.delete(deadline);
-    }
+    // Each token settles in its own claimer's and victim's cells, so one
+    // unreachable cell must not hold back the rest of the page.
+    const settled = await Promise.allSettled(
+      page.map(async ([deadline, { token }]) => {
+        const intent = await this.ctx.storage.get<HookTakeover>(takeoverKey(token));
+        if (intent?.deadlineKey === deadline) await this.settleTakeover(token);
+        else await this.ctx.storage.delete(deadline);
+      }),
+    );
+    const failed = settled.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    // The alarm's catch retries soon; the tokens that settled are done.
+    if (failed) throw failed.reason;
     return due.length > LIFECYCLE_COMPACTION_BATCH;
   }
 }

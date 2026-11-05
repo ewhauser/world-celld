@@ -166,8 +166,20 @@ export interface WorkflowIndex {
     owner: HookTokenOwner,
     reservation: HookReservation,
   ): Promise<void>;
-  /** Finish or abandon a pending takeover of `token`, optionally only `claimer`'s. */
-  settleHookTakeover?(token: string, claimer?: HookTokenOwner): Promise<void>;
+  /**
+   * Finish or abandon a pending takeover of `token`, optionally only
+   * `claimer`'s, and return who holds the token afterwards.
+   */
+  settleHookTakeover?(
+    token: string,
+    claimer?: HookTokenOwner,
+  ): Promise<{ owner: HookTokenOwner | null }>;
+  /**
+   * Set when `releaseHookIndexes({ runEnded: true })` keeps a token whose
+   * `tokenRetentionUntil` is still ahead, so the World can advertise
+   * `hookRetention`.
+   */
+  readonly retainsHookTokens?: boolean;
   finalizeHookIndexes(
     token: string,
     hookId: string,
@@ -272,7 +284,11 @@ async function inBatches<T>(
   return deleted;
 }
 
-type HookTakeoverOperations = 'forceReserveHook' | 'completeHookTakeover' | 'settleHookTakeover';
+type HookTakeoverOperations =
+  | 'forceReserveHook'
+  | 'completeHookTakeover'
+  | 'settleHookTakeover'
+  | 'retainsHookTokens';
 
 export function createWorkflowIndex(
   bindings: WorkflowIndexBindings,
@@ -365,6 +381,8 @@ export function createWorkflowIndex(
   };
 
   return {
+    retainsHookTokens: true,
+
     async commitRun(run, serializedMetadata, publicationExpiresAt) {
       return await stub(bindings.runCatalog, runCatalogShardName(run.runId)).upsertRun(
         run.runId,
@@ -439,7 +457,7 @@ export function createWorkflowIndex(
     },
 
     async settleHookTakeover(token, claimer) {
-      await stub(bindings.hookTokens, hookTokenShardName(token)).settleTakeover(
+      return await stub(bindings.hookTokens, hookTokenShardName(token)).settleTakeover(
         token,
         claimer ? { claimer } : undefined,
       );
