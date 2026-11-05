@@ -119,7 +119,7 @@ describe('events.createBatch', () => {
               input: [],
             },
           },
-        } as BatchEventRequest,
+        } as unknown as BatchEventRequest,
       ]),
     ).rejects.toThrow('does not support');
     expect((await s.events.list({ runId })).data).toHaveLength(prior);
