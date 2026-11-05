@@ -498,6 +498,33 @@ describe('forced hook claims and hook token retention', () => {
     await expect(deliver(victim, 'victim-hook', 'kept')).resolves.toBeDefined();
   });
 
+  it('compacts a retained token whose takeover is abandoned after its retention passed', async () => {
+    const retained = await startRun('wrun_retained_abandoned');
+    await createHook(retained, 'retained-hook', {
+      tokenRetentionUntil: new Date(fleet.now + 1_000),
+    });
+    await finishRun(retained);
+    expect(tokenShard().storage.data.has(`retained:${token}`)).toBe(true);
+    const admission = await indexes.forceReserveHook(token, {
+      runId: await startRun('wrun_retained_abandoned_claimer'),
+      hookId: 'claimer-hook',
+    });
+    if (!admission.admitted) throw new Error('expected a takeover');
+
+    // Retention passes while the takeover is pending, so compaction skips it.
+    fleet.advance(1_000);
+    await fleet.fireDueAlarms();
+    expect(tokenShard().storage.data.has(`retained:${token}`)).toBe(true);
+
+    // The claimer never applies its creation, so the alarm abandons the
+    // takeover and must still compact the expired retention afterwards.
+    fleet.advance(HOOK_TAKEOVER_SETTLE_MS);
+    await fleet.fireDueAlarms();
+    fleet.advance(1);
+    await fleet.fireDueAlarms();
+    expect([...tokenShard().storage.data.keys()].filter((key) => key.includes(token))).toEqual([]);
+  });
+
   /** A pending takeover of a token whose victim then disposes its hook. */
   async function takeoverOfReleasedToken(name: string) {
     const victim = await startRun(`wrun_released_${name}_victim`);

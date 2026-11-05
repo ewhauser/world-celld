@@ -336,9 +336,16 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         await this.rollForward(token, intent, resolution.hook);
       } else {
         await this.ctx.storage.transaction(async (txn) => {
-          const current = await txn.get<HookTakeover>(takeoverKey(token));
-          if (current?.claimId === intent.claimId) {
-            await txn.delete([takeoverKey(token), intent.deadlineKey]);
+          const current = await txn.get<TokenValue>([takeoverKey(token), retainedKey(token)]);
+          const pending = current.get(takeoverKey(token)) as HookTakeover | undefined;
+          if (pending?.claimId !== intent.claimId) return;
+          await txn.delete([takeoverKey(token), intent.deadlineKey]);
+          // compactRetained drops the deadline of a token under takeover, so
+          // the victim keeps its retained record now: schedule it again.
+          const retained = current.get(retainedKey(token)) as RetainedToken | undefined;
+          if (retained) {
+            await txn.put<TokenDeadline>(retained.deadlineKey, { token });
+            await this.armAtMost(txn, retained.until);
           }
         });
       }
@@ -354,8 +361,9 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     claimId?: string,
   ): Promise<{ stored: boolean }> {
     const active = await runIsActive(this.env, owner.runId);
-    const retainedUntil = tokenRetentionUntil(parse<Hook>(serializedHook));
-    if (!active && !(retainedUntil !== undefined && retainedUntil > this.now())) {
+    const hook = parse<Hook>(serializedHook);
+    const retainedUntil = tokenRetentionUntil(hook);
+    if (!active && !retentionAhead(hook, this.now())) {
       await this.releaseBatch([{ token, owner }]);
       return { stored: false };
     }

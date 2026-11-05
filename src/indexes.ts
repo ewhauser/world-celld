@@ -289,10 +289,7 @@ export function createWorkflowIndex(
             token: hook.token,
             owner: { runId: request.runId, hookId: hook.hookId },
           })),
-          (batch) =>
-            request.runEnded
-              ? target.releaseBatch(batch, { runEnded: true })
-              : target.releaseBatch(batch),
+          (batch) => target.releaseBatch(batch, request.runEnded ? { runEnded: true } : undefined),
         ),
       );
     }
