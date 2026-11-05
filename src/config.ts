@@ -60,6 +60,8 @@ export interface CelldWorldConfig {
    * Default: process.env.CELLD_RUN_RETENTION_MS || 0
    */
   runRetentionMs?: number;
+  /** Opt in only after the fleet worker supports applyEventBatch. Default: false. */
+  enableEventBatching?: boolean;
   /** Duration of one bounded idle stream read. Default: 20000 */
   streamLongPollMs?: number;
   /** Runtime stream batching delay. Default: 0 */
@@ -76,6 +78,7 @@ export interface ResolvedCelldConfig {
   baseUrl?: string;
   deploymentUrls?: DeploymentUrls;
   runRetentionMs: number;
+  enableEventBatching: boolean;
   streamLongPollMs: number;
   streamFlushIntervalMs: number;
   rpcTimeoutMs: number;
@@ -131,6 +134,7 @@ export function resolveConfig(config?: CelldWorldConfig): ResolvedCelldConfig {
         ? parseDeploymentUrls(process.env.WORKFLOW_DEPLOYMENT_URLS)
         : validateDeploymentUrls(config.deploymentUrls),
     runRetentionMs,
+    enableEventBatching: config?.enableEventBatching ?? process.env.CELLD_EVENT_BATCHING === '1',
     streamLongPollMs,
     streamFlushIntervalMs,
     rpcTimeoutMs,

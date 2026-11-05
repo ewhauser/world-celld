@@ -27,6 +27,18 @@ reads see a dense log and failed writes leave no gaps. No background sealing or
 World v8 adds forced hook claims. This adapter does not advertise the optional
 `hookForceClaim` capability, so `experimental_force` is unavailable.
 
+Workflow 5.0.1's optional `events.createBatch` is an opt-in prototype for
+compiled step and wait fan-out. Set `CELLD_EVENT_BATCHING=1` (or
+`createCelldWorld({ enableEventBatching: true })`) only after every serving
+worker has the `applyEventBatch` RPC. A new client leaves the method absent by
+default, so applications with an older worker continue using single-event
+writes. The batch path uses one RunDO transaction per chunk, returns a result
+for each input event, and never retries a commit-ambiguous inline claim in the
+client. It does not change Queue publication. See the [compiled fan-out
+benchmark](docs/benchmarks/events-create-batch-2026-10-10.md) and the
+[real celld/MinIO follow-up](docs/benchmarks/events-create-batch-real-celld-2026-10-10.md)
+for measured results and limits.
+
 Run listing accepts either a single status or an array of statuses (OR matching).
 An empty status array matches no runs.
 

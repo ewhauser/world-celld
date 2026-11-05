@@ -14,6 +14,7 @@ import {
   hookClaimCancellationKey,
   type ApplyEventOutcome,
   type ApplyEventRequest,
+  type ApplyEventBatchRequest,
   EVENT_KEY_PREFIX,
   type EventStore,
   HOOK_CREATED_KEY_PREFIX,
@@ -21,6 +22,7 @@ import {
   listByCreationTime,
   listByPrefix,
   parseApplyEventRequest,
+  parseApplyEventBatchRequest,
   STEP_CREATED_KEY_PREFIX,
   STEP_KEY_PREFIX,
   WAIT_KEY_PREFIX,
@@ -296,6 +298,53 @@ export class WorkflowRunDO extends DurableObject {
       const tombstone = this.tombstoneFrom(values as Map<string, RunTombstone | CleanupRecord>);
       if (tombstone) return expiredRead<T | null>(tombstone);
       return { ok: true, value: (values.get(key) as T | undefined) ?? null };
+    });
+  }
+
+  /** One ordered fold attempt: successes share one durable commit and sequence. */
+  async applyEventBatch(request: ApplyEventBatchRequest): Promise<ApplyEventOutcome[]> {
+    request = parseApplyEventBatchRequest(request);
+    if (this.ctx.id.name !== undefined && request.runId !== this.ctx.id.name) {
+      throw new TypeError('applyEventBatch runId does not match durable object');
+    }
+    return await this.ctx.storage.transaction(async (txn) => {
+      const now = new Date(this.now());
+      const retention = await this.retentionState(txn, now.getTime(), { withEventSequence: true });
+      if (retention.tombstone) {
+        return request.events.map(() => ({
+          ok: false as const,
+          code: 'RUN_EXPIRED' as const,
+          message: `Workflow run "${request.runId}" has expired`,
+        }));
+      }
+      let sequence = retention.eventSequence;
+      const rejectedCreates = new Set<string>();
+      const outcomes: ApplyEventOutcome[] = [];
+      for (const { event, occurredAt } of request.events) {
+        if (event.eventType === 'step_started' && rejectedCreates.has(event.correlationId)) {
+          outcomes.push({
+            ok: false,
+            code: 'ENTITY_CONFLICT',
+            message: `Step "${event.correlationId}" was not claimed by this batch`,
+          });
+          continue;
+        }
+        const priorSequence = sequence;
+        const outcome = await applyEvent(storeFrom(txn), {
+          runId: request.runId,
+          data: event,
+          params: occurredAt ? { occurredAt } : undefined,
+          nextEventId: () => slotToEventId(++sequence),
+          now,
+        });
+        if (!outcome.ok) {
+          sequence = priorSequence;
+          if (event.eventType === 'step_created') rejectedCreates.add(event.correlationId);
+        }
+        outcomes.push(outcome);
+      }
+      if (sequence !== retention.eventSequence) await txn.put(EVENT_SEQUENCE_KEY, sequence);
+      return outcomes;
     });
   }
 

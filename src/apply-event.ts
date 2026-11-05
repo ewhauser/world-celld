@@ -25,6 +25,7 @@
  */
 
 import type {
+  BatchEventRequest,
   CreateEventParams,
   CreateEventRequest,
   Event,
@@ -164,6 +165,65 @@ export interface ApplyEventRequest {
   hookClaimId?: string;
   /** Internal world-celld retention policy captured with the event. */
   cleanup?: ScheduleCleanupRequest;
+}
+
+/** The step and wait transitions emitted by Workflow 5.0.1's batch fold. */
+export interface ApplyEventBatchRequest {
+  runId: string;
+  events: BatchEventRequest[];
+}
+
+export function parseApplyEventBatchRequest(value: unknown): ApplyEventBatchRequest {
+  if (!isRecord(value) || typeof value.runId !== 'string' || !value.runId) {
+    throw new TypeError('applyEventBatch requires a non-empty runId');
+  }
+  if (!Array.isArray(value.events) || value.events.length < 1 || value.events.length > 64) {
+    throw new TypeError('applyEventBatch requires 1 to 64 events');
+  }
+  const seen = new Map<string, string>();
+  const events = value.events.map((entry: unknown) => {
+    if (!isRecord(entry)) throw new TypeError('applyEventBatch entries must be objects');
+    const event = CreateEventSchema.parse(
+      isRecord(entry.event) ? compact(entry.event) : entry.event,
+    );
+    if (
+      event.eventType !== 'step_created' &&
+      event.eventType !== 'step_started' &&
+      event.eventType !== 'step_completed' &&
+      event.eventType !== 'step_failed' &&
+      event.eventType !== 'step_retrying' &&
+      event.eventType !== 'wait_created'
+    ) {
+      throw new TypeError(`applyEventBatch does not support ${event.eventType}`);
+    }
+    if (event.eventType === 'step_started' && event.eventData?.input !== undefined) {
+      throw new TypeError('applyEventBatch step_started must not carry inline input');
+    }
+    const prior = seen.get(event.correlationId);
+    if (prior && !(prior === 'step_created' && event.eventType === 'step_started')) {
+      throw new TypeError(
+        'applyEventBatch accepts at most a step_created/step_started pair per step',
+      );
+    }
+    seen.set(event.correlationId, event.eventType);
+    if (
+      entry.occurredAt !== undefined &&
+      (!(entry.occurredAt instanceof Date) || Number.isNaN(entry.occurredAt.getTime()))
+    ) {
+      throw new TypeError('applyEventBatch occurredAt must be a valid Date');
+    }
+    if (entry.computeInstanceId !== undefined && typeof entry.computeInstanceId !== 'string') {
+      throw new TypeError('applyEventBatch computeInstanceId must be a string');
+    }
+    return {
+      event,
+      ...(entry.occurredAt === undefined ? {} : { occurredAt: entry.occurredAt }),
+      ...(entry.computeInstanceId === undefined
+        ? {}
+        : { computeInstanceId: entry.computeInstanceId }),
+    };
+  });
+  return { runId: value.runId, events };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

@@ -102,6 +102,7 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     },
     deploymentId: resolved.deploymentId,
     runRetentionMs: resolved.runRetentionMs,
+    enableEventBatching: resolved.enableEventBatching,
   });
 
   const queue = createQueue({
