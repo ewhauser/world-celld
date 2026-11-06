@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.10.0 (2026-11-06)
+
+## What's Changed
+* chore: upgrade eligible Workflow packages to 5.0.4 and 5.2.2 by @ewhauser in https://github.com/ewhauser/world-celld/pull/103
+* chore: upgrade World packages to 5.0.5 with replay-safe runtime by @ewhauser in https://github.com/ewhauser/world-celld/pull/104
+* feat: support forced hook claims and hook token retention by @danXyu in https://github.com/ewhauser/world-celld/pull/105
+
+## New Contributors
+* @danXyu made their first contribution in https://github.com/ewhauser/world-celld/pull/105
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.9.2...v0.10.0
+
 ## 0.9.2 (2026-10-21)
 
 ## What's Changed
