@@ -534,10 +534,16 @@ export class WorkflowRunDO extends DurableObject {
       }
       return disposal;
     });
-    const hookIds = this.namespace<HookIdShardStub>('WORKFLOW_HOOK_IDS');
-    await hookIds
-      .get(hookIds.idFromName(hookIdShardName(request.hookId)))
-      .releaseBatch([{ hookId: request.hookId, owner: { runId, hookId: request.hookId } }]);
+    // The hook-ID shard is unrelated to the token, so the takeover does not
+    // wait on it. The hook is already disposed, and the retention marker its
+    // hook_created wrote makes terminal cleanup release it again if this is
+    // lost, as for an ordinary disposal.
+    void (async () => {
+      const hookIds = this.namespace<HookIdShardStub>('WORKFLOW_HOOK_IDS');
+      await hookIds
+        .get(hookIds.idFromName(hookIdShardName(request.hookId)))
+        .releaseBatch([{ hookId: request.hookId, owner: { runId, hookId: request.hookId } }]);
+    })().catch(() => undefined);
     return result;
   }
 

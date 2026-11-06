@@ -103,6 +103,7 @@ export interface HookTokenShardStub {
   settleTakeover(
     token: string,
     match?: { claimer: HookTokenOwner; claimId?: string },
+    committedHook?: string,
   ): Promise<{ owner: HookTokenOwner | null }>;
 }
 
@@ -448,6 +449,8 @@ export function createWorkflowIndex(
       const settled = await stub(bindings.hookTokens, hookTokenShardName(token)).settleTakeover(
         token,
         { claimer: owner, claimId: reservation.tokenClaimId },
+        // The caller's hook_created committed, so the shard need not ask.
+        serializedHook,
       );
       if (settled.owner && sameOwner(settled.owner, owner)) {
         await hookIdTarget.publish(hookId, serializedHook, owner, reservation.hookIdClaimId);

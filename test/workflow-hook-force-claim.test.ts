@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createCelldWorld } from '../src/index.js';
 import { createWorkflowIndex, hookIdShardName, hookTokenShardName } from '../src/indexes.js';
 import { HOOK_TAKEOVER_SETTLE_MS } from '../src/lifecycle.js';
+import { hookMarkerKey } from '../src/retention.js';
 import { createStorage } from '../src/storage.js';
 import { FakeFleet } from '../src/testing/fake-cell.js';
 import { startHarness } from '../src/testing/http-harness.js';
@@ -618,9 +619,9 @@ describe('forced hook claims and hook token retention', () => {
     };
     /** After the alarm runs, exactly `winner` holds a live hook on the token. */
     const expectSoleOwner = async (winner: string) => {
-      expect(tokenShard().storage.data.has(`takeover:${token}`)).toBe(false);
       fleet.advance(HOOK_TAKEOVER_SETTLE_MS);
       await fleet.fireDueAlarms();
+      expect(tokenShard().storage.data.has(`takeover:${token}`)).toBe(false);
       await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId: winner });
       const live = [];
       for (const runId of [victim, claimer, competitor]) {
@@ -647,10 +648,27 @@ describe('forced hook claims and hook token retention', () => {
     await expectSoleOwner(claimer);
   });
 
-  it('fences an unjournaled takeover before an unforced creation takes the released token', async () => {
+  it('answers an unforced creation from a live takeover without calling the claimer', async () => {
+    const { claimer, competitor, applyClaimer, releaseVictim, expectSoleOwner } =
+      await takeoverOfReleasedToken('live');
+    await releaseVictim();
+    const resolve = vi.spyOn(runCell(claimer), 'resolveForcedHookClaim');
+
+    const created = await createHook(competitor, 'competitor-hook');
+    expect(created.event).toMatchObject({
+      eventType: 'hook_conflict',
+      eventData: { conflictingRunId: claimer },
+    });
+    expect(resolve).not.toHaveBeenCalled();
+    expect((await applyClaimer()).ok).toBe(true);
+    await expectSoleOwner(claimer);
+  });
+
+  it('fences an abandoned takeover before an unforced creation takes the released token', async () => {
     const { competitor, applyClaimer, releaseVictim, expectSoleOwner } =
       await takeoverOfReleasedToken('unjournaled');
     await releaseVictim();
+    fleet.advance(HOOK_TAKEOVER_SETTLE_MS);
 
     const created = await createHook(competitor, 'competitor-hook');
     expect(created.event?.eventType).toBe('hook_created');
@@ -689,6 +707,107 @@ describe('forced hook claims and hook token retention', () => {
     // Six pending answers, the preempting admission that was fenced, then a
     // re-admission that waits again before it would preempt.
     expect(preempts).toEqual([false, false, false, false, false, false, true, false]);
+  });
+
+  it('completes a forced creation without asking the claimer cell to resolve it', async () => {
+    const victim = await startRun('wrun_no_resolve_victim');
+    const claimer = await startRun('wrun_no_resolve_claimer');
+    await createHook(victim, 'victim-hook');
+    const resolve = vi.spyOn(runCell(claimer), 'resolveForcedHookClaim');
+
+    await createHook(claimer, 'claimer-hook', { force: true });
+    expect(resolve).not.toHaveBeenCalled();
+    await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId: claimer });
+    expect(forceClaimedBy((await ofType(victim, 'hook_disposed'))[0])).toMatchObject({
+      runId: claimer,
+    });
+  });
+
+  it("moves the token without waiting on the victim's hook-ID shard", async () => {
+    const victim = await startRun('wrun_hookid_slow_victim');
+    const claimer = await startRun('wrun_hookid_slow_claimer');
+    await createHook(victim, 'victim-hook');
+    const victimIds = fleet.cell('hook-ids', hookIdShardName('victim-hook')).instance as HookIdDO;
+    vi.spyOn(victimIds, 'releaseBatch').mockReturnValue(new Promise(() => {}));
+
+    await createHook(claimer, 'claimer-hook', { force: true });
+    await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId: claimer });
+    // Terminal cleanup releases the victim's hook ID again from this marker.
+    expect(
+      fleet.cell('runs', victim).storage.data.has(hookMarkerKey({ hookId: 'victim-hook', token })),
+    ).toBe(true);
+  });
+
+  it('settles at most a bounded number of due takeovers at once', async () => {
+    const tokens: string[] = [];
+    for (let i = 0; tokens.length < 10; i++) {
+      const candidate = `${token}-bounded-${i}`;
+      if (hookTokenShardName(candidate) === hookTokenShardName(token)) tokens.push(candidate);
+    }
+    for (const [i, hookToken] of tokens.entries()) {
+      const victim = await startRun(`wrun_bounded_victim_${i}`);
+      await storage.events.create(victim, {
+        eventType: 'hook_created',
+        correlationId: `victim-hook-${i}`,
+        eventData: { token: hookToken },
+      });
+      const claimer = await startRun(`wrun_bounded_claimer_${i}`);
+      const admission = await indexes.forceReserveHook(hookToken, {
+        runId: claimer,
+        hookId: `claimer-hook-${i}`,
+      });
+      if (!admission.admitted) throw new Error('expected a takeover');
+    }
+    const shard = tokenShard().instance as HookTokenDO;
+    const settle = shard.settleTakeover.bind(shard);
+    let inFlight = 0;
+    let peak = 0;
+    vi.spyOn(shard, 'settleTakeover').mockImplementation(async (...args) => {
+      peak = Math.max(peak, ++inFlight);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        return await settle(...args);
+      } finally {
+        inFlight--;
+      }
+    });
+
+    fleet.advance(HOOK_TAKEOVER_SETTLE_MS);
+    await fleet.fireDueAlarms();
+    expect(peak).toBe(8);
+    for (const hookToken of tokens) {
+      expect(tokenShard().storage.data.has(`takeover:${hookToken}`)).toBe(false);
+    }
+  });
+
+  it('reads a full release batch in storage calls of at most 128 keys', async () => {
+    const shard = tokenShard();
+    const hooks = Array.from({ length: 64 }, (_, i) => ({
+      token: `${token}-batch-${i}`,
+      owner: { runId: 'wrun_batch', hookId: `hook-${i}` },
+    }));
+    shard.storage.getManyCalls.length = 0;
+
+    await (shard.instance as HookTokenDO).releaseBatch(hooks, { runEnded: true });
+    expect(shard.storage.getManyCalls.flat()).toHaveLength(64 * 3);
+    expect(Math.max(...shard.storage.getManyCalls.map((keys) => keys.length))).toBe(128);
+  });
+
+  it('lists each deadline prefix once per shard alarm', async () => {
+    const victim = await startRun('wrun_alarm_lists_victim');
+    const claimer = await startRun('wrun_alarm_lists_claimer');
+    await createHook(victim, 'victim-hook');
+    const admission = await indexes.forceReserveHook(token, {
+      runId: claimer,
+      hookId: 'claimer-hook',
+    });
+    if (!admission.admitted) throw new Error('expected a takeover');
+    const list = vi.spyOn(tokenShard().storage, 'list');
+
+    fleet.advance(HOOK_TAKEOVER_SETTLE_MS);
+    await fleet.fireDueAlarms();
+    expect(tokenShard().storage.data.has(`takeover:${token}`)).toBe(false);
+    expect(list).toHaveBeenCalledTimes(3);
   });
 
   it('still refuses a delivery with HookForceClaimedError when settling the takeover fails', async () => {

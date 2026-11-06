@@ -56,14 +56,13 @@ interface HookTakeover {
 }
 
 const MAX_RELEASE_BATCH = 64;
+/** One storage get accepts at most 128 keys. */
+const STORAGE_GET_KEYS = 128;
+/** Each settle calls the claimer's and the victim's cells; bound the alarm's fan-out. */
+const MAX_CONCURRENT_TAKEOVER_SETTLES = 8;
 const CLAIM_DEADLINE_PREFIX = 'claim-deadline:';
 const RETAINED_DEADLINE_PREFIX = 'retained-deadline:';
 const TAKEOVER_DEADLINE_PREFIX = 'takeover-deadline:';
-const DEADLINE_PREFIXES = [
-  CLAIM_DEADLINE_PREFIX,
-  RETAINED_DEADLINE_PREFIX,
-  TAKEOVER_DEADLINE_PREFIX,
-] as const;
 
 interface ClaimDeadline {
   token: string;
@@ -105,6 +104,45 @@ function deadlineAt(prefix: string, key: string): number {
 
 type TokenValue = string | HookClaim | RetainedToken | HookTakeover;
 
+/** One alarm pass over a deadline prefix: what is due, and when the rest falls due. */
+interface DeadlineScan<T> {
+  due: Array<[string, T]>;
+  more: boolean;
+  next: number | undefined;
+}
+
+/** `get` for any number of keys, in calls the storage API accepts. */
+async function getMany<T>(txn: DurableObjectTransaction, keys: string[]): Promise<Map<string, T>> {
+  if (keys.length <= STORAGE_GET_KEYS) return await txn.get<T>(keys);
+  const calls: Array<Promise<Map<string, T>>> = [];
+  for (let offset = 0; offset < keys.length; offset += STORAGE_GET_KEYS) {
+    calls.push(txn.get<T>(keys.slice(offset, offset + STORAGE_GET_KEYS)));
+  }
+  return new Map((await Promise.all(calls)).flatMap((page) => Array.from(page)));
+}
+
+/** Run `task` over `items` at most `limit` at a time; returns every failure. */
+async function forEachBounded<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<void>,
+): Promise<unknown[]> {
+  const failures: unknown[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const item = items[next++];
+      try {
+        await task(item);
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return failures;
+}
+
 /** Token-ownership shard. A token hashes to exactly one shard and transaction domain. */
 export class HookTokenDO extends DurableObject<HookIndexEnv> {
   private now(): number {
@@ -123,9 +161,9 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         token,
       ));
     if (!raw) return null;
-    if (retentionAhead(parse<Hook>(raw), this.now())) return raw;
-    const owner = ownerFromSerializedHook(raw);
-    return (await runIsActive(this.env, owner.runId)) ? raw : null;
+    const hook = parse<Hook>(raw);
+    if (retentionAhead(hook, this.now())) return raw;
+    return (await runIsActive(this.env, hook.runId)) ? raw : null;
   }
 
   async reserve(
@@ -153,10 +191,17 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         if (indexed !== undefined && !(await this.freeExpiredRetention(txn, token, values, now))) {
           return { claimed: false as const, holder: ownerFromSerializedHook(indexed) };
         }
-        // The victim released the token while a takeover was pending. Settle
-        // the takeover before claiming, or its roll-forward would later
-        // overwrite this claim's record and leave two live owners.
-        if (values.has(takeoverKey(token))) return 'settle' as const;
+        // The victim released the token while a takeover was pending. A live
+        // takeover holds the token like an in-flight claim, so answer without
+        // calling other cells; an abandoned one is settled before claiming, or
+        // its roll-forward would overwrite this claim's record.
+        const pending = values.get(takeoverKey(token)) as HookTakeover | undefined;
+        if (pending) {
+          if (!sameOwner(pending.claimer, owner) && pending.expiresAt > now) {
+            return { claimed: false as const, holder: pending.claimer };
+          }
+          return 'settle' as const;
+        }
         let existing = values.get(claim) as HookClaim | undefined;
         if (existing && existing.expiresAt <= now) {
           if (existing.claimId !== expired?.claimId || existing.expiresAt !== expired.expiresAt) {
@@ -314,10 +359,15 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
    * Decide the pending takeover of `token` from the claimer's log: roll it
    * forward if its hook_created is journaled, otherwise fence the claimer and
    * drop the intent. Returns who holds the token afterwards.
+   *
+   * `committedHook` is the claimer's own report that its hook_created for
+   * `match.claimId` committed, which saves asking its cell; the record it
+   * writes is still confirmed against the claimer's log afterwards.
    */
   async settleTakeover(
     token: string,
     match?: { claimer: HookTokenOwner; claimId?: string },
+    committedHook?: string,
   ): Promise<{ owner: HookTokenOwner | null }> {
     const intent = await this.ctx.storage.get<HookTakeover>(takeoverKey(token));
     if (
@@ -326,12 +376,15 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         (sameOwner(intent.claimer, match.claimer) &&
           (match.claimId === undefined || match.claimId === intent.claimId)))
     ) {
-      const resolution = await runCell(this.env, intent.claimer.runId).resolveForcedHookClaim({
-        hookId: intent.claimer.hookId,
-        token,
-        claimId: intent.claimId,
-        victim: intent.victim,
-      });
+      const resolution =
+        committedHook !== undefined && match?.claimId === intent.claimId
+          ? { journaled: true, hook: parse<Hook>(committedHook) }
+          : await runCell(this.env, intent.claimer.runId).resolveForcedHookClaim({
+              hookId: intent.claimer.hookId,
+              token,
+              claimId: intent.claimId,
+              victim: intent.victim,
+            });
       if (resolution.journaled) {
         await this.rollForward(token, intent, resolution.hook);
       } else {
@@ -422,20 +475,25 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         claimKey(token),
         retainedKey(token),
       ]);
-      const values = await txn.get<TokenValue>(keys);
+      const values = await getMany<TokenValue>(txn, keys);
       const now = this.now();
       const deletes: string[] = [];
       const deadlineDeletes: string[] = [];
+      let earliestRetained = Infinity;
       for (const { token, owner } of hooks) {
         const record = recordKey(token);
         const claim = claimKey(token);
         const indexed = values.get(record) as string | undefined;
         const existingClaim = values.get(claim) as HookClaim | undefined;
         const retained = values.get(retainedKey(token)) as RetainedToken | undefined;
-        if (indexed !== undefined && sameOwner(ownerFromSerializedHook(indexed), owner)) {
-          const until = tokenRetentionUntil(parse<Hook>(indexed));
+        const hook = indexed === undefined ? undefined : parse<Hook>(indexed);
+        if (hook && sameOwner(hook, owner)) {
+          const until = tokenRetentionUntil(hook);
           if (options?.runEnded && until !== undefined && until > now) {
-            if (!retained) await this.retain(txn, token, owner, until);
+            if (!retained) {
+              await this.markRetained(txn, token, owner, until);
+              earliestRetained = Math.min(earliestRetained, until);
+            }
           } else {
             deletes.push(record);
             if (retained) deadlineDeletes.push(retainedKey(token), retained.deadlineKey);
@@ -448,16 +506,24 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
       }
       const deleted = deletes.length === 0 ? 0 : await txn.delete(deletes);
       if (deadlineDeletes.length > 0) await txn.delete(deadlineDeletes);
+      if (earliestRetained < Infinity) await this.armAtMost(txn, earliestRetained);
       return { deleted };
     });
   }
 
   async alarm(): Promise<void> {
     try {
-      const moreClaims = await this.compactClaims();
-      const moreRetained = await this.compactRetained();
-      const moreTakeovers = await this.compactTakeovers();
-      await this.rearm(moreClaims || moreRetained || moreTakeovers);
+      const now = this.now();
+      const [firing, claims, retained, takeovers] = await Promise.all([
+        this.ctx.storage.getAlarm(),
+        this.scanDeadlines<ClaimDeadline>(CLAIM_DEADLINE_PREFIX, now),
+        this.scanDeadlines<TokenDeadline>(RETAINED_DEADLINE_PREFIX, now),
+        this.scanDeadlines<TokenDeadline>(TAKEOVER_DEADLINE_PREFIX, now),
+      ]);
+      await this.compactClaims(claims.due, now);
+      await this.compactRetained(retained.due, now);
+      await this.compactTakeovers(takeovers.due);
+      await this.rearm([claims, retained, takeovers], firing === null);
     } catch {
       await this.ctx.storage.setAlarm(this.now() + LIFECYCLE_COMPACTION_RETRY_MS);
     }
@@ -468,19 +534,38 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     if (current === null || at < current) await storage.setAlarm(at);
   }
 
-  private async rearm(more: boolean): Promise<void> {
+  /**
+   * Schedule the next pass from this pass's scans. The running alarm reads
+   * as unset, so a deadline written while the pass ran armed it through
+   * armAtMost and is kept when sooner. A runtime that still reports the
+   * running alarm cannot show that, so the first deadlines are listed again.
+   */
+  private async rearm(
+    scans: Array<DeadlineScan<unknown>>,
+    alarmClearedWhileRunning: boolean,
+  ): Promise<void> {
     const now = this.now();
-    if (more) {
+    if (scans.some((scan) => scan.more)) {
       await this.ctx.storage.setAlarm(now + 1);
       return;
     }
-    let next: number | undefined;
-    for (const prefix of DEADLINE_PREFIXES) {
-      const first = await this.ctx.storage.list({ prefix, limit: 1 });
-      const key = first.keys().next().value;
-      if (key !== undefined) next = Math.min(next ?? Infinity, deadlineAt(prefix, key));
+    let next: number;
+    if (alarmClearedWhileRunning) {
+      next = Math.min(...scans.map((scan) => scan.next ?? Infinity));
+      const pending = await this.ctx.storage.getAlarm();
+      if (pending !== null) next = Math.min(next, pending);
+    } else {
+      const firsts = await Promise.all(
+        [CLAIM_DEADLINE_PREFIX, RETAINED_DEADLINE_PREFIX, TAKEOVER_DEADLINE_PREFIX].map(
+          async (prefix) => {
+            const key = (await this.ctx.storage.list({ prefix, limit: 1 })).keys().next().value;
+            return key === undefined ? Infinity : deadlineAt(prefix, key);
+          },
+        ),
+      );
+      next = Math.min(...firsts);
     }
-    if (next === undefined) await this.ctx.storage.deleteAlarm();
+    if (next === Infinity) await this.ctx.storage.deleteAlarm();
     else await this.ctx.storage.setAlarm(Math.max(now + 1, next));
   }
 
@@ -490,10 +575,20 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     owner: HookTokenOwner,
     until: number,
   ): Promise<void> {
+    await this.markRetained(txn, token, owner, until);
+    await this.armAtMost(txn, until);
+  }
+
+  /** Write the retained marker and its deadline; the caller arms the alarm. */
+  private async markRetained(
+    txn: DurableObjectTransaction,
+    token: string,
+    owner: HookTokenOwner,
+    until: number,
+  ): Promise<void> {
     const deadline = deadlineKey(RETAINED_DEADLINE_PREFIX, token, until);
     await txn.put<RetainedToken>(retainedKey(token), { owner, until, deadlineKey: deadline });
     await txn.put<TokenDeadline>(deadline, { token });
-    await this.armAtMost(txn, until);
   }
 
   /** Drop a finished run's record once its retention passed; false while it still holds. */
@@ -582,20 +677,24 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     await this.armAtMost(txn, expiresAt);
   }
 
-  private async dueDeadlines<T>(prefix: string, now: number): Promise<Array<[string, T]>> {
-    const due = await this.ctx.storage.list<T>({
-      prefix,
-      end: `${prefix}${pad(now + 1)}`,
-      limit: LIFECYCLE_COMPACTION_BATCH + 1,
-    });
-    return Array.from(due);
+  /**
+   * One list per prefix serves both this pass and the next alarm: the first
+   * deadline not yet due is when the prefix needs its next pass.
+   */
+  private async scanDeadlines<T>(prefix: string, now: number): Promise<DeadlineScan<T>> {
+    const listed = Array.from(
+      await this.ctx.storage.list<T>({ prefix, limit: LIFECYCLE_COMPACTION_BATCH + 1 }),
+    );
+    const firstLater = listed.findIndex(([key]) => deadlineAt(prefix, key) > now);
+    const dueCount = firstLater === -1 ? listed.length : firstLater;
+    return {
+      due: listed.slice(0, Math.min(dueCount, LIFECYCLE_COMPACTION_BATCH)),
+      more: dueCount > LIFECYCLE_COMPACTION_BATCH,
+      next: firstLater === -1 ? undefined : deadlineAt(prefix, listed[firstLater][0]),
+    };
   }
 
-  /** Returns true when more due claims remain than one batch holds. */
-  private async compactClaims(): Promise<boolean> {
-    const now = this.now();
-    const due = await this.dueDeadlines<ClaimDeadline>(CLAIM_DEADLINE_PREFIX, now);
-    const page = due.slice(0, LIFECYCLE_COMPACTION_BATCH);
+  private async compactClaims(page: Array<[string, ClaimDeadline]>, now: number): Promise<void> {
     const observed = await this.ctx.storage.get<HookClaim>(
       page.map(([, item]) => claimKey(item.token)),
     );
@@ -642,49 +741,45 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
       warnRepublished(owner);
       await confirmRepublished(this.ctx.storage, this.env, recordKey(token), owner, token);
     }
-    return due.length > LIFECYCLE_COMPACTION_BATCH;
   }
 
-  private async compactRetained(): Promise<boolean> {
-    const now = this.now();
-    const due = await this.dueDeadlines<TokenDeadline>(RETAINED_DEADLINE_PREFIX, now);
-    const page = due.slice(0, LIFECYCLE_COMPACTION_BATCH);
+  private async compactRetained(page: Array<[string, TokenDeadline]>, now: number): Promise<void> {
+    if (page.length === 0) return;
     await this.ctx.storage.transaction(async (txn) => {
+      const values = await getMany<TokenValue>(
+        txn,
+        page.flatMap(([, { token }]) => [recordKey(token), retainedKey(token), takeoverKey(token)]),
+      );
       for (const [deadline, { token }] of page) {
-        const values = await txn.get<TokenValue>([
-          recordKey(token),
-          retainedKey(token),
-          takeoverKey(token),
-        ]);
         const retained = values.get(retainedKey(token)) as RetainedToken | undefined;
         if (retained?.deadlineKey === deadline) {
           await this.freeExpiredRetention(txn, token, values, now);
         }
-        // A takeover pending on this token clears the marker when it settles.
-        await txn.delete(deadline);
       }
+      // A takeover pending on a token clears its marker when it settles.
+      await txn.delete(page.map(([deadline]) => deadline));
     });
-    return due.length > LIFECYCLE_COMPACTION_BATCH;
   }
 
-  private async compactTakeovers(): Promise<boolean> {
-    const now = this.now();
-    const due = await this.dueDeadlines<TokenDeadline>(TAKEOVER_DEADLINE_PREFIX, now);
-    const page = due.slice(0, LIFECYCLE_COMPACTION_BATCH);
+  private async compactTakeovers(page: Array<[string, TokenDeadline]>): Promise<void> {
+    if (page.length === 0) return;
+    const intents = await this.ctx.storage.get<HookTakeover>(
+      page.map(([, { token }]) => takeoverKey(token)),
+    );
+    const stale = page.filter(
+      ([deadline, { token }]) => intents.get(takeoverKey(token))?.deadlineKey !== deadline,
+    );
+    if (stale.length > 0) await this.ctx.storage.delete(stale.map(([deadline]) => deadline));
     // Each token settles in its own claimer's and victim's cells, so one
     // unreachable cell must not hold back the rest of the page.
-    const settled = await Promise.allSettled(
-      page.map(async ([deadline, { token }]) => {
-        const intent = await this.ctx.storage.get<HookTakeover>(takeoverKey(token));
-        if (intent?.deadlineKey === deadline) await this.settleTakeover(token);
-        else await this.ctx.storage.delete(deadline);
-      }),
-    );
-    const failed = settled.find(
-      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    const failures = await forEachBounded(
+      page.filter((entry) => !stale.includes(entry)),
+      MAX_CONCURRENT_TAKEOVER_SETTLES,
+      async ([, { token }]) => {
+        await this.settleTakeover(token);
+      },
     );
     // The alarm's catch retries soon; the tokens that settled are done.
-    if (failed) throw failed.reason;
-    return due.length > LIFECYCLE_COMPACTION_BATCH;
+    if (failures.length > 0) throw failures[0];
   }
 }
