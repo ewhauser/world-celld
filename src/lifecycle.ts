@@ -37,3 +37,9 @@ export const HOOK_CLAIM_LEASE_MS =
 
 export const LIFECYCLE_COMPACTION_BATCH = 128;
 export const LIFECYCLE_COMPACTION_RETRY_MS = 1000;
+
+/**
+ * When the token shard settles a forced takeover nobody finished. Settling
+ * earlier is safe: an uncommitted claimer is fenced and retries.
+ */
+export const HOOK_TAKEOVER_SETTLE_MS = MAX_FLEET_RPC_TIMEOUT_MS;

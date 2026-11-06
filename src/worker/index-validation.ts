@@ -12,7 +12,10 @@ export type IndexOperation =
   | 'runs.commit'
   | 'runs.expire'
   | 'hooks.reserve'
+  | 'hooks.force-reserve'
   | 'hooks.finalize'
+  | 'hooks.complete-takeover'
+  | 'hooks.settle-takeover'
   | 'hooks.release-reservation'
   | 'hooks.release';
 
@@ -23,9 +26,18 @@ export type ValidatedIndexRequest =
   | { operation: 'runs.expire'; args: [ExpireRunIndexesRequest] }
   | { operation: 'hooks.reserve'; args: [string, HookTokenOwner] }
   | {
+      operation: 'hooks.force-reserve';
+      args: [string, HookTokenOwner, { preempt?: boolean } | undefined];
+    }
+  | {
       operation: 'hooks.finalize';
       args: [string, string, string, HookTokenOwner, HookReservation | undefined];
     }
+  | {
+      operation: 'hooks.complete-takeover';
+      args: [string, string, string, HookTokenOwner, HookReservation];
+    }
+  | { operation: 'hooks.settle-takeover'; args: [string, HookTokenOwner | undefined] }
   | {
       operation: 'hooks.release-reservation';
       args: [string, HookTokenOwner, HookReservation];
@@ -85,6 +97,10 @@ function reservation(value: unknown): HookReservation {
   if (value.hookIdClaimId !== undefined) {
     parsed.hookIdClaimId = nonEmptyString(value.hookIdClaimId, 'reservation.hookIdClaimId');
   }
+  if (value.takeover !== undefined) {
+    if (value.takeover !== true) invalid('reservation.takeover must be true');
+    parsed.takeover = true;
+  }
   return parsed;
 }
 
@@ -106,9 +122,13 @@ function exactProperties(value: Record<string, unknown>, allowed: string[], name
 
 function releaseRequest(value: unknown): ReleaseHookIndexesRequest {
   if (!isRecord(value)) invalid('release request must be an object');
+  if (value.runEnded !== undefined && typeof value.runEnded !== 'boolean') {
+    invalid('request.runEnded must be a boolean');
+  }
   return {
     runId: nonEmptyString(value.runId, 'request.runId'),
     hooks: hooks(value.hooks),
+    ...(value.runEnded === true ? { runEnded: true } : {}),
   };
 }
 
@@ -212,7 +232,9 @@ function runCommit(args: unknown[]): ValidatedIndexRequest {
   return { operation: 'runs.commit', args: [run, serializedMetadata, publicationExpiresAt] };
 }
 
-function hookFinalize(args: unknown[]): ValidatedIndexRequest {
+function hookPublication(
+  args: unknown[],
+): [string, string, string, HookTokenOwner, HookReservation | undefined] {
   if (args.length !== 4 && args.length !== 5) invalid('expected 4 or 5 arguments');
   const token = nonEmptyString(args[0], 'token');
   const hookId = nonEmptyString(args[1], 'hookId');
@@ -239,8 +261,31 @@ function hookFinalize(args: unknown[]): ValidatedIndexRequest {
   }
   const hookReservation =
     args[4] === undefined || args[4] === null ? undefined : reservation(args[4]);
+  return [token, hookId, serializedHook, hookOwner, hookReservation];
+}
+
+function forceReserveRequest(args: unknown[]): ValidatedIndexRequest {
+  if (args.length !== 2 && args.length !== 3) invalid('expected 2 or 3 arguments');
+  let options: { preempt?: boolean } | undefined;
+  if (args[2] !== undefined && args[2] !== null) {
+    if (!isRecord(args[2])) invalid('options must be an object');
+    exactProperties(args[2], ['preempt'], 'options');
+    if (args[2].preempt !== undefined && typeof args[2].preempt !== 'boolean') {
+      invalid('options.preempt must be a boolean');
+    }
+    options = args[2].preempt === undefined ? {} : { preempt: args[2].preempt };
+  }
   return {
-    operation: 'hooks.finalize',
+    operation: 'hooks.force-reserve',
+    args: [nonEmptyString(args[0], 'token'), owner(args[1]), options],
+  };
+}
+
+function hookTakeoverCompletion(args: unknown[]): ValidatedIndexRequest {
+  const [token, hookId, serializedHook, hookOwner, hookReservation] = hookPublication(args);
+  if (!hookReservation?.takeover) invalid('reservation must be a takeover');
+  return {
+    operation: 'hooks.complete-takeover',
     args: [token, hookId, serializedHook, hookOwner, hookReservation],
   };
 }
@@ -267,8 +312,21 @@ export function validateIndexRequest(
         operation,
         args: [nonEmptyString(args[0], 'token'), owner(args[1])],
       };
+    case 'hooks.force-reserve':
+      return forceReserveRequest(args);
     case 'hooks.finalize':
-      return hookFinalize(args);
+      return { operation, args: hookPublication(args) };
+    case 'hooks.complete-takeover':
+      return hookTakeoverCompletion(args);
+    case 'hooks.settle-takeover':
+      if (args.length !== 1 && args.length !== 2) invalid('expected 1 or 2 arguments');
+      return {
+        operation,
+        args: [
+          nonEmptyString(args[0], 'token'),
+          args[1] === undefined || args[1] === null ? undefined : owner(args[1], 'claimer'),
+        ],
+      };
     case 'hooks.release-reservation':
       exactArgs(args, 3);
       return {
@@ -289,7 +347,10 @@ export const INDEX_OPERATIONS = new Set<IndexOperation>([
   'runs.commit',
   'runs.expire',
   'hooks.reserve',
+  'hooks.force-reserve',
   'hooks.finalize',
+  'hooks.complete-takeover',
+  'hooks.settle-takeover',
   'hooks.release-reservation',
   'hooks.release',
 ]);

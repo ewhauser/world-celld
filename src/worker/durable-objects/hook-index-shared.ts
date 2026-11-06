@@ -1,7 +1,7 @@
 import type { Hook } from '@workflow/world';
 import type { HookTokenOwner } from '../../config.js';
 import type { CellNamespaceLike } from '../../indexes.js';
-import type { RunLifecycleStatus } from '../../retention.js';
+import type { ForceClaimVictim, RunLifecycleStatus } from '../../retention.js';
 import { parse, stringify } from '../../vendor/shared/index.js';
 
 interface RunLifecycleStub {
@@ -12,6 +12,18 @@ interface RunLifecycleStub {
     token?: string;
   }): Promise<Hook | null>;
   getCommittedHook(request: { hookId: string; token?: string }): Promise<Hook | null>;
+  describeForceClaimVictim(): Promise<ForceClaimVictim>;
+  forceDisposeHook(request: {
+    hookId: string;
+    token: string;
+    claimedBy: HookTokenOwner;
+  }): Promise<{ journaled: boolean }>;
+  resolveForcedHookClaim(request: {
+    hookId: string;
+    token: string;
+    claimId: string;
+    victim: HookTokenOwner;
+  }): Promise<{ journaled: boolean; hook: Hook | null }>;
 }
 
 export interface HookIndexEnv {
@@ -33,11 +45,26 @@ export function indexKey(prefix: string, value: string): string {
   return `${prefix}:${encodeURIComponent(value)}`;
 }
 
-export async function runIsActive(env: HookIndexEnv, runId: string): Promise<boolean> {
+export function runCell(env: HookIndexEnv, runId: string): RunLifecycleStub {
   const namespace = env.WORKFLOW_DB;
   if (!namespace) throw new Error('world-celld hook index missing WORKFLOW_DB binding');
-  const target = namespace.get(namespace.idFromName(runId));
-  return (await target.getLifecycleStatus()) === 'active';
+  return namespace.get(namespace.idFromName(runId));
+}
+
+export async function runIsActive(env: HookIndexEnv, runId: string): Promise<boolean> {
+  return (await runCell(env, runId).getLifecycleStatus()) === 'active';
+}
+
+/** A serialized record's `tokenRetentionUntil`, which arrives as a string. */
+export function tokenRetentionUntil(hook: Pick<Hook, 'tokenRetentionUntil'>): number | undefined {
+  return hook.tokenRetentionUntil === undefined
+    ? undefined
+    : new Date(hook.tokenRetentionUntil).getTime();
+}
+
+/** True while a hook's token outlives its run under `tokenRetentionUntil`. */
+export function retentionAhead(hook: Pick<Hook, 'tokenRetentionUntil'>, now: number): boolean {
+  return (tokenRetentionUntil(hook) ?? -Infinity) > now;
 }
 
 /** Resolve a stale shard reservation in its authoritative event writer. */
@@ -47,10 +74,11 @@ export async function resolveExpiredHookClaim(
   claimId: string,
   token?: string,
 ): Promise<Hook | null> {
-  const namespace = env.WORKFLOW_DB;
-  if (!namespace) throw new Error('world-celld hook index missing WORKFLOW_DB binding');
-  const target = namespace.get(namespace.idFromName(owner.runId));
-  return await target.resolveExpiredHookClaim({ hookId: owner.hookId, claimId, token });
+  return await runCell(env, owner.runId).resolveExpiredHookClaim({
+    hookId: owner.hookId,
+    claimId,
+    token,
+  });
 }
 
 /** Read-only owner check used by index repair; unlike the resolver it never fences. */
@@ -59,10 +87,7 @@ export async function getCommittedHook(
   owner: HookTokenOwner,
   token?: string,
 ): Promise<Hook | null> {
-  const namespace = env.WORKFLOW_DB;
-  if (!namespace) throw new Error('world-celld hook index missing WORKFLOW_DB binding');
-  const target = namespace.get(namespace.idFromName(owner.runId));
-  return await target.getCommittedHook({ hookId: owner.hookId, token });
+  return await runCell(env, owner.runId).getCommittedHook({ hookId: owner.hookId, token });
 }
 
 interface IndexClaim {

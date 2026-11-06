@@ -150,6 +150,16 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     // so the queue message carries runInput and run_started can bootstrap the
     // run when run_created has not landed yet.
     specVersion: SPEC_VERSION_CURRENT,
+    capabilities: {
+      // Retention lives in the index's token shards; an injected index must
+      // opt in, since releasing a run's hooks would otherwise drop them.
+      hookRetention: { active: env.WORKFLOW_INDEX.retainsHookTokens === true },
+      // An injected index without the takeover operations cannot honor force.
+      hookForceClaim:
+        typeof env.WORKFLOW_INDEX.forceReserveHook === 'function' &&
+        typeof env.WORKFLOW_INDEX.completeHookTakeover === 'function' &&
+        typeof env.WORKFLOW_INDEX.settleHookTakeover === 'function',
+    },
   };
 }
 

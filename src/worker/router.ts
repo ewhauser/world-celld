@@ -701,8 +701,17 @@ export function createRouter(env: WorkerEnv) {
           case 'hooks.reserve':
             result = await index.reserveHook(...validated.args);
             break;
+          case 'hooks.force-reserve':
+            result = await index.forceReserveHook(...validated.args);
+            break;
           case 'hooks.finalize':
             result = await index.finalizeHookIndexes(...validated.args);
+            break;
+          case 'hooks.complete-takeover':
+            result = await index.completeHookTakeover(...validated.args);
+            break;
+          case 'hooks.settle-takeover':
+            result = await index.settleHookTakeover(...validated.args);
             break;
           case 'hooks.release-reservation':
             result = await index.releaseHookReservation(...validated.args);

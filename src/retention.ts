@@ -48,6 +48,16 @@ export interface RunTombstone {
 
 export type RunLifecycleStatus = 'active' | 'terminal' | 'expired' | 'missing';
 
+/** What a forced hook takeover needs to know about the run holding the token. */
+export type ForceClaimVictim =
+  | { lifecycle: 'expired' | 'missing' }
+  | {
+      lifecycle: 'active' | 'terminal';
+      workflowName: string;
+      deploymentId: string;
+      specVersion?: number;
+    };
+
 export type RunReadOutcome<T> =
   | { ok: true; value: T }
   | { ok: false; code: 'RUN_EXPIRED'; message: string; tombstone: RunTombstone };
@@ -70,6 +80,8 @@ export interface TerminalCleanupRecord {
 export interface ReleaseHookIndexesRequest {
   runId: string;
   hooks: HookIndexReference[];
+  /** The owning run ended: keep records whose `tokenRetentionUntil` is still ahead. */
+  runEnded?: boolean;
 }
 
 export interface ReleaseHookIndexesResult {

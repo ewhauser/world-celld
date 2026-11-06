@@ -29,6 +29,7 @@ import type {
   CreateEventRequest,
   Event,
   Hook,
+  HookClaimedFrom,
   RunCreatedEventRequest,
   Step,
   Wait,
@@ -40,6 +41,7 @@ import {
   eventIdToSlot,
   EventSchema,
   getMaxEventsPerRun,
+  HookClaimedFromSchema,
   HookSchema,
   isChildEntityCreationEvent,
   isTerminalStepStatus,
@@ -78,6 +80,13 @@ export const HOOK_CLAIM_CANCELLATION_PREFIX = 'hookclaimcancelled:';
 const ATTRIBUTE_EVENT_MARKER_PREFIX = 'attrevent:';
 /** Durable lazy-hook resume claims, scoped by the containing run DO. */
 const HOOK_RESUME_CLAIM_PREFIX = 'hookresume:';
+/** Hooks another run took over with `experimental_force`, naming the claimer. */
+const HOOK_FORCE_CLAIM_PREFIX = 'hookforced:';
+
+interface HookForceClaim {
+  token: string;
+  claimedBy: { runId: string; hookId: string };
+}
 
 interface HookResumeClaim {
   hookId: string;
@@ -162,6 +171,10 @@ export interface ApplyEventRequest {
   tokenHolder?: { runId: string; hookId: string } | null;
   /** Exact token/ID reservation fenced on ambiguous-delivery resolution. */
   hookClaimId?: string;
+  /** Forced hook_created only: the hook whose token this creation takes over. */
+  claimedFrom?: HookClaimedFrom;
+  /** Forced hook_created only: why it is answered with hook_conflict. */
+  forceRefusedReason?: 'victim-spec-version';
   /** Internal world-celld retention policy captured with the event. */
   cleanup?: ScheduleCleanupRequest;
 }
@@ -234,12 +247,39 @@ export function parseApplyEventRequest(value: unknown): ApplyEventRequest {
     throw new TypeError('applyEvent hookClaimId must be a non-empty string');
   }
 
+  let claimedFrom: HookClaimedFrom | undefined;
+  if (value.claimedFrom !== undefined) {
+    const parsed = HookClaimedFromSchema.safeParse(
+      isRecord(value.claimedFrom) ? compact(value.claimedFrom) : value.claimedFrom,
+    );
+    if (!parsed.success || !parsed.data.runId || !parsed.data.hookId) {
+      throw new TypeError('applyEvent claimedFrom must name a run and a hook');
+    }
+    claimedFrom = parsed.data;
+  }
+  if (
+    value.forceRefusedReason !== undefined &&
+    value.forceRefusedReason !== 'victim-spec-version'
+  ) {
+    throw new TypeError("applyEvent forceRefusedReason must be 'victim-spec-version'");
+  }
+  if (
+    (claimedFrom !== undefined || value.forceRefusedReason !== undefined) &&
+    data.eventType !== 'hook_created'
+  ) {
+    throw new TypeError('applyEvent force-claim fields apply only to hook_created');
+  }
+
   return {
     runId: value.runId,
     data,
     ...(params === undefined ? {} : { params }),
     ...(value.tokenHolder === undefined ? {} : { tokenHolder }),
     ...(value.hookClaimId === undefined ? {} : { hookClaimId: value.hookClaimId }),
+    ...(claimedFrom === undefined ? {} : { claimedFrom }),
+    ...(value.forceRefusedReason === undefined
+      ? {}
+      : { forceRefusedReason: value.forceRefusedReason }),
     ...(value.cleanup === undefined ? {} : { cleanup: value.cleanup as ScheduleCleanupRequest }),
   };
 }
@@ -248,6 +288,7 @@ export type ApplyEventErrorCode =
   | 'RUN_NOT_FOUND'
   | 'STEP_NOT_FOUND'
   | 'HOOK_NOT_FOUND'
+  | 'HOOK_FORCE_CLAIMED'
   | 'WAIT_NOT_FOUND'
   | 'ENTITY_CONFLICT'
   | 'HOOK_CLAIM_CANCELLED'
@@ -263,6 +304,9 @@ export interface ApplyEventFailure {
   retryAfterSeconds?: number;
   /** The run's spec version (RUN_NOT_SUPPORTED only). */
   runSpecVersion?: number;
+  /** HOOK_FORCE_CLAIMED only: the hook's token and the hook that took it. */
+  token?: string;
+  claimedBy?: { runId: string; hookId: string };
 }
 
 export interface ApplyEventSuccess {
@@ -311,7 +355,7 @@ interface ApplyEventContext extends ApplyEventRequest {
 function failure(
   code: ApplyEventErrorCode,
   message: string,
-  extra?: Pick<ApplyEventFailure, 'retryAfterSeconds' | 'runSpecVersion'>,
+  extra?: Pick<ApplyEventFailure, 'retryAfterSeconds' | 'runSpecVersion' | 'token' | 'claimedBy'>,
 ): ApplyEventFailure {
   return { ok: false, code, message, ...extra };
 }
@@ -708,7 +752,27 @@ export async function applyEvent(
           `${HOOK_RELEASE_MARKER_PREFIX}${data.correlationId}`,
         );
         if (released) return { ok: true, releasedHooks: [released] };
+      } else {
+        const forced = await store.get<HookForceClaim>(
+          `${HOOK_FORCE_CLAIM_PREFIX}${data.correlationId}`,
+        );
+        if (forced) {
+          return failure(
+            'HOOK_FORCE_CLAIMED',
+            `Hook "${data.correlationId}" was force-claimed by run "${forced.claimedBy.runId}"`,
+            { token: forced.token, claimedBy: forced.claimedBy },
+          );
+        }
       }
+      return failure('HOOK_NOT_FOUND', `Hook "${data.correlationId}" not found`);
+    }
+    // Terminal cleanup deletes hook entities later, and a retained hook keeps
+    // its token after the run ends, but neither can be resumed.
+    if (
+      data.eventType === 'hook_received' &&
+      currentRun &&
+      isTerminalWorkflowRunStatus(currentRun.status)
+    ) {
       return failure('HOOK_NOT_FOUND', `Hook "${data.correlationId}" not found`);
     }
   }
@@ -1120,7 +1184,13 @@ export async function applyEvent(
         const event = buildEvent({
           eventType: 'hook_conflict',
           correlationId: hookId,
-          eventData: { token, conflictingRunId: holder.runId },
+          eventData: {
+            token,
+            conflictingRunId: holder.runId,
+            ...(data.eventData.force && ctx.forceRefusedReason
+              ? { forceRefusedReason: ctx.forceRefusedReason }
+              : {}),
+          },
         });
         await putEvent(event);
         return { ok: true, event, releasedHooks: [] };
@@ -1139,6 +1209,7 @@ export async function applyEvent(
         return failure('ENTITY_CONFLICT', `Hook "${hookId}" already created`);
       }
 
+      const claimedFrom = data.eventData.force ? ctx.claimedFrom : undefined;
       const hook = HookSchema.parse(
         compact({
           runId,
@@ -1153,9 +1224,15 @@ export async function applyEvent(
           isWebhook: data.eventData.isWebhook ?? false,
           isSystem: data.eventData.isSystem,
           tokenRetentionUntil: data.eventData.tokenRetentionUntil,
+          claimedFrom,
         }),
       );
-      const event = buildEvent({ ...data });
+      // forceClaimedFrom is World-written; a caller-supplied value is dropped.
+      const { forceClaimedFrom: _supplied, ...eventData } = data.eventData;
+      const event = buildEvent({
+        ...data,
+        eventData: { ...eventData, ...(claimedFrom ? { forceClaimedFrom: claimedFrom } : {}) },
+      });
       await store.put(hookKey, hook);
       await store.put(
         creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId),
@@ -1246,6 +1323,95 @@ export async function applyEvent(
       return { ok: true, event, releasedHooks: [] };
     }
   }
+}
+
+/**
+ * The victim half of a forced takeover, inside the victim's RunDO
+ * transaction: the hook leaves, its `hook_disposed{forceClaimedBy}` row is
+ * journaled, and the marker that refuses later deliveries with
+ * HOOK_FORCE_CLAIMED is written, all in one commit. A finished run gets no
+ * row; nothing reads its log.
+ */
+export async function applyForcedHookDisposal(
+  store: EventStore,
+  request: { hookId: string; token: string; claimedBy: { runId: string; hookId: string } },
+  ctx: { runId: string; nextEventId(): string; now: Date },
+): Promise<{ journaled: boolean }> {
+  const forcedKey = `${HOOK_FORCE_CLAIM_PREFIX}${request.hookId}`;
+  if ((await store.get<HookForceClaim>(forcedKey)) !== undefined) return { journaled: false };
+  const hookKey = `${HOOK_KEY_PREFIX}${request.hookId}`;
+  const hook = await store.get<Hook>(hookKey);
+  // Gone already: the run disposed it itself, which released the token too.
+  if (!hook || hook.token !== request.token) return { journaled: false };
+
+  await store.delete(hookKey);
+  await store.delete(creationIndexKey(HOOK_CREATED_KEY_PREFIX, hook.createdAt, hook.hookId));
+  await store.put(`${HOOK_RELEASE_MARKER_PREFIX}${hook.hookId}`, {
+    hookId: hook.hookId,
+    token: hook.token,
+  });
+  await store.put<HookForceClaim>(forcedKey, {
+    token: request.token,
+    claimedBy: { runId: request.claimedBy.runId, hookId: request.claimedBy.hookId },
+  });
+  const run = await store.get<WorkflowRun>(RUN_KEY);
+  if (!run || isTerminalWorkflowRunStatus(run.status)) return { journaled: false };
+  const event = EventSchema.parse({
+    eventType: 'hook_disposed',
+    correlationId: request.hookId,
+    eventData: {
+      token: request.token,
+      forceClaimedBy: { runId: request.claimedBy.runId, hookId: request.claimedBy.hookId },
+    },
+    runId: ctx.runId,
+    eventId: ctx.nextEventId(),
+    createdAt: ctx.now,
+    specVersion: run.specVersion,
+  });
+  await store.put(`${EVENT_KEY_PREFIX}${event.eventId}`, event);
+  return { journaled: true };
+}
+
+/**
+ * Decide a pending forced takeover from the claimer's own log. A forced
+ * hook_created journaled against this victim must be rolled forward;
+ * otherwise the exact reservation is fenced here, in the claimer's
+ * serialization domain, so it can never commit and the takeover can be
+ * abandoned.
+ */
+export async function resolveForcedHookClaim(
+  store: EventStore,
+  request: {
+    hookId: string;
+    token: string;
+    claimId: string;
+    victim: { runId: string; hookId: string };
+  },
+  now: number,
+): Promise<{ journaled: boolean; hook: Hook | null }> {
+  const eventId = await store.get<string>(`${HOOK_EVENT_MARKER_PREFIX}${request.hookId}`);
+  const created =
+    eventId === undefined ? undefined : await store.get<Event>(`${EVENT_KEY_PREFIX}${eventId}`);
+  const claimedFrom =
+    created?.eventType === 'hook_created' ? created.eventData.forceClaimedFrom : undefined;
+  // A creation journaled against an earlier victim is not this takeover's.
+  if (
+    created?.eventType === 'hook_created' &&
+    created.eventData.token === request.token &&
+    claimedFrom?.runId === request.victim.runId &&
+    claimedFrom.hookId === request.victim.hookId
+  ) {
+    const [run, hook] = await Promise.all([
+      store.get<WorkflowRun>(RUN_KEY),
+      store.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`),
+    ]);
+    const live = run && !isTerminalWorkflowRunStatus(run.status) && hook?.token === request.token;
+    return { journaled: true, hook: live ? hook : null };
+  }
+  const cancellation = { hookId: request.hookId, token: request.token, canceledAt: now };
+  await store.put(hookClaimCancellationKey(`${request.claimId}:${request.claimId}`), cancellation);
+  await store.put(hookClaimCancellationKey(`-:${request.claimId}`), cancellation);
+  return { journaled: false, hook: null };
 }
 
 /**
