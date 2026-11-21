@@ -127,6 +127,24 @@ describe('forced hook claims and hook token retention', () => {
     return fleet.cell('runs', runId).instance as WorkflowRunDO;
   }
 
+  it('reuses an unretained terminal token before cleanup without releasing the new owner', async () => {
+    const previous = await startRun('wrun_terminal_reuse_previous');
+    const next = await startRun('wrun_terminal_reuse_next');
+    await createHook(previous, 'previous-hook');
+    await storage.events.create(previous, {
+      eventType: 'run_completed',
+      eventData: { output: [] },
+    });
+    expect(tokenShard().storage.data.has(`hook:${token}`)).toBe(true);
+
+    await expect(createHook(next, 'next-hook')).resolves.toMatchObject({
+      event: { eventType: 'hook_created' },
+    });
+    fleet.advance(1);
+    await fleet.fireDueAlarms();
+    await expect(storage.hooks.getByToken(token)).resolves.toMatchObject({ runId: next });
+  });
+
   it('disposes the victim before the token moves, and refuses a delivery that resolved it', async () => {
     const victim = await startRun('wrun_force_victim');
     const claimer = await startRun('wrun_force_claimer');

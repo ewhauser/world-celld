@@ -344,6 +344,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
           eventType: 'step_started',
           correlationId: 'step-123',
         });
+        if (!started.step) throw new Error('step_started did not return a step');
         expect(started.step.attempt).toBe(1);
         expect(started.step.status).toBe('running');
         expect(started.step.startedAt).toBeInstanceOf(Date);
@@ -367,7 +368,7 @@ describe('Storage (Cloudflare Durable Objects integration)', () => {
           eventType: 'step_started',
           correlationId: 'step-123',
         });
-        expect(restarted.step.attempt).toBe(2);
+        expect(restarted.step?.attempt).toBe(2);
       });
     });
 
