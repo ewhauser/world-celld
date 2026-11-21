@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.10.1 (2026-11-21)
+
+## What's Changed
+* chore(deps): upgrade eligible Workflow adapter packages by @ewhauser in https://github.com/ewhauser/world-celld/pull/109
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.10.0...v0.10.1
+
 ## 0.10.0 (2026-11-06)
 
 ## What's Changed
