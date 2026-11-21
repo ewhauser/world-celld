@@ -189,7 +189,13 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         const now = this.now();
         const indexed = values.get(record) as string | undefined;
         if (indexed !== undefined && !(await this.freeExpiredRetention(txn, token, values, now))) {
-          return { claimed: false as const, holder: ownerFromSerializedHook(indexed) };
+          return {
+            claimed: false as const,
+            holder: ownerFromSerializedHook(indexed),
+            kind: 'indexed' as const,
+            indexed,
+            reclaimable: !values.has(takeoverKey(token)),
+          };
         }
         // The victim released the token while a takeover was pending. A live
         // takeover holds the token like an in-flight claim, so answer without
@@ -239,8 +245,41 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         await this.settleTakeover(token);
         continue;
       }
+      if (result?.kind === 'indexed') {
+        // A completed run may not have fired the cleanup alarm yet. Only
+        // reclaim its unchanged, unretained record; never displace a takeover.
+        const hook = parse<Hook>(result.indexed);
+        if (result.reclaimable && !retentionAhead(hook, this.now())) {
+          const lifecycle = await runCell(this.env, hook.runId).getLifecycleStatus();
+          if (lifecycle === 'terminal' || lifecycle === 'expired') {
+            const retry = await this.dropInactiveRecord(token, result.indexed);
+            if (retry) continue;
+          }
+        }
+        return { claimed: false, holder: result.holder };
+      }
       if (result) return result;
     }
+  }
+
+  private async dropInactiveRecord(token: string, indexed: string): Promise<boolean> {
+    return await this.ctx.storage.transaction(async (txn) => {
+      const record = recordKey(token);
+      const retainedKeyForToken = retainedKey(token);
+      const keys = await txn.get<TokenValue>([record, retainedKeyForToken, takeoverKey(token)]);
+      if (keys.get(record) !== indexed) return true;
+      if (keys.has(takeoverKey(token)) || retentionAhead(parse<Hook>(indexed), this.now())) {
+        return false;
+      }
+      const retained = keys.get(retainedKeyForToken) as RetainedToken | undefined;
+      if (retained) {
+        if (retained.until > this.now()) return false;
+        await txn.delete([record, retainedKeyForToken, retained.deadlineKey]);
+      } else {
+        await txn.delete(record);
+      }
+      return true;
+    });
   }
 
   /**

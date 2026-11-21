@@ -263,6 +263,7 @@ describe('workflow fault state correctness', () => {
               eventType: 'step_started',
               correlationId: 'fault-step',
             });
+            if (!started.step) throw new Error('step_started did not return a step');
             retryErrors.push(started.step.error);
             const completed = await storage.events.create(runId, {
               eventType: 'step_completed',
