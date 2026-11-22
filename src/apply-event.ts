@@ -31,6 +31,7 @@ import type {
   Hook,
   HookClaimedFrom,
   RunCreatedEventRequest,
+  StartHook,
   Step,
   Wait,
   WorkflowRun,
@@ -46,6 +47,11 @@ import {
   isChildEntityCreationEvent,
   isTerminalStepStatus,
   isTerminalWorkflowRunStatus,
+  isStartHookId,
+  DEFAULT_TIMESTAMP_THRESHOLD_FUTURE_MS,
+  START_HOOK_CANDIDATE_MAX_AGE_MS,
+  startHookId,
+  ulidToDate,
   SPEC_VERSION_CURRENT,
   slotToEventId,
   StepSchema,
@@ -58,6 +64,21 @@ import type { ScheduleCleanupRequest } from './retention.js';
 
 /** Storage key for the run entity. */
 const RUN_KEY = 'run';
+const MAX_START_HOOK_RETENTION_MS = 365 * 24 * 60 * 60 * 1000;
+export const START_HOOK_REFUSAL_KEY = 'start-hook:refusal';
+
+export function requestedStartHook(data: ApplyEventRequest['data']): StartHook | undefined {
+  return data.eventType === 'run_created' || data.eventType === 'run_started'
+    ? data.eventData?.startHook
+    : undefined;
+}
+
+export interface StartHookRefusal {
+  token: string;
+  conflictingRunId: string;
+  expiresAt: number;
+}
+
 /** Key prefixes for per-entity storage. */
 export const EVENT_KEY_PREFIX = 'event:';
 export const STEP_KEY_PREFIX = 'step:';
@@ -289,6 +310,8 @@ export type ApplyEventErrorCode =
   | 'STEP_NOT_FOUND'
   | 'HOOK_NOT_FOUND'
   | 'HOOK_FORCE_CLAIMED'
+  | 'START_HOOK_CONFLICT'
+  | 'START_HOOK_ADMISSION_REJECTED'
   | 'WAIT_NOT_FOUND'
   | 'ENTITY_CONFLICT'
   | 'HOOK_CLAIM_CANCELLED'
@@ -306,6 +329,8 @@ export interface ApplyEventFailure {
   runSpecVersion?: number;
   /** HOOK_FORCE_CLAIMED only: the hook's token and the hook that took it. */
   token?: string;
+  conflictingRunId?: string;
+  reason?: 'invalid' | 'expired' | 'token_mismatch' | 'ordinary_run' | 'disabled';
   claimedBy?: { runId: string; hookId: string };
 }
 
@@ -355,7 +380,10 @@ interface ApplyEventContext extends ApplyEventRequest {
 function failure(
   code: ApplyEventErrorCode,
   message: string,
-  extra?: Pick<ApplyEventFailure, 'retryAfterSeconds' | 'runSpecVersion' | 'token' | 'claimedBy'>,
+  extra?: Pick<
+    ApplyEventFailure,
+    'retryAfterSeconds' | 'runSpecVersion' | 'token' | 'claimedBy' | 'conflictingRunId' | 'reason'
+  >,
 ): ApplyEventFailure {
   return { ok: false, code, message, ...extra };
 }
@@ -551,6 +579,108 @@ export async function applyEvent(
     currentRun = await store.get<WorkflowRun>(RUN_KEY);
   }
 
+  const startHook = requestedStartHook(data);
+  let storedStartHook: StartHook | undefined;
+  let hookToIndex: Hook | undefined;
+  const startRejected = (reason: NonNullable<ApplyEventFailure['reason']>) =>
+    failure('START_HOOK_ADMISSION_REJECTED', `Start Hook admission refused: ${reason}`, { reason });
+  if (startHook) {
+    const stamp = runId.startsWith('wrun_') && ulidToDate(runId.slice(5));
+    if (!stamp || stamp.getTime() > now.getTime() + DEFAULT_TIMESTAMP_THRESHOLD_FUTURE_MS) {
+      return startRejected('invalid');
+    }
+    const expiresAt = stamp.getTime() + START_HOOK_CANDIDATE_MAX_AGE_MS;
+    if (expiresAt <= now.getTime()) return startRejected('expired');
+
+    const hookId = startHookId(runId);
+    if (
+      !startHook.token ||
+      (startHook.hookId !== undefined && startHook.hookId !== hookId) ||
+      (startHook.tokenRetentionUntil?.getTime() ?? 0) >
+        now.getTime() + MAX_START_HOOK_RETENTION_MS + DEFAULT_TIMESTAMP_THRESHOLD_FUTURE_MS
+    ) {
+      return startRejected('invalid');
+    }
+    const existing =
+      data.eventType === 'run_created' ? await store.get<WorkflowRun>(RUN_KEY) : currentRun;
+    if (existing) {
+      if (!existing.startHook) return startRejected('ordinary_run');
+      if (existing.startHook.token !== startHook.token) return startRejected('token_mismatch');
+      // An accepted replay never resurrects a disposed Hook. If the claim is
+      // still live, it can repair an interrupted derivative index publication.
+      if (ctx.hookClaimId && !isTerminalWorkflowRunStatus(existing.status)) {
+        hookToIndex = await store.get<Hook>(`${HOOK_KEY_PREFIX}${hookId}`);
+      }
+      if (data.eventType === 'run_created') {
+        return { ok: true, run: existing, hookToIndex, releasedHooks: [] };
+      }
+    } else {
+      const refused = await store.get<StartHookRefusal>(START_HOOK_REFUSAL_KEY);
+      const token = startHook.token;
+      if (refused && refused.token !== token) return startRejected('token_mismatch');
+      if (refused || (ctx.tokenHolder && ctx.tokenHolder.runId !== runId)) {
+        const conflictingRunId = refused?.conflictingRunId ?? ctx.tokenHolder!.runId;
+        if (!refused) {
+          await store.put(START_HOOK_REFUSAL_KEY, { token, conflictingRunId, expiresAt });
+        }
+        return failure('START_HOOK_CONFLICT', 'Start Hook token is already held', {
+          token,
+          conflictingRunId,
+        });
+      }
+      // Fail closed if an old or unsupported path omitted admission.
+      if (!ctx.hookClaimId) return startRejected('invalid');
+      const [tokenClaim, idClaim] = ctx.hookClaimId.split(':');
+      if (!tokenClaim || tokenClaim === '-' || !idClaim) return startRejected('invalid');
+      // Each shard can expire independently, including when its claim ID
+      // differs from the other shard's. Check both authoritative fences.
+      const fences = await getMany(store, [
+        hookClaimCancellationKey(ctx.hookClaimId),
+        hookClaimCancellationKey(`${tokenClaim}:${tokenClaim}`),
+        hookClaimCancellationKey(`-:${idClaim}`),
+      ]);
+      if (fences.size) {
+        return failure('HOOK_CLAIM_CANCELLED', 'Start Hook reservation was fenced before commit');
+      }
+      if (
+        data.eventType === 'run_started' &&
+        (!data.eventData?.deploymentId ||
+          !data.eventData.workflowName ||
+          data.eventData.input === undefined)
+      ) {
+        return startRejected('invalid');
+      }
+      storedStartHook = { ...startHook, hookId };
+      hookToIndex = HookSchema.parse(
+        compact({
+          ...storedStartHook,
+          runId,
+          ownerId: '',
+          projectId: '',
+          environment: '',
+          createdAt: now,
+          specVersion,
+          isWebhook: false,
+        }),
+      );
+    }
+  } else if (
+    (data.eventType === 'run_created' ||
+      (data.eventType === 'run_started' && !currentRun && data.eventData)) &&
+    (await store.get(START_HOOK_REFUSAL_KEY))
+  ) {
+    return startRejected('token_mismatch');
+  }
+
+  const persistStartHook = async (): Promise<void> => {
+    if (!storedStartHook || !hookToIndex) return;
+    await store.put(`${HOOK_KEY_PREFIX}${hookToIndex.hookId}`, hookToIndex);
+    await store.put(
+      creationIndexKey(HOOK_CREATED_KEY_PREFIX, hookToIndex.createdAt, hookToIndex.hookId),
+      hookToIndex.hookId,
+    );
+  };
+
   // ============================================================
   // RESILIENT START: run_started on a non-existent run bootstraps the run
   // from the message's runInput (spec >= 3 queue transport).
@@ -581,6 +711,7 @@ export async function applyEvent(
           executionContext,
           attributes,
           encryptionPublicKey,
+          startHook: storedStartHook,
           input,
           status: 'pending',
           output: undefined,
@@ -601,10 +732,12 @@ export async function applyEvent(
           attributes,
           allowReservedAttributes,
           encryptionPublicKey,
+          startHook: storedStartHook,
         },
       });
       await store.put(RUN_KEY, createdRun);
       await putEvent(runCreatedEvent);
+      await persistStartHook();
       currentRun = createdRun;
       bootstrapped = { workflowName, createdAt: now };
     }
@@ -704,6 +837,9 @@ export async function applyEvent(
   // ============================================================
   // GUARDS: hook event ordering
   // ============================================================
+  if (data.eventType === 'hook_created' && isStartHookId(runId, data.correlationId)) {
+    return startRejected('invalid');
+  }
   if (data.eventType === 'hook_received' && ctx.params?.resumeId) {
     const claim = await store.get<HookResumeClaim>(
       `${HOOK_RESUME_CLAIM_PREFIX}${ctx.params.resumeId}`,
@@ -810,6 +946,7 @@ export async function applyEvent(
           executionContext: data.eventData.executionContext,
           attributes: data.eventData.attributes,
           encryptionPublicKey: data.eventData.encryptionPublicKey,
+          startHook: storedStartHook,
           input: data.eventData.input,
           status: 'pending',
           output: undefined,
@@ -820,13 +957,18 @@ export async function applyEvent(
           updatedAt: now,
         }),
       );
-      const event = buildEvent({ ...data });
+      const event = buildEvent({
+        ...data,
+        eventData: { ...data.eventData, startHook: storedStartHook },
+      });
       await store.put(RUN_KEY, run);
       await putEvent(event);
+      await persistStartHook();
       return {
         ok: true,
         event,
         run,
+        hookToIndex,
         releasedHooks: [],
         runCreated: { workflowName: data.eventData.workflowName, createdAt: now },
       };
@@ -842,6 +984,7 @@ export async function applyEvent(
         const result: ApplyEventSuccess = {
           ok: true,
           run: currentRun,
+          hookToIndex,
           releasedHooks: [],
           maxEvents: getMaxEventsPerRun(),
         };
@@ -880,6 +1023,7 @@ export async function applyEvent(
         run,
         releasedHooks: [],
         runCreated: bootstrapped,
+        hookToIndex,
         maxEvents: getMaxEventsPerRun(),
       };
       if (ctx.params?.skipPreload) return result;

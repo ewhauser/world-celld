@@ -7,11 +7,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
-import { RunExpiredError } from '@workflow/errors';
-import { SPEC_VERSION_CURRENT } from '@workflow/world';
+import { HookConflictError, RunExpiredError } from '@workflow/errors';
+import { SPEC_VERSION_CURRENT, startHookId } from '@workflow/world';
 import { build } from 'esbuild';
+import { ulid } from 'ulid';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { createCelldWorld } from '../../src/index.js';
+import { createCelldWorld, createWorld } from '../../src/index.js';
 
 const execFileAsync = promisify(execFile);
 const CELLD_BIN = process.env.CELLD_SMOKE_CELLD_BIN;
@@ -1123,6 +1124,51 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
       expect(deliveries.length).toBe(before);
     },
   );
+
+  it('admits exactly one atomic start Hook across real celld transactions', async () => {
+    const config = { fleetUrl: runtime!.url, secret: SECRET, baseUrl: callbackBaseUrl };
+    const [first, second] = await Promise.all([createWorld(config), createWorld(config)]);
+    expect(first.capabilities?.atomicStartHook?.active).toBe(true);
+    const token = `atomic-start-${randomUUID()}`;
+    const eventData = {
+      deploymentId: 'atomic-start-smoke',
+      workflowName: 'start-session',
+      input: [],
+      startHook: { token },
+    };
+    const runIds = Array.from({ length: 4 }, () => `wrun_${ulid()}`);
+    const results = await Promise.allSettled(
+      runIds.map((runId, i) => {
+        const data = { specVersion: SPEC_VERSION_CURRENT, eventData };
+        return i % 2 === 0
+          ? first.events.create(runId, { eventType: 'run_created', ...data })
+          : second.events.create(runId, { eventType: 'run_started', ...data });
+      }),
+    );
+    const winner = await first.hooks.getByToken(token);
+    expect(runIds).toContain(winner.runId);
+    expect(winner.hookId).toBe(startHookId(winner.runId));
+    const accepted = results.filter((result) => result.status === 'fulfilled');
+    const refused = results.flatMap((result, i) =>
+      result.status === 'rejected' ? [{ runId: runIds[i], reason: result.reason }] : [],
+    );
+    expect(accepted).toHaveLength(1);
+    expect(accepted[0]?.value.run).toMatchObject({ runId: winner.runId, startHook: { token } });
+    expect(refused).toHaveLength(3);
+    for (const { runId, reason } of refused) {
+      expect(HookConflictError.is(reason)).toBe(true);
+      expect(reason).toMatchObject({ conflictingRunId: winner.runId });
+      await expect(second.runs.get(runId)).rejects.toMatchObject({
+        name: 'WorkflowRunNotFoundError',
+      });
+      await expect(second.hooks.get(startHookId(runId))).rejects.toMatchObject({
+        name: 'HookNotFoundError',
+      });
+    }
+    expect(
+      (await first.events.list({ runId: winner.runId })).data.map((e) => e.eventType),
+    ).toContain('run_created');
+  });
 
   it('does not expose the removed HTTP delivery route', async () => {
     const response = await fetch(`${runtime!.url}/v1/queue/deliver`, {

@@ -144,8 +144,14 @@ try {
     [
       `import { createCelldWorld, createWorld } from '${PACKAGE_NAME}';`,
       `import { FakeFleet, startDevFleet } from '${PACKAGE_NAME}/testing';`,
-      "if (typeof createCelldWorld !== 'function' || createWorld !== createCelldWorld) throw new Error('root exports are invalid');",
+      "if (typeof createCelldWorld !== 'function' || typeof createWorld !== 'function') throw new Error('root exports are invalid');",
       "if (typeof FakeFleet !== 'function' || typeof startDevFleet !== 'function') throw new Error('testing exports are invalid');",
+      "const fleet = await startDevFleet({ secret: 'package-smoke-secret' });",
+      'try {',
+      "  const config = { fleetUrl: fleet.url, secret: 'package-smoke-secret' };",
+      "  if (!(await createWorld(config)).capabilities?.atomicStartHook?.active) throw new Error('remote factory did not negotiate atomic starts');",
+      "  if (createCelldWorld(config).capabilities?.atomicStartHook?.active) throw new Error('unprobed world advertised atomic starts');",
+      '} finally { await fleet.stop(); }',
     ].join('\n'),
   );
   run(process.execPath, ['smoke.mjs'], { cwd: consumerDirectory });

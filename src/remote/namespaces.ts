@@ -32,6 +32,7 @@ interface MethodSpec {
 const RUNS: MethodSpec = {
   methods: [
     'applyEvent',
+    'applyStartHookEvent',
     'getLifecycleStatus',
     'getRun',
     'getStep',
@@ -48,6 +49,7 @@ const RUNS: MethodSpec = {
   ],
   mutating: new Set([
     'applyEvent',
+    'applyStartHookEvent',
     'scheduleCleanup',
     'cleanupNow',
     'rearmCleanup',
@@ -153,7 +155,7 @@ async function listResolvedRuns(
   }
 }
 
-export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
+export function createRemoteEnv(transport: RpcTransport, atomicStartHooks = false): CelldWorldEnv {
   const runCatalog = makeNamespace<RunCatalogShardStub>(transport, 'run-catalog', RUN_CATALOG);
   const hookTokens = makeNamespace<HookTokenShardStub>(transport, 'hook-tokens', HOOK_TOKENS);
   const hookIds = makeNamespace<HookIdShardStub>(transport, 'hook-ids', HOOK_IDS);
@@ -163,6 +165,12 @@ export function createRemoteEnv(transport: RpcTransport): CelldWorldEnv {
     WORKFLOW_STREAMS: makeStreamNamespace(transport),
     WORKFLOW_INDEX: {
       ...workflowIndex,
+      reserveStartHook: atomicStartHooks
+        ? (token, owner) =>
+            callFleetRoute(transport, '/v1/index/hooks/reserve-start', [token, owner], {
+              idempotent: true,
+            })
+        : undefined,
       commitRun: (run, serializedMetadata, publicationExpiresAt) =>
         callFleetRoute(
           transport,

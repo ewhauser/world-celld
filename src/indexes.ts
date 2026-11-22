@@ -83,6 +83,16 @@ export type HookReservationResult =
 export interface HookTokenShardStub {
   get(token: string): Promise<string | null>;
   reserve(token: string, owner: HookTokenOwner, proposedClaimId: string): Promise<HookClaimResult>;
+  preserveRetainedStartHook(
+    token: string,
+    owner: HookTokenOwner,
+    serializedHook: string,
+  ): Promise<void>;
+  reserveStart(
+    token: string,
+    owner: HookTokenOwner,
+    proposedClaimId: string,
+  ): Promise<HookForceClaimResult>;
   finalize(
     token: string,
     serializedHook: string,
@@ -153,6 +163,8 @@ export interface WorkflowIndex {
   getHookByToken(token: string): Promise<string | null>;
   getHookById(hookId: string): Promise<string | null>;
   reserveHook(token: string, owner: HookTokenOwner): Promise<HookReservationResult>;
+  /** Only confirmed owners conflict; an uncommitted holder is retryable. */
+  reserveStartHook?(token: string, owner: HookTokenOwner): Promise<HookReservationResult>;
   /** `experimental_force`: take the token over from a live holder instead of conflicting. */
   forceReserveHook?(
     token: string,
@@ -289,7 +301,8 @@ type HookTakeoverOperations =
   | 'forceReserveHook'
   | 'completeHookTakeover'
   | 'settleHookTakeover'
-  | 'retainsHookTokens';
+  | 'retainsHookTokens'
+  | 'reserveStartHook';
 
 export function createWorkflowIndex(
   bindings: WorkflowIndexBindings,
@@ -329,12 +342,15 @@ export function createWorkflowIndex(
     token: string,
     owner: HookTokenOwner,
     force?: { preempt?: boolean },
+    start = false,
   ): Promise<HookReservationResult> => {
     const proposedClaimId = crypto.randomUUID();
     const tokenTarget = stub(bindings.hookTokens, hookTokenShardName(token));
     const tokenClaim: HookForceClaimResult = force
       ? await tokenTarget.forceReserve(token, owner, proposedClaimId, force.preempt === true)
-      : await tokenTarget.reserve(token, owner, proposedClaimId);
+      : start
+        ? await tokenTarget.reserveStart(token, owner, proposedClaimId)
+        : await tokenTarget.reserve(token, owner, proposedClaimId);
     if (!tokenClaim.claimed && !sameOwner(tokenClaim.holder, owner)) {
       return {
         admitted: false,
@@ -438,6 +454,10 @@ export function createWorkflowIndex(
 
     reserveHook(token, owner) {
       return reserveHook(token, owner);
+    },
+
+    reserveStartHook(token, owner) {
+      return reserveHook(token, owner, undefined, true);
     },
 
     forceReserveHook(token, owner, options) {

@@ -6,6 +6,7 @@
 import { SPEC_VERSION_CURRENT, type World } from '@workflow/world';
 import { type CelldWorldConfig, type CelldWorldEnv, resolveConfig } from './config.js';
 import { createRemoteEnv } from './remote/namespaces.js';
+import { callFleetRoute } from './remote/rpc-client.js';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
 import { createStreamer, type CelldStreamer } from './streamer.js';
@@ -151,6 +152,7 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     // run when run_created has not landed yet.
     specVersion: SPEC_VERSION_CURRENT,
     capabilities: {
+      atomicStartHook: { active: typeof env.WORKFLOW_INDEX.reserveStartHook === 'function' },
       // Retention lives in the index's token shards; an injected index must
       // opt in, since releasing a run's hooks would otherwise drop them.
       hookRetention: { active: env.WORKFLOW_INDEX.retainsHookTokens === true },
@@ -163,5 +165,49 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
   };
 }
 
-// Export createWorld as an alias for compatibility with @workflow/world
-export { createCelldWorld as createWorld };
+/**
+ * Workflow's asynchronous World factory. Probe the authenticated fleet before
+ * exposing atomic start admission. Synchronous createCelldWorld() cannot do
+ * this for URL-based worlds, so use this factory for remote atomic starts.
+ */
+export async function createWorld(config?: CelldWorldConfig): Promise<CelldWorld> {
+  const resolved = resolveConfig(config);
+  if (
+    resolved.env ||
+    (globalThis as { CELLD_ENV?: CelldWorldEnv }).CELLD_ENV ||
+    !resolved.fleetUrl ||
+    !resolved.secret
+  ) {
+    return createCelldWorld(config);
+  }
+
+  const transport = {
+    fleetUrl: resolved.fleetUrl,
+    secret: resolved.secret,
+    timeoutMs: resolved.rpcTimeoutMs,
+  };
+  let active = false;
+  try {
+    const capability = await callFleetRoute<{ active?: boolean } | null>(
+      transport,
+      '/v1/index/hooks/start-capability',
+      [],
+      { idempotent: true },
+    );
+    active = capability?.active === true;
+  } catch (error) {
+    const status = (error as { status?: unknown }).status;
+    // A rejected secret is a configuration error; every later call would fail too.
+    if (status === 401 || status === 403) throw error;
+    // A worker from before start Hooks (404) is still valid for ordinary runs.
+    // Any other probe failure must not take the World down: leave atomic
+    // starts disabled, which fails closed with START_HOOK_ADMISSION_DISABLED.
+    if (status !== 404) {
+      console.warn(
+        'world-celld: atomic start Hook capability probe failed; atomic starts are disabled',
+        error,
+      );
+    }
+  }
+  return createCelldWorld({ ...config, env: createRemoteEnv(transport, active) });
+}
