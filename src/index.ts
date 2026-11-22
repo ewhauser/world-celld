@@ -196,8 +196,18 @@ export async function createWorld(config?: CelldWorldConfig): Promise<CelldWorld
     );
     active = capability?.active === true;
   } catch (error) {
-    // A worker from before start Hooks is still valid for ordinary runs.
-    if ((error as { status?: unknown }).status !== 404) throw error;
+    const status = (error as { status?: unknown }).status;
+    // A rejected secret is a configuration error; every later call would fail too.
+    if (status === 401 || status === 403) throw error;
+    // A worker from before start Hooks (404) is still valid for ordinary runs.
+    // Any other probe failure must not take the World down: leave atomic
+    // starts disabled, which fails closed with START_HOOK_ADMISSION_DISABLED.
+    if (status !== 404) {
+      console.warn(
+        'world-celld: atomic start Hook capability probe failed; atomic starts are disabled',
+        error,
+      );
+    }
   }
   return createCelldWorld({ ...config, env: createRemoteEnv(transport, active) });
 }

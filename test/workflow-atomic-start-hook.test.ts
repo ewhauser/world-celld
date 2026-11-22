@@ -165,6 +165,65 @@ describe('celld atomic admission recovery', () => {
     ).resolves.toMatchObject({ run: { runId } });
   });
 
+  it('keeps the shared reservation when the sibling start copy fails before publication', async () => {
+    const runId = newRunId();
+    const token = 'eve:inbox:v1:sibling-failure';
+    const cell = harness.fleet.cell('runs', runId).instance as WorkflowRunDO;
+    const apply = cell.applyStartHookEvent.bind(cell);
+    vi.spyOn(cell, 'applyStartHookEvent').mockImplementation(async (request) => {
+      if (request.data.eventType === 'run_started') {
+        return {
+          ok: false,
+          code: 'START_HOOK_ADMISSION_REJECTED',
+          message: 'injected sibling failure',
+          reason: 'invalid',
+        };
+      }
+      const outcome = await apply(request);
+      // The queued copy fails after the direct copy committed but before the
+      // direct copy's client finalizes the shared token reservation.
+      await expect(
+        second.events.create(runId, {
+          eventType: 'run_started',
+          eventData: { ...create(token).eventData },
+        } as unknown as RunCreatedEventRequest),
+      ).rejects.toMatchObject({ code: 'START_HOOK_ADMISSION_REJECTED' });
+      return outcome;
+    });
+    await expect(world.events.create(runId, create(token))).resolves.toMatchObject({
+      run: { runId },
+    });
+    await expect(second.hooks.getByToken(token)).resolves.toMatchObject({ runId });
+    await expect(second.events.create(newRunId(), create(token))).rejects.toMatchObject({
+      name: 'HookConflictError',
+      conflictingRunId: runId,
+    });
+  });
+
+  it('creates the World with atomic starts disabled when the probe fails transiently', async () => {
+    const fetch = globalThis.fetch.bind(globalThis);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    vi.spyOn(globalThis, 'fetch').mockImplementation((input, init) =>
+      (input instanceof Request ? input.url : input.toString()).endsWith(
+        '/v1/index/hooks/start-capability',
+      )
+        ? Promise.resolve(new Response('boom', { status: 500 }))
+        : fetch(input, init),
+    );
+    const degraded = await createWorld({ fleetUrl: harness.url, secret });
+    expect(degraded.capabilities?.atomicStartHook?.active).toBe(false);
+    expect(warn).toHaveBeenCalled();
+    await expect(degraded.events.create(newRunId(), create('probe-failed'))).rejects.toMatchObject({
+      code: 'START_HOOK_ADMISSION_DISABLED',
+    });
+  });
+
+  it('rejects World creation when the fleet refuses the secret', async () => {
+    await expect(
+      createWorld({ fleetUrl: harness.url, secret: 'wrong-secret' }),
+    ).rejects.toMatchObject({ status: 401 });
+  });
+
   it('does not admit an atomic start on a synchronous, unprobed HTTP adapter', async () => {
     const unprobed = createCelldWorld({ fleetUrl: harness.url, secret });
     expect(unprobed.capabilities?.atomicStartHook?.active).toBe(false);

@@ -56,6 +56,13 @@ advertising the capability. When constructing a URL-based World explicitly, use
 probe a remote worker, so it does not advertise that capability on its own.
 Keep the app and worker compatible until existing deliveries drain.
 
+**Breaking:** `createWorld()` now returns a `Promise<CelldWorld>`; it was
+previously a synchronous alias of `createCelldWorld()`. Code that called it
+directly must `await` it, or switch to `createCelldWorld()`. If the capability
+probe fails for any reason other than a rejected secret, the World is still
+created with atomic starts disabled (a warning is logged); such starts fail
+with `START_HOOK_ADMISSION_DISABLED` rather than dropping the Hook.
+
 Run listing accepts either a single status or an array of statuses (OR matching).
 An empty status array matches no runs.
 

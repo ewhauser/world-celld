@@ -141,6 +141,13 @@ const MAX_FORCED_HOOK_ADMISSIONS = 4;
  */
 const MAX_FORCED_HOOK_WAITS = 6;
 const FORCED_HOOK_WAIT_MS = 10;
+/**
+ * A start waits this long in total for an uncommitted competitor's lease to
+ * commit or be fenced before answering a retryable 429. Bounded by time, not
+ * attempts, so a slow (cold) winner does not turn every loser into a 429.
+ */
+const START_HOOK_MAX_WAIT_MS = 5_000;
+const START_HOOK_MAX_POLL_MS = 250;
 
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -168,6 +175,35 @@ async function settleAmbiguousTakeover(
   } else {
     await index.releaseHookReservation(token, owner, reservation);
   }
+}
+
+/**
+ * The direct run_created and the queued run_started for one candidate reserve
+ * as the same owner and so share one claim. One copy finishing without the
+ * Hook says nothing about the other, which may be about to commit. Resolve the
+ * claim in the run cell first: that transaction either observes the committed
+ * Hook (keep the claim for its finalization) or fences this exact claim so the
+ * other copy cannot commit after the release. If resolution itself fails, keep
+ * the claim; the token shard resolves it the same way once its lease expires.
+ */
+async function releaseUncommittedStartReservation(
+  stub: WorkflowRunDOStub,
+  index: IndexNamespace,
+  admission: HookAdmission | undefined,
+): Promise<void> {
+  if (!admission) return;
+  const { token, owner, reservation } = admission;
+  let resolution: { committed: boolean };
+  try {
+    resolution = await stub.resolveHookTokenClaim({
+      hookId: owner.hookId,
+      token,
+      claimId: reservation.claimId,
+    });
+  } catch {
+    return;
+  }
+  if (!resolution.committed) await index.releaseHookReservation(token, owner, reservation);
 }
 
 function hookOwner(hook: Pick<Hook, 'runId' | 'hookId'>): HookTokenOwner {
@@ -692,6 +728,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         let parsedOutcome: ParsedApplyEventOutcome;
         let waits = 0;
         let admissions = 0;
+        let startWaitedMs = 0;
         for (;;) {
           let tokenHolder: ApplyEventRequest['tokenHolder'];
           let claimedFrom: HookClaimedFrom | undefined;
@@ -701,13 +738,19 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             const owner = { runId: effectiveRunId, hookId: startHookId(effectiveRunId) };
             const admission = await env.WORKFLOW_INDEX.reserveStartHook!(startHook.token, owner);
             if (!admission.admitted && admission.pending) {
-              if (waits >= 12) {
+              if (startWaitedMs >= START_HOOK_MAX_WAIT_MS) {
                 throw new WorkflowWorldError('Start Hook token admission is still in progress', {
                   status: 429,
                   retryAfter: 1,
                 });
               }
-              await delay(FORCED_HOOK_WAIT_MS * 2 ** Math.min(waits++, 4));
+              const pause = Math.min(
+                FORCED_HOOK_WAIT_MS * 2 ** Math.min(waits++, 5),
+                START_HOOK_MAX_POLL_MS,
+                START_HOOK_MAX_WAIT_MS - startWaitedMs,
+              );
+              await delay(pause);
+              startWaitedMs += pause;
               continue;
             }
             if (admission.admitted) {
@@ -799,7 +842,9 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           }
 
           if (parsedOutcome.kind === 'success') break;
-          if (hookAdmission) {
+          if (startHook) {
+            await releaseUncommittedStartReservation(stub, env.WORKFLOW_INDEX, hookAdmission);
+          } else if (hookAdmission) {
             await env.WORKFLOW_INDEX.releaseHookReservation(
               hookAdmission.token,
               hookAdmission.owner,
@@ -862,6 +907,8 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
             hookOwner(outcome.hookToIndex),
             hookAdmission?.reservation,
           );
+        } else if (startHook) {
+          await releaseUncommittedStartReservation(stub, env.WORKFLOW_INDEX, hookAdmission);
         } else if (hookAdmission) {
           await env.WORKFLOW_INDEX.releaseHookReservation(
             hookAdmission.token,
