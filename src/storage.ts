@@ -1,5 +1,6 @@
 import {
   EntityConflictError,
+  HookConflictError,
   HookForceClaimedError,
   HookNotFoundError,
   RunExpiredError,
@@ -36,6 +37,9 @@ import {
   CreateEventSchema,
   EventSchema,
   HookSchema,
+  isStartHookId,
+  ulidToDate,
+  startHookId,
   SPEC_VERSION_CURRENT,
   StepSchema,
   WaitSchema,
@@ -43,6 +47,7 @@ import {
 } from '@workflow/world';
 import { parse, stringify } from './vendor/shared/index.js';
 import { monotonicFactory } from 'ulid';
+import { requestedStartHook } from './apply-event.js';
 import type {
   ApplyEventErrorCode,
   ApplyEventFailure,
@@ -63,6 +68,7 @@ import type { RunReadOutcome } from './retention.js';
  */
 export interface WorkflowRunDOStub {
   applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome>;
+  applyStartHookEvent?(request: ApplyEventRequest): Promise<ApplyEventOutcome>;
   resolveHookTokenClaim(request: {
     hookId: string;
     token: string;
@@ -173,6 +179,8 @@ const APPLY_EVENT_ERROR_CODES = new Set<string>([
   'STEP_NOT_FOUND',
   'HOOK_NOT_FOUND',
   'HOOK_FORCE_CLAIMED',
+  'START_HOOK_CONFLICT',
+  'START_HOOK_ADMISSION_REJECTED',
   'WAIT_NOT_FOUND',
   'ENTITY_CONFLICT',
   'HOOK_CLAIM_CANCELLED',
@@ -193,6 +201,8 @@ interface ApplyEventWireFailure {
   worldSpecVersion?: number;
   details?: unknown;
   token?: string;
+  conflictingRunId?: string;
+  reason?: string;
   claimedBy?: HookTokenOwner;
 }
 
@@ -287,6 +297,19 @@ function parseApplyEventOutcome(value: unknown): ParsedApplyEventOutcome {
         value.claimedBy.hookId.length === 0)
     ) {
       malformedApplyEventOutcome('HOOK_FORCE_CLAIMED must name the token and its claimer');
+    }
+
+    if (
+      value.code === 'START_HOOK_CONFLICT' &&
+      (typeof value.token !== 'string' ||
+        !value.token ||
+        typeof value.conflictingRunId !== 'string' ||
+        !value.conflictingRunId)
+    ) {
+      malformedApplyEventOutcome('START_HOOK_CONFLICT must name the token and its owner');
+    }
+    if (value.code === 'START_HOOK_ADMISSION_REJECTED' && typeof value.reason !== 'string') {
+      malformedApplyEventOutcome('START_HOOK_ADMISSION_REJECTED must give the reason');
     }
 
     const outcome = value as unknown as ApplyEventWireFailure;
@@ -458,6 +481,14 @@ function throwOutcomeError(
       throw new WorkflowWorldError(outcome.message, { status: 404, code: outcome.code });
     case 'HOOK_NOT_FOUND':
       throw withCode(new HookNotFoundError(data.correlationId ?? runId));
+    case 'START_HOOK_CONFLICT':
+      throw new HookConflictError(outcome.token!, outcome.conflictingRunId, { kind: 'start' });
+    case 'START_HOOK_ADMISSION_REJECTED':
+      throw new WorkflowWorldError(outcome.message, {
+        status: 400,
+        code: outcome.code,
+        reason: outcome.reason,
+      });
     case 'HOOK_FORCE_CLAIMED':
       throw withCode(
         new HookForceClaimedError(
@@ -620,6 +651,38 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
         }
 
         const stub = getRunDO(effectiveRunId);
+        const startHook = requestedStartHook(data);
+        if (
+          startHook &&
+          (!runId?.startsWith('wrun_') ||
+            !ulidToDate(runId.slice(5)) ||
+            !startHook.token ||
+            (startHook.hookId !== undefined && startHook.hookId !== startHookId(runId)))
+        ) {
+          throw new WorkflowWorldError('Invalid atomic start Hook or candidate run ID', {
+            status: 400,
+            code: 'START_HOOK_ADMISSION_REJECTED',
+            reason: 'invalid',
+          });
+        }
+        if (startHook && (!env.WORKFLOW_INDEX.reserveStartHook || !stub.applyStartHookEvent)) {
+          throw new WorkflowWorldError(
+            'The connected world-celld worker does not support atomic start Hooks',
+            {
+              status: 400,
+              code: 'START_HOOK_ADMISSION_DISABLED',
+              reason: 'disabled',
+            },
+          );
+        }
+        if (
+          data.eventType === 'hook_created' &&
+          isStartHookId(effectiveRunId, data.correlationId)
+        ) {
+          throw new WorkflowWorldError('This Hook ID is reserved for atomic start', {
+            status: 400,
+          });
+        }
         const force =
           data.eventType === 'hook_created' &&
           data.eventData.force === true &&
@@ -634,7 +697,26 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           let claimedFrom: HookClaimedFrom | undefined;
           let forceRefusedReason: ApplyEventRequest['forceRefusedReason'];
           hookAdmission = undefined;
-          if (data.eventType === 'hook_created') {
+          if (startHook) {
+            const owner = { runId: effectiveRunId, hookId: startHookId(effectiveRunId) };
+            const admission = await env.WORKFLOW_INDEX.reserveStartHook!(startHook.token, owner);
+            if (!admission.admitted && admission.pending) {
+              if (waits >= 12) {
+                throw new WorkflowWorldError('Start Hook token admission is still in progress', {
+                  status: 429,
+                  retryAfter: 1,
+                });
+              }
+              await delay(FORCED_HOOK_WAIT_MS * 2 ** Math.min(waits++, 4));
+              continue;
+            }
+            if (admission.admitted) {
+              tokenHolder = null;
+              hookAdmission = { owner, reservation: admission.reservation, token: startHook.token };
+            } else {
+              tokenHolder = admission.holder;
+            }
+          } else if (data.eventType === 'hook_created') {
             const owner = {
               runId: effectiveRunId,
               hookId: data.correlationId,
@@ -669,7 +751,7 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
           // RunDO: that transaction either observes the committed hook or fences
           // this exact reservation before its token/ID claims are released.
           try {
-            const wireOutcome: unknown = await stub.applyEvent({
+            const eventRequest: ApplyEventRequest = {
               runId: effectiveRunId,
               data,
               params,
@@ -678,9 +760,16 @@ export function createStorage(config: CloudflareStorageConfig): Storage {
               ...(claimedFrom ? { claimedFrom } : {}),
               ...(forceRefusedReason ? { forceRefusedReason } : {}),
               cleanup,
-            });
+            };
+            const wireOutcome: unknown = startHook
+              ? await stub.applyStartHookEvent!(eventRequest)
+              : await stub.applyEvent(eventRequest);
             parsedOutcome = parseApplyEventOutcome(wireOutcome);
           } catch (error) {
+            // Both direct and queued start share this reservation. Do not fence
+            // the other copy on an ambiguous response: the shard resolves it
+            // against the transaction, or expires and fences the abandoned claim.
+            if (startHook) throw error;
             if (hookAdmission?.reservation.takeover) {
               await settleAmbiguousTakeover(env.WORKFLOW_INDEX, hookAdmission).catch(
                 () => undefined,

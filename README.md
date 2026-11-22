@@ -39,6 +39,23 @@ Forced claims need a worker that has the `/v1/index/hooks/force-reserve`,
 `complete-takeover` and `settle-takeover` routes, so deploy the worker before
 the application.
 
+### Atomic start Hooks (Eve 1.1)
+
+With a Workflow SDK that supports `start({ experimental_hook })` (such as
+Workflow 5.5), the adapter can admit a run and create its initial Hook together.
+A duplicate token produces a `HookConflictError` naming the owning run; the
+losing candidate creates no run or Hook. The caller's candidate run ID is
+preserved, including when the queue delivery reaches storage first.
+
+Deploy the new worker across the fleet **before** enabling atomic starts in
+your application. `WORKFLOW_TARGET_WORLD=@ewhauser/world-celld` uses the
+asynchronous `createWorld()` factory, which checks the connected worker before
+advertising the capability. When constructing a URL-based World explicitly, use
+`await createWorld(options)` for atomic starts. The synchronous
+`createCelldWorld(options)` remains available for ordinary starts; it cannot
+probe a remote worker, so it does not advertise that capability on its own.
+Keep the app and worker compatible until existing deliveries drain.
+
 Run listing accepts either a single status or an array of statuses (OR matching).
 An empty status array matches no runs.
 

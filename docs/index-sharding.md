@@ -230,3 +230,19 @@ reuse, exact-claim cancellation, delayed-finalization fences, catalog
 resurrection prevention, partial-publication/deletion failures, lost-response
 ownership, concurrent ownership, concurrent resume idempotency, terminal
 marker fencing, cleanup paging, and retention retries.
+
+## Atomic start Hook admission
+
+`run_created` and resilient `run_started` carry the same token and candidate
+run ID. The token shard coordinates a recoverable lease in the same namespace
+as ordinary and forced Hooks. Competing starts wait briefly on an in-flight
+lease or get a retryable 429; only a confirmed owner causes an immutable
+conflict. A run-cell transaction commits the run, its deterministically named
+Hook and journal records together, or remembers the refusal until the
+candidate ID ages out. No separate `hook_created` event is emitted.
+
+Token and Hook ID index publication rolls forward from the committed run
+transaction, including after a lost HTTP response. An expired uncommitted
+lease is fenced at that transaction before another owner can take the token.
+Wire admission uses dedicated worker RPCs and a capability check so older
+workers cannot silently drop the start Hook.

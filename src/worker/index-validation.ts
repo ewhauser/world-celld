@@ -12,6 +12,8 @@ export type IndexOperation =
   | 'runs.commit'
   | 'runs.expire'
   | 'hooks.reserve'
+  | 'hooks.reserve-start'
+  | 'hooks.start-capability'
   | 'hooks.force-reserve'
   | 'hooks.finalize'
   | 'hooks.complete-takeover'
@@ -24,7 +26,8 @@ export type ValidatedIndexRequest =
   | { operation: 'runs.list-resolved'; args: [RunListRequest] }
   | { operation: 'runs.commit'; args: [WorkflowRun, string, number] }
   | { operation: 'runs.expire'; args: [ExpireRunIndexesRequest] }
-  | { operation: 'hooks.reserve'; args: [string, HookTokenOwner] }
+  | { operation: 'hooks.reserve' | 'hooks.reserve-start'; args: [string, HookTokenOwner] }
+  | { operation: 'hooks.start-capability'; args: [] }
   | {
       operation: 'hooks.force-reserve';
       args: [string, HookTokenOwner, { preempt?: boolean } | undefined];
@@ -306,6 +309,10 @@ export function validateIndexRequest(
     case 'runs.expire':
       exactArgs(args, 1);
       return { operation, args: [expireRequest(args[0])] };
+    case 'hooks.start-capability':
+      exactArgs(args, 0);
+      return { operation, args: [] };
+    case 'hooks.reserve-start':
     case 'hooks.reserve':
       exactArgs(args, 2);
       return {
@@ -347,6 +354,8 @@ export const INDEX_OPERATIONS = new Set<IndexOperation>([
   'runs.commit',
   'runs.expire',
   'hooks.reserve',
+  'hooks.reserve-start',
+  'hooks.start-capability',
   'hooks.force-reserve',
   'hooks.finalize',
   'hooks.complete-takeover',

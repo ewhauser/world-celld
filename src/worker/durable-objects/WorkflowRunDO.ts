@@ -1,16 +1,26 @@
+import { stringify } from '../../vendor/shared/index.js';
 import { DurableObject } from '../do-base.js';
 import {
   createWorkflowIndex,
   hookIdShardName,
   type HookIdShardStub,
   type HookTokenShardStub,
+  hookTokenShardName,
   type RunCatalogShardStub,
   type WorkflowIndex,
 } from '../../indexes.js';
 import type { Event, Hook, Step, WorkflowRun } from '@workflow/world';
-import { isTerminalWorkflowRunStatus, slotToEventId, WorkflowRunSchema } from '@workflow/world';
+import {
+  isStartHookId,
+  isTerminalWorkflowRunStatus,
+  slotToEventId,
+  WorkflowRunSchema,
+} from '@workflow/world';
 import {
   applyEvent,
+  requestedStartHook,
+  START_HOOK_REFUSAL_KEY,
+  type StartHookRefusal,
   applyForcedHookDisposal,
   finalizeEventPage,
   hookClaimCancellationKey,
@@ -307,6 +317,13 @@ export class WorkflowRunDO extends DurableObject {
     });
   }
 
+  async applyStartHookEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
+    if (!requestedStartHook(parseApplyEventRequest(request).data)) {
+      throw new TypeError('applyStartHookEvent requires a start Hook');
+    }
+    return this.applyEvent(request);
+  }
+
   /** Apply an event and capture all retention metadata in the same transaction. */
   async applyEvent(request: ApplyEventRequest): Promise<ApplyEventOutcome> {
     request = parseApplyEventRequest(request);
@@ -335,7 +352,16 @@ export class WorkflowRunDO extends DurableObject {
         nextEventId: () => slotToEventId(++eventSequence),
         now,
       });
-      if (!outcome.ok) return outcome;
+      if (!outcome.ok) {
+        if (outcome.code === 'START_HOOK_CONFLICT') {
+          const refused = await txn.get<StartHookRefusal>(START_HOOK_REFUSAL_KEY);
+          if (refused) {
+            const alarm = await txn.getAlarm();
+            if (alarm === null || refused.expiresAt < alarm) await txn.setAlarm(refused.expiresAt);
+          }
+        }
+        return outcome;
+      }
 
       // An idempotent replay appends nothing; leaving the sequence untouched
       // keeps its transaction read-only, so it skips the durable commit.
@@ -445,8 +471,10 @@ export class WorkflowRunDO extends DurableObject {
       const { tombstone } = await this.retentionState(txn);
       if (tombstone) return null;
       const run = await txn.get<WorkflowRun>('run');
-      if (run && isTerminalWorkflowRunStatus(run.status)) return null;
       const hook = await txn.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
+      if (run && isTerminalWorkflowRunStatus(run.status)) {
+        return hook && request.token === hook.token && this.isRetainedStartHook(hook) ? hook : null;
+      }
       if (hook && (request.token === undefined || hook.token === request.token)) return hook;
       const cancellation = { hookId: request.hookId, token: request.token, canceledAt: this.now() };
       await txn.put({
@@ -474,9 +502,12 @@ export class WorkflowRunDO extends DurableObject {
       const { tombstone } = await this.retentionState(txn);
       if (tombstone) return null;
       const run = await txn.get<WorkflowRun>('run');
-      if (!run || isTerminalWorkflowRunStatus(run.status)) return null;
+      if (!run) return null;
       const hook = await txn.get<Hook>(`${HOOK_KEY_PREFIX}${request.hookId}`);
       if (!hook || (request.token !== undefined && hook.token !== request.token)) return null;
+      if (isTerminalWorkflowRunStatus(run.status)) {
+        return request.token !== undefined && this.isRetainedStartHook(hook) ? hook : null;
+      }
       return hook;
     });
   }
@@ -807,6 +838,12 @@ export class WorkflowRunDO extends DurableObject {
   }
 
   async alarm(): Promise<void> {
+    const refusal = await this.ctx.storage.get<StartHookRefusal>(START_HOOK_REFUSAL_KEY);
+    if (refusal) {
+      if (refusal.expiresAt <= this.now()) {
+        await this.ctx.storage.delete(START_HOOK_REFUSAL_KEY);
+      }
+    }
     await this.executeScheduledCleanupPage();
   }
 
@@ -957,7 +994,9 @@ export class WorkflowRunDO extends DurableObject {
     }
 
     if (!cleanup || cleanup.phase === 'tombstoned') {
-      await this.ctx.storage.deleteAlarm();
+      const refusal = await this.ctx.storage.get<StartHookRefusal>(START_HOOK_REFUSAL_KEY);
+      if (refusal) await this.ctx.storage.setAlarm(refusal.expiresAt);
+      else await this.ctx.storage.deleteAlarm();
       return;
     }
     try {
@@ -1008,6 +1047,25 @@ export class WorkflowRunDO extends DurableObject {
     }
   }
 
+  private isRetainedStartHook(hook: Hook): boolean {
+    return (
+      isStartHookId(hook.runId, hook.hookId) &&
+      (hook.tokenRetentionUntil?.getTime() ?? 0) > this.now()
+    );
+  }
+
+  private async preserveRetainedStartHook(hooks: Hook[]): Promise<void> {
+    const hook = hooks.find((candidate) => this.isRetainedStartHook(candidate));
+    if (!hook) return;
+    const namespace = this.namespace<HookTokenShardStub>('WORKFLOW_HOOK_TOKENS');
+    const target = namespace.get(namespace.idFromName(hookTokenShardName(hook.token)));
+    await target.preserveRetainedStartHook(
+      hook.token,
+      { runId: hook.runId, hookId: hook.hookId },
+      stringify(hook),
+    );
+  }
+
   /**
    * Most runs end with a handful of hooks and waits. When every terminal
    * phase fits in one page, release the hook indexes once and delete hooks,
@@ -1027,6 +1085,7 @@ export class WorkflowRunDO extends DurableObject {
       return false;
     }
     const hooks = Array.from(hookEntries.values());
+    await this.preserveRetainedStartHook(hooks);
     const references = new Map<string, HookIndexReference>();
     for (const reference of [
       ...hooks.map((hook) => ({ hookId: hook.hookId, token: hook.token })),
@@ -1082,6 +1141,7 @@ export class WorkflowRunDO extends DurableObject {
       limit: TERMINAL_HOOK_PAGE_SIZE + 1,
     });
     const page = Array.from(entries.values()).slice(0, TERMINAL_HOOK_PAGE_SIZE);
+    await this.preserveRetainedStartHook(page);
     await this.workflowIndex().releaseHookIndexes({
       runId: cleanup.runId,
       hooks: page.map((hook) => ({ hookId: hook.hookId, token: hook.token })),

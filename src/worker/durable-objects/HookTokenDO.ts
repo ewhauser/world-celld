@@ -166,11 +166,20 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
     return (await runIsActive(this.env, hook.runId)) ? raw : null;
   }
 
+  async reserveStart(
+    token: string,
+    owner: HookTokenOwner,
+    proposedClaimId: string,
+  ): Promise<HookForceClaimResult> {
+    return this.reserve(token, owner, proposedClaimId, true);
+  }
+
   async reserve(
     token: string,
     owner: HookTokenOwner,
     proposedClaimId: string,
-  ): Promise<{ claimed: true; claimId: string } | { claimed: false; holder: HookTokenOwner }> {
+    requireCommittedOwner?: boolean,
+  ): Promise<HookForceClaimResult> {
     for (;;) {
       const observed = await this.ctx.storage.get<HookClaim>(claimKey(token));
       const expired = observed && observed.expiresAt <= this.now() ? observed : undefined;
@@ -204,7 +213,7 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         const pending = values.get(takeoverKey(token)) as HookTakeover | undefined;
         if (pending) {
           if (!sameOwner(pending.claimer, owner) && pending.expiresAt > now) {
-            return { claimed: false as const, holder: pending.claimer };
+            return { claimed: false as const, holder: pending.claimer, inFlight: true as const };
           }
           return 'settle' as const;
         }
@@ -223,7 +232,7 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
           existing = undefined;
         }
         if (existing !== undefined && !sameOwner(existing.owner, owner)) {
-          return { claimed: false as const, holder: existing.owner };
+          return { claimed: false as const, holder: existing.owner, inFlight: true as const };
         }
         if (existing === undefined) {
           const expiresAt = now + HOOK_CLAIM_LEASE_MS;
@@ -258,7 +267,18 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
         }
         return { claimed: false, holder: result.holder };
       }
-      if (result) return result;
+      if (result) {
+        if ('inFlight' in result && result.holder) {
+          if (requireCommittedOwner) {
+            // Roll forward a writer that committed the run but lost its reply.
+            // Re-enter reserve to confirm the published record under the lock.
+            if (await this.get(token)) continue;
+            return { claimed: false, holder: result.holder, pending: true };
+          }
+          return { claimed: false, holder: result.holder };
+        }
+        return result;
+      }
     }
   }
 
@@ -499,6 +519,34 @@ export class HookTokenDO extends DurableObject<HookIndexEnv> {
       if (claim && sameOwner(claim.owner, owner) && claim.claimId === claimId) {
         await txn.delete([key, claim.deadlineKey]);
       }
+    });
+  }
+
+  /** Terminal run cleanup can reach a committed start before its client publishes the token. */
+  async preserveRetainedStartHook(
+    token: string,
+    owner: HookTokenOwner,
+    serializedHook: string,
+  ): Promise<void> {
+    const until = tokenRetentionUntil(parse<Hook>(serializedHook));
+    if (until === undefined || until <= this.now()) return;
+    await this.ctx.storage.transaction(async (txn) => {
+      const record = recordKey(token);
+      const claim = claimKey(token);
+      const entries = await txn.get<TokenValue>([record, claim, takeoverKey(token)]);
+      const reservation = entries.get(claim) as HookClaim | undefined;
+      if (
+        entries.has(record) ||
+        entries.has(takeoverKey(token)) ||
+        !reservation ||
+        !sameOwner(reservation.owner, owner) ||
+        until <= this.now()
+      ) {
+        return;
+      }
+      await txn.put(record, serializedHook);
+      await txn.delete([claim, reservation.deadlineKey]);
+      await this.retain(txn, token, owner, until);
     });
   }
 

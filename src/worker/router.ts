@@ -218,6 +218,7 @@ const BINDINGS: Record<string, { env: keyof WorkerEnv; methods: ReadonlySet<stri
     env: 'WORKFLOW_DB',
     methods: new Set([
       'applyEvent',
+      'applyStartHookEvent',
       'getLifecycleStatus',
       'getRun',
       'getStep',
@@ -698,6 +699,12 @@ export function createRouter(env: WorkerEnv) {
           case 'runs.expire':
             result = await index.expireRun(...validated.args);
             break;
+          case 'hooks.start-capability':
+            result = { active: Boolean(env.WORKFLOW_DB) };
+            break;
+          case 'hooks.reserve-start':
+            result = await index.reserveStartHook(...validated.args);
+            break;
           case 'hooks.reserve':
             result = await index.reserveHook(...validated.args);
             break;
@@ -885,7 +892,7 @@ export function createRouter(env: WorkerEnv) {
       return errorResponse(400, 'BadRequest', 'malformed rpc body');
     }
 
-    if (bindingKey === 'runs' && method === 'applyEvent') {
+    if (bindingKey === 'runs' && (method === 'applyEvent' || method === 'applyStartHookEvent')) {
       if (args.length !== 1) {
         return errorResponse(400, 'BadRequest', 'applyEvent expects exactly one request argument');
       }
@@ -910,7 +917,7 @@ export function createRouter(env: WorkerEnv) {
         (...a: unknown[]) => Promise<unknown>
       >;
       const result = await stub[method](...args);
-      if (bindingKey === 'runs' && method === 'applyEvent') {
+      if (bindingKey === 'runs' && (method === 'applyEvent' || method === 'applyStartHookEvent')) {
         await publishApplyEventIndexes(env, name, result);
       }
       return new Response(rpcStringify(result ?? null), {

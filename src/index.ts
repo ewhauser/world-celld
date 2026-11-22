@@ -6,6 +6,7 @@
 import { SPEC_VERSION_CURRENT, type World } from '@workflow/world';
 import { type CelldWorldConfig, type CelldWorldEnv, resolveConfig } from './config.js';
 import { createRemoteEnv } from './remote/namespaces.js';
+import { callFleetRoute } from './remote/rpc-client.js';
 import { createQueue } from './queue.js';
 import { createStorage } from './storage.js';
 import { createStreamer, type CelldStreamer } from './streamer.js';
@@ -151,6 +152,7 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
     // run when run_created has not landed yet.
     specVersion: SPEC_VERSION_CURRENT,
     capabilities: {
+      atomicStartHook: { active: typeof env.WORKFLOW_INDEX.reserveStartHook === 'function' },
       // Retention lives in the index's token shards; an injected index must
       // opt in, since releasing a run's hooks would otherwise drop them.
       hookRetention: { active: env.WORKFLOW_INDEX.retainsHookTokens === true },
@@ -163,5 +165,39 @@ export function createCelldWorld(config?: CelldWorldConfig): CelldWorld {
   };
 }
 
-// Export createWorld as an alias for compatibility with @workflow/world
-export { createCelldWorld as createWorld };
+/**
+ * Workflow's asynchronous World factory. Probe the authenticated fleet before
+ * exposing atomic start admission. Synchronous createCelldWorld() cannot do
+ * this for URL-based worlds, so use this factory for remote atomic starts.
+ */
+export async function createWorld(config?: CelldWorldConfig): Promise<CelldWorld> {
+  const resolved = resolveConfig(config);
+  if (
+    resolved.env ||
+    (globalThis as { CELLD_ENV?: CelldWorldEnv }).CELLD_ENV ||
+    !resolved.fleetUrl ||
+    !resolved.secret
+  ) {
+    return createCelldWorld(config);
+  }
+
+  const transport = {
+    fleetUrl: resolved.fleetUrl,
+    secret: resolved.secret,
+    timeoutMs: resolved.rpcTimeoutMs,
+  };
+  let active = false;
+  try {
+    const capability = await callFleetRoute<{ active?: boolean } | null>(
+      transport,
+      '/v1/index/hooks/start-capability',
+      [],
+      { idempotent: true },
+    );
+    active = capability?.active === true;
+  } catch (error) {
+    // A worker from before start Hooks is still valid for ordinary runs.
+    if ((error as { status?: unknown }).status !== 404) throw error;
+  }
+  return createCelldWorld({ ...config, env: createRemoteEnv(transport, active) });
+}
