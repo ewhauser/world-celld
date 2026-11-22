@@ -63,7 +63,10 @@ services:
       <<: *storage-environment
       CELLD_WATCH: /var/lib/celld/state
       CELLD_NODE: world-celld-perf-primary
-      CELLD_TTL_MS: '2000'
+      # celld's default node lease. With a two-second lease, one renewal
+      # write slower than about 667 ms under load fenced the node
+      # (ewhauser/world-celld#114).
+      CELLD_TTL_MS: '10000'
     command:
       - celld
       - --bucket
@@ -99,7 +102,7 @@ services:
       <<: *storage-environment
       CELLD_WATCH: /var/lib/celld/state
       CELLD_NODE: world-celld-perf-peer
-      CELLD_TTL_MS: '2000'
+      CELLD_TTL_MS: '10000'
     command:
       - celld
       - --bucket

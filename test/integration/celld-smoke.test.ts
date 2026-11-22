@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { type ChildProcessByStdio, execFile, spawn } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
@@ -24,6 +24,12 @@ const BUCKET = 'world-celld-smoke';
 const ACCESS_KEY = 'world-celld-smoke-access';
 const SECRET_KEY = 'world-celld-smoke-secret-key';
 const MAX_PROCESS_LOG_BYTES = 128 * 1024;
+// celld's own default. The node renews every third of this TTL and fences
+// itself if a renewal cannot be confirmed before the prior lease expires, so a
+// single object-store write slower than about TTL/3 is enough to halt the node.
+// A two-second lease fenced a node under the offloaded queue load below
+// (ewhauser/world-celld#114).
+const NODE_LEASE_TTL_MS = 10_000;
 
 interface CapturedDelivery {
   body: string;
@@ -35,6 +41,13 @@ interface ManagedProcess {
   child: ChildProcessByStdio<null, Readable, Readable>;
   logs: () => string;
   name: string;
+}
+
+interface NodeLeaseAttempt {
+  attempt: string;
+  outcome: string;
+  elapsedMs: number;
+  priorHeadroomMs: number;
 }
 
 interface RestartEvidence {
@@ -138,16 +151,25 @@ function startManaged(
   args: string[],
   env: NodeJS.ProcessEnv,
   cwd?: string,
+  onLine?: (line: string) => void,
 ): ManagedProcess {
   const child = spawn(command, args, { env, cwd, stdio: ['ignore', 'pipe', 'pipe'] });
   let output = '';
-  const capture = (chunk: Buffer) => {
+  const partial = { stdout: '', stderr: '' };
+  const capture = (chunk: Buffer, stream?: keyof typeof partial) => {
     // Buffer stringifies as UTF-8.
-    output += String(chunk);
+    const text = String(chunk);
+    output += text;
     if (output.length > MAX_PROCESS_LOG_BYTES) output = output.slice(-MAX_PROCESS_LOG_BYTES);
+    // The retained tail is bounded, so line observers see output as it
+    // arrives rather than scanning what is left of it later.
+    if (!onLine || !stream) return;
+    const lines = (partial[stream] + text).split('\n');
+    partial[stream] = lines.pop() ?? '';
+    for (const line of lines) onLine(line);
   };
-  child.stdout.on('data', capture);
-  child.stderr.on('data', capture);
+  child.stdout.on('data', (chunk: Buffer) => capture(chunk, 'stdout'));
+  child.stderr.on('data', (chunk: Buffer) => capture(chunk, 'stderr'));
   child.on('error', (error) => capture(Buffer.from(`\nprocess error: ${String(error)}\n`)));
   return { child, logs: () => output, name };
 }
@@ -260,6 +282,9 @@ async function prepareWorker(
 class NativeCelldRuntime {
   private celld: ManagedProcess | undefined;
   private readonly baseEnv: NodeJS.ProcessEnv;
+  /** Node-lease attempts and self-fences reported by every celld process started here. */
+  readonly leaseAttempts: NodeLeaseAttempt[] = [];
+  fences = 0;
 
   constructor(
     private readonly binary: string,
@@ -280,7 +305,7 @@ class NativeCelldRuntime {
       CELLD_OTEL: '1',
       CELLD_OTEL_FLUSH_MS: '1000',
       CELLD_OPERATION_DEADLINE_MS: '10000',
-      CELLD_TTL_MS: '2000',
+      CELLD_TTL_MS: String(NODE_LEASE_TTL_MS),
       CELLD_WAKER_TICK_MS: '50',
       CELLD_WATCH: watchDirectory,
       RUST_LOG: 'info',
@@ -308,7 +333,28 @@ class NativeCelldRuntime {
         `127.0.0.1:${this.internalPort}`,
       ],
       this.baseEnv,
+      undefined,
+      (line) => this.observe(line),
     );
+  }
+
+  private observe(line: string): void {
+    if (line.includes('node_lease_watchdog_fence') || line.includes('SELF-FENCE')) {
+      this.fences++;
+      return;
+    }
+    if (!line.includes('event="node_lease_attempt"')) return;
+    const field = (name: string) => line.match(new RegExp(`\\b${name}="?([^"\\s]+)`))?.[1];
+    this.leaseAttempts.push({
+      attempt: field('attempt') ?? '',
+      outcome: field('outcome') ?? '',
+      elapsedMs: Number(field('elapsed_ms')),
+      priorHeadroomMs: Number(field('prior_authority_headroom_ms')),
+    });
+  }
+
+  get running(): boolean {
+    return this.celld?.child.exitCode === null && this.celld.child.signalCode === null;
   }
 
   async start(): Promise<void> {
@@ -1363,4 +1409,81 @@ describe.skipIf(!CONFIGURED)('real celld v0.6.0 native-services restart smoke', 
     await expect(w.runs.get(runId)).rejects.toSatisfy((error) => RunExpiredError.is(error));
     await expect(w.getStreamInfo(streamName, runId)).rejects.toThrow(/expired/);
   });
+  it('keeps its node lease with headroom under offloaded single-send queue load', async () => {
+    // Four runs each publish 32 single queue messages at once, alternating
+    // inline envelopes with 200 KB inputs that celld offloads to object
+    // storage. A two-second lease fenced the node under this shape
+    // (ewhauser/world-celld#114). Raise CELLD_SMOKE_LOAD_ROUNDS to qualify a
+    // lease setting for longer than the required smoke runs it.
+    const rounds = Number(process.env.CELLD_SMOKE_LOAD_ROUNDS ?? 6);
+    const concurrency = 4;
+    // 200 KB of incompressible text, so every offloaded message really
+    // reaches object storage at that size.
+    const largeInput = Array.from(randomBytes(100_000), (byte) =>
+      byte.toString(16).padStart(2, '0'),
+    ).join('');
+    const firstAttempt = runtime!.leaseAttempts.length;
+    const fencesBefore = runtime!.fences;
+    for (let round = 0; round < rounds; round++) {
+      for (const offloaded of [false, true]) {
+        const deploymentId = `lease-load-${randomUUID()}`;
+        const w = world({ deploymentId });
+        const queueName = `__wkf_workflow_lease_load_${randomUUID().slice(0, 8)}`;
+        const runs = await Promise.all(
+          Array.from({ length: concurrency }, () =>
+            w.events.create(null, {
+              eventType: 'run_created',
+              eventData: { deploymentId, workflowName: deploymentId, input: [] },
+            }),
+          ),
+        );
+        await Promise.all(
+          runs.flatMap(({ run }) =>
+            Array.from({ length: 32 }, (_, index) =>
+              w.queue(
+                queueName,
+                offloaded
+                  ? {
+                      runId: run.runId,
+                      runInput: {
+                        input: largeInput,
+                        deploymentId,
+                        workflowName: deploymentId,
+                        specVersion: SPEC_VERSION_CURRENT,
+                      },
+                    }
+                  : { runId: run.runId, stepId: `step_${index}` },
+                { idempotencyKey: `${run.runId}-${index}` },
+              ),
+            ),
+          ),
+        );
+        await waitFor(
+          async () =>
+            new Set(
+              deliveries
+                .filter((d) => d.headers['x-vqs-queue-name'] === queueName)
+                .map((d) => d.headers['x-vqs-message-id']),
+            ).size ===
+            32 * concurrency
+              ? true
+              : null,
+          30_000,
+          `round ${round} ${offloaded ? 'offloaded' : 'inline'} callbacks\n${runtime!.logs()}`,
+        );
+      }
+    }
+
+    expect(runtime!.running).toBe(true);
+    expect(runtime!.fences).toBe(fencesBefore);
+    const renewals = runtime!.leaseAttempts
+      .slice(firstAttempt)
+      .filter((attempt) => attempt.attempt === 'renew');
+    expect(renewals.length).toBeGreaterThan(0);
+    expect(renewals.filter((renewal) => renewal.outcome !== 'applied')).toEqual([]);
+    // Renewal starts with two thirds of the TTL left. Landing with less than
+    // half left means one slow write is already most of the way to a fence.
+    const minimumHeadroomMs = Math.min(...renewals.map((renewal) => renewal.priorHeadroomMs));
+    expect(minimumHeadroomMs).toBeGreaterThanOrEqual(NODE_LEASE_TTL_MS / 2);
+  }, 300_000);
 });
