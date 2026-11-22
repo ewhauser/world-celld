@@ -366,6 +366,15 @@ fleet-wide maximum age are both enabled, the earlier deadline wins.
   retain the callback URL with which they were created.
 - Fleet restarts can interrupt in-flight callbacks; expired claims are
   delivered again.
+- Size celld's node lease (`CELLD_TTL_MS`, default 10 seconds) for your
+  object store's write latency under load, not when idle. celld renews the lease
+  every third of the TTL. If a renewal cannot be confirmed before the previous
+  lease expires, the node fences itself and halts, and its cells move to a peer.
+  A two-second lease fenced a node under a burst of 128 offloaded queue messages
+  against local MinIO
+  ([#114](https://github.com/ewhauser/world-celld/issues/114)). Keep the
+  default unless you have measured renewal latency (celld logs each attempt as
+  `node_lease_attempt` with `elapsed_ms`) well below a third of a shorter TTL.
 
 ## Development
 
@@ -393,7 +402,8 @@ pnpm test:integration
 The required CI smoke owns native celld v0.6.0 and MinIO processes on loopback,
 uses fresh temporary bucket and runtime state, and kills celld with `SIGKILL`
 before deleting its local working state and starting a new process against the
-bucket-backed state. It checks that:
+bucket-backed state. celld runs with its default 10-second node lease. It checks
+that:
 
 - opt-in runtime telemetry is persisted as nonempty Parquet files in the fleet bucket;
 - acknowledged run and stream state survives the process restart;
@@ -406,6 +416,9 @@ bucket-backed state. It checks that:
 - invalid credentials, envelopes, and attempts are rejected across real RPC;
 - the former HTTP delivery route returns 404;
 - multi-page retention cleanup continues from a persisted nonterminal phase;
+- the node keeps its lease, with every renewal applied and at least half the
+  TTL to spare, through bursts of 128 concurrent single queue sends, inline and
+  offloaded;
 - cancelling an in-flight HTTP long poll leaves the stream writable and
   readable.
 
