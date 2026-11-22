@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.11.0 (2026-11-22)
+
+## What's Changed
+* chore(deps): bump hono from 4.13.11 to 4.13.16 by @dependabot[bot] in https://github.com/ewhauser/world-celld/pull/107
+* test: run celld with its default node lease and guard lease headroom under load by @ewhauser in https://github.com/ewhauser/world-celld/pull/115
+* feat!: support atomic start hooks for Eve 1.1 by @ewhauser in https://github.com/ewhauser/world-celld/pull/112
+
+
+**Full Changelog**: https://github.com/ewhauser/world-celld/compare/v0.10.1...v0.11.0
+
 ## 0.10.1 (2026-11-21)
 
 ## What's Changed
